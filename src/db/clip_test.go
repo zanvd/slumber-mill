@@ -58,6 +58,9 @@ func TestClipEveryLimit(t *testing.T) {
 			if !strings.HasPrefix(valid, got) {
 				t.Fatalf("Clip(%q, %d) = %q, not a prefix of %q", s, n, got, valid)
 			}
+			if n >= len(valid) && got != valid {
+				t.Fatalf("Clip(%q, %d) = %q, want all of %q, which fits", s, n, got, valid)
+			}
 			if len(got) < n && len(got) < len(valid) {
 				if r, size := utf8.DecodeRuneInString(valid[len(got):]); len(got)+size <= n {
 					t.Fatalf("Clip(%q, %d) = %q, dropped %q that fits", s, n, got, r)
