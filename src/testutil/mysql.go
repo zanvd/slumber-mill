@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -38,7 +39,7 @@ func NewEmptyDatabase(tb testing.TB) string {
 	if dsn == "" {
 		tb.Fatalf("%s is not set; integration tests need MySQL", dsnEnv)
 	}
-	cfg, err := mysql.ParseDSN(dsn)
+	cfg, err := parseDSN(dsn)
 	if err != nil {
 		tb.Fatalf("error parsing %s: %v", dsnEnv, err)
 	}
@@ -73,4 +74,14 @@ func NewEmptyDatabase(tb testing.TB) string {
 
 	cfg.DBName = name
 	return cfg.FormatDSN()
+}
+
+// parseDSN is mysql.ParseDSN with the panic it raises on removed parameters, such as strict, returned as an error.
+func parseDSN(dsn string) (cfg *mysql.Config, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			cfg, err = nil, fmt.Errorf("%v", r)
+		}
+	}()
+	return mysql.ParseDSN(dsn)
 }

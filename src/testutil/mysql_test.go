@@ -48,6 +48,7 @@ func TestNewDatabaseFailsWithoutMySQL(t *testing.T) {
 		{"unset", "", "SLUMBER_MILL_DSN is not set"},
 		{"blank", "  ", "SLUMBER_MILL_DSN is not set"},
 		{"malformed", "no slash", "error parsing SLUMBER_MILL_DSN"},
+		{"strict parameter", "u:p@tcp(127.0.0.1:1)/?strict=true", "error parsing SLUMBER_MILL_DSN"},
 		{"unreachable", "u:p@tcp(127.0.0.1:1)/?timeout=2s", "error connecting to MySQL"},
 	}
 	for _, tc := range tests {

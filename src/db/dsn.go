@@ -34,8 +34,14 @@ func migrationConfig(dsn string) (*mysql.Config, error) {
 	return cfg, nil
 }
 
-func parseDSN(dsn string) (*mysql.Config, error) {
-	cfg, err := mysql.ParseDSN(dsn)
+func parseDSN(dsn string) (cfg *mysql.Config, err error) {
+	// The driver panics on parameters it has removed, such as strict.
+	defer func() {
+		if r := recover(); r != nil {
+			cfg, err = nil, fmt.Errorf("error parsing DSN: %v", r)
+		}
+	}()
+	cfg, err = mysql.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing DSN: %w", err)
 	}

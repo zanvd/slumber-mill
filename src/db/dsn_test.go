@@ -108,7 +108,28 @@ func TestParseDSNPoolRules(t *testing.T) {
 }
 
 func TestParseDSNInvalid(t *testing.T) {
-	if _, err := appConfig("no slash here"); err == nil {
-		t.Error("appConfig() error = nil, want a parse error")
+	tests := []struct {
+		name string
+		dsn  string
+	}{
+		{"no slash", "no slash here"},
+		{"strict=true", baseDSN + "?strict=true"},
+		{"strict=false", baseDSN + "?strict=false"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := appConfig(tc.dsn); err == nil {
+				t.Error("appConfig() error = nil, want a parse error")
+			}
+			if _, err := migrationConfig(tc.dsn); err == nil {
+				t.Error("migrationConfig() error = nil, want a parse error")
+			}
+			if _, err := Open(tc.dsn); err == nil {
+				t.Error("Open() error = nil, want a parse error")
+			}
+			if _, err := Migrate(t.Context(), tc.dsn); err == nil {
+				t.Error("Migrate() error = nil, want a parse error")
+			}
+		})
 	}
 }
