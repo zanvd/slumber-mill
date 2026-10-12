@@ -143,15 +143,20 @@ func TestClosedSetsRejectUnknownValues(t *testing.T) {
 	}
 }
 
+// ascii_bin is a PAD SPACE collation: trailing spaces don't count, so validation rejects them.
 func TestIdentifiersCompareByteForByte(t *testing.T) {
 	tests := []struct {
 		name          string
 		first, second string
+		wantDuplicate bool
 		wantSecondErr uint16
 	}{
-		{"case", "AbC", "abc", 0},
-		{"accent", "resume-1", "résumé-1", errConversionImpossible},
-		{"sharp s", "strasse", "straße", errConversionImpossible},
+		{"case", "AbC", "abc", false, 0},
+		{"accent", "resume-1", "résumé-1", false, errConversionImpossible},
+		{"sharp s", "strasse", "straße", false, errConversionImpossible},
+		{"leading space", "upload-42", " upload-42", false, 0},
+		{"trailing space", "upload-42", "upload-42 ", true, 0},
+		{"trailing spaces first", "upload-42   ", "upload-42", true, 0},
 	}
 	columns := []struct {
 		name   string
@@ -174,13 +179,16 @@ func TestIdentifiersCompareByteForByte(t *testing.T) {
 					t.Fatalf("inserting %q: %v", tc.first, err)
 				}
 				err := col.insert(gdb, tenantID, tc.second)
-				if errors.Is(err, gorm.ErrDuplicatedKey) {
-					t.Fatalf("inserting %q after %q: duplicate key", tc.second, tc.first)
-				}
-				if tc.wantSecondErr == 0 && err != nil {
+				switch {
+				case tc.wantDuplicate:
+					if !errors.Is(err, gorm.ErrDuplicatedKey) {
+						t.Errorf("inserting %q after %q: error = %v, want a duplicate key", tc.second, tc.first, err)
+					}
+				case errors.Is(err, gorm.ErrDuplicatedKey):
+					t.Errorf("inserting %q after %q: duplicate key", tc.second, tc.first)
+				case tc.wantSecondErr == 0 && err != nil:
 					t.Errorf("inserting %q after %q: %v", tc.second, tc.first, err)
-				}
-				if tc.wantSecondErr != 0 && !isMySQLError(err, tc.wantSecondErr) {
+				case tc.wantSecondErr != 0 && !isMySQLError(err, tc.wantSecondErr):
 					t.Errorf("inserting %q: error = %v, want MySQL error %d", tc.second, err, tc.wantSecondErr)
 				}
 			})
