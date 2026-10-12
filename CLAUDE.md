@@ -38,8 +38,8 @@ Go ahead without asking:
 
 - Reading anything; running builds, vet, tests and `docker compose` against the local stack.
 - Removing what you created in Docker: your own worktree's Compose project,
-  with `docker compose down -v --remove-orphans`, and any containers, networks and volumes you started yourself.
-  Leave nothing of yours running or stored when you finish.
+  with `docker compose down -v --remove-orphans --rmi local`, and any containers, networks and volumes
+  you started yourself. Leave nothing of yours running or stored when you finish.
 - Creating and editing files under `src/`, the `Dockerfile`, `compose.yaml`, `.github/`, `README.md`, a `Makefile`
   and the `var/**/.gitkeep` files.
 - Adding the modules listed in §3 at their pinned versions.
@@ -54,7 +54,7 @@ These are the user's decisions; implementers return them to the overseer, which 
   The measured figures in the spec depend on them.
 - **Editing** `SPEC.md`, `CLAUDE.md`, anything under `.claude/`, `LICENSE`, `.gitignore` or `.editorconfig`.
 - **Destructive operations:** `docker compose down -v` or removing volumes
-  anywhere but your own worktree's Compose project, removing `var/data`,
+  anywhere but your own worktree's Compose project, unless you created them yourself, removing `var/data`,
   or dropping any database the test suite didn't create.
 
 Never:
