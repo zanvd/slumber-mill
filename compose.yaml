@@ -1,0 +1,60 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      MYSQL_DATABASE: slumber_mill
+      MYSQL_USER: slumber_mill
+      MYSQL_PASSWORD: slumber_mill
+    configs:
+      - source: mysql-test-account
+        target: /docker-entrypoint-initdb.d/test-account.sql
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 2m
+      start_interval: 1s
+
+  dev:
+    build:
+      context: .
+      target: dev
+      args:
+        APP_UID: ${APP_UID:-1000}
+    volumes:
+      - type: bind
+        source: ./src
+        target: /src
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./var/out
+        target: /out
+        bind:
+          create_host_path: false
+      - go-mod:/home/app/go/pkg/mod
+      - go-build:/home/app/.cache/go-build
+    environment:
+      SLUMBER_MILL_DSN: "slumber_mill_test:slumber_mill_test@tcp(mysql:3306)/"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["go", "test", "-race", "-tags", "integration", "./..."]
+
+configs:
+  mysql-test-account:
+    content: |
+      CREATE USER 'slumber_mill_test'@'%' IDENTIFIED BY 'slumber_mill_test';
+      GRANT ALTER, ALTER ROUTINE, CREATE, CREATE ROUTINE, CREATE TEMPORARY TABLES, CREATE VIEW,
+        DELETE, DROP, EVENT, EXECUTE, INDEX, INSERT, LOCK TABLES, REFERENCES, SELECT, SHOW VIEW,
+        TRIGGER, UPDATE
+        ON `slumber\_mill\_test\_%`.* TO 'slumber_mill_test'@'%';
+
+volumes:
+  mysql-data:
+  go-mod:
+  go-build:
