@@ -323,6 +323,8 @@ CREATE TABLE webhook_deliveries (
   the prefixes make leaks easy to spot. The database holds only the key's hash and the secret's ciphertext.
 - **Collations are right in migration 0001** (pitfall 10): identifiers that must compare byte for byte use `ascii_bin`,
   and the API accepts only printable ASCII in `Idempotency-Key`.
+  `ascii_bin` ignores trailing spaces (PAD SPACE), so `'x '` equals `'x'`, and validation rejects leading and trailing
+  spaces in slugs and `Idempotency-Key` values.
 - **Closed sets are `ENUM` or `SET`:** `status`, `state`, `type`, `profile`, `codec`, `normalization` and `warnings`.
   In strict mode, MySQL 8's default, a value outside the list fails the insert (error 1265),
   so a typo in code can't be stored. New members are only ever appended, which is instant;
