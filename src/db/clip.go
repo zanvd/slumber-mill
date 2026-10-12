@@ -8,7 +8,7 @@ import (
 // Clip returns s as valid UTF-8, cut to at most n bytes without splitting a character.
 // Invalid byte sequences become U+FFFD first.
 func Clip(s string, n int) string {
-	s = strings.ToValidUTF8(s, "�")
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= n {
 		return s
 	}

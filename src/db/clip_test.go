@@ -25,8 +25,8 @@ func TestClip(t *testing.T) {
 		{"zero limit", "abc", 0, ""},
 		{"negative limit", "abc", -1, ""},
 		{"empty", "", 5, ""},
-		{"invalid byte replaced", "a\xffb", 10, "a�b"},
-		{"truncated character replaced", "ab\xe2\x82", 10, "ab�"},
+		{"invalid byte replaced", "a\xffb", 10, "a\uFFFDb"},
+		{"truncated character replaced", "ab\xe2\x82", 10, "ab\uFFFD"},
 		{"replacement cut whole", "a\xffb", 3, "a"},
 	}
 	for _, tc := range tests {
@@ -46,7 +46,7 @@ func TestClipEveryLimit(t *testing.T) {
 		"bad \xff\xfe bytes \xe2\x82 mid-text",
 	}
 	for _, s := range inputs {
-		valid := strings.ToValidUTF8(s, "�")
+		valid := strings.ToValidUTF8(s, "\uFFFD")
 		for n := 0; n <= len(valid)+1; n++ {
 			got := Clip(s, n)
 			if !utf8.ValidString(got) {
