@@ -750,7 +750,8 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
 - **The binary is static** (`CGO_ENABLED=0`; Gin, GORM and the driver are pure Go): 22.7 MB in the prototype.
   Only `dev` needs cgo, for the race detector.
 - **Only the encode worker's image has ffmpeg.**
-  It adds about 380 MiB to Ubuntu (233 packages, from a simulated install); the other images are about 25 MB.
+  It adds about 440 MiB to Ubuntu (200 packages, from a simulated install without recommended packages);
+  the other images are about 25 MB.
   Uploads are validated by the encode pool's probe, not the API, which is what makes the split safe.
 - **Ubuntu rather than the official Go image** for `base-media`, so `dev` and `runtime-media` share one ffmpeg build:
   the loudness figures in §7 depend on the encoder.
