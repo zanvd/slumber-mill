@@ -46,7 +46,7 @@ func TestGormLoggerTrace(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&buf, nil)))
-			l := newGormLogger()
+			l := newGormLogger(discardLogger())
 			l.slow = time.Minute
 			gl := l.LogMode(tc.level)
 
@@ -75,7 +75,7 @@ func TestGormLoggerTrace(t *testing.T) {
 func TestGormLoggerMessages(t *testing.T) {
 	var buf bytes.Buffer
 	ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&buf, nil)))
-	l := newGormLogger()
+	l := newGormLogger(discardLogger())
 
 	l.Info(ctx, "hidden %d", 1)
 	l.Warn(ctx, "parsed %s with %d%%", "assets", 100)
@@ -86,23 +86,65 @@ func TestGormLoggerMessages(t *testing.T) {
 }
 
 func TestGormLoggerParamsFilter(t *testing.T) {
-	sql, vars := newGormLogger().ParamsFilter(context.Background(), tracedSQL, "secret", 7)
+	l := newGormLogger(discardLogger())
+	sql, vars := l.ParamsFilter(context.Background(), tracedSQL, "secret", 7)
 	if sql != tracedSQL || vars != nil {
 		t.Errorf("ParamsFilter() = %q, %v; want the SQL unchanged and no values", sql, vars)
 	}
-	if _, ok := any(newGormLogger()).(gorm.ParamsFilter); !ok {
+	if _, ok := any(l).(gorm.ParamsFilter); !ok {
 		t.Error("gormLogger doesn't implement gorm.ParamsFilter")
 	}
 }
 
+func TestGormLoggerChoosesLogger(t *testing.T) {
+	failure := errors.New("boom")
+	calls := map[string]func(l logger.Interface, ctx context.Context){
+		"Trace": func(l logger.Interface, ctx context.Context) {
+			l.Trace(ctx, time.Now(), func() (string, int64) { return tracedSQL, 0 }, failure)
+		},
+		"Error": func(l logger.Interface, ctx context.Context) { l.Error(ctx, "callback failed: %v", failure) },
+	}
+	tests := []struct {
+		name         string
+		inContext    bool
+		wantInCtx    bool
+		wantFallback bool
+	}{
+		{"context logger", true, true, false},
+		{"no context logger", false, false, true},
+	}
+	for call, logWith := range calls {
+		for _, tc := range tests {
+			t.Run(call+"/"+tc.name, func(t *testing.T) {
+				var ctxBuf, fallbackBuf bytes.Buffer
+				ctx := t.Context()
+				if tc.inContext {
+					ctx = logging.CtxWithLogger(ctx, slog.New(slog.NewJSONHandler(&ctxBuf, nil)))
+				}
+				l := newGormLogger(slog.New(slog.NewJSONHandler(&fallbackBuf, nil)))
+
+				logWith(l, ctx)
+
+				if got := ctxBuf.Len() > 0; got != tc.wantInCtx {
+					t.Errorf("context logger got a record: %t, want %t (%q)", got, tc.wantInCtx, ctxBuf.String())
+				}
+				if got := fallbackBuf.Len() > 0; got != tc.wantFallback {
+					t.Errorf("Open's logger got a record: %t, want %t (%q)", got, tc.wantFallback, fallbackBuf.String())
+				}
+			})
+		}
+	}
+}
+
 func TestGormConfig(t *testing.T) {
-	cfg := gormConfig()
+	log := discardLogger()
+	cfg := gormConfig(log)
 	if !cfg.SkipDefaultTransaction || !cfg.TranslateError {
 		t.Errorf("SkipDefaultTransaction = %t, TranslateError = %t, want both true",
 			cfg.SkipDefaultTransaction, cfg.TranslateError)
 	}
-	if _, ok := cfg.Logger.(gormLogger); !ok {
-		t.Errorf("Logger = %T, want gormLogger", cfg.Logger)
+	if l, ok := cfg.Logger.(gormLogger); !ok || l.log != log {
+		t.Errorf("Logger = %#v, want a gormLogger falling back to the given logger", cfg.Logger)
 	}
 }
 

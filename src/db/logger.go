@@ -15,15 +15,16 @@ import (
 
 const slowQueryThreshold = 200 * time.Millisecond
 
-// gormLogger writes GORM's logs through the context's logger.
+// gormLogger writes GORM's logs through the context's logger, or log when the context carries none.
 // Queries are logged with their placeholders, never their values.
 type gormLogger struct {
+	log   *slog.Logger
 	level logger.LogLevel
 	slow  time.Duration
 }
 
-func newGormLogger() gormLogger {
-	return gormLogger{level: logger.Warn, slow: slowQueryThreshold}
+func newGormLogger(log *slog.Logger) gormLogger {
+	return gormLogger{log: log, level: logger.Warn, slow: slowQueryThreshold}
 }
 
 func (l gormLogger) LogMode(level logger.LogLevel) logger.Interface {
@@ -32,25 +33,25 @@ func (l gormLogger) LogMode(level logger.LogLevel) logger.Interface {
 }
 
 func (l gormLogger) Info(ctx context.Context, msg string, args ...any) {
-	l.log(ctx, logger.Info, slog.LevelInfo, msg, args)
+	l.message(ctx, logger.Info, slog.LevelInfo, msg, args)
 }
 
 func (l gormLogger) Warn(ctx context.Context, msg string, args ...any) {
-	l.log(ctx, logger.Warn, slog.LevelWarn, msg, args)
+	l.message(ctx, logger.Warn, slog.LevelWarn, msg, args)
 }
 
 func (l gormLogger) Error(ctx context.Context, msg string, args ...any) {
-	l.log(ctx, logger.Error, slog.LevelError, msg, args)
+	l.message(ctx, logger.Error, slog.LevelError, msg, args)
 }
 
-func (l gormLogger) log(ctx context.Context, minLevel logger.LogLevel, level slog.Level, msg string, args []any) {
+func (l gormLogger) message(ctx context.Context, minLevel logger.LogLevel, level slog.Level, msg string, args []any) {
 	if l.level < minLevel {
 		return
 	}
 	if len(args) > 0 {
 		msg = fmt.Sprintf(msg, args...)
 	}
-	logging.LoggerFromContext(ctx).Log(ctx, level, msg)
+	logging.LoggerFromContextOr(ctx, l.log).Log(ctx, level, msg)
 }
 
 func (l gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
@@ -75,7 +76,7 @@ func (l gormLogger) trace(ctx context.Context, level slog.Level, msg string, too
 	if rows >= 0 {
 		attrs = append(attrs, slog.Int64("rows", rows))
 	}
-	logging.LoggerFromContext(ctx).LogAttrs(ctx, level, msg, attrs...)
+	logging.LoggerFromContextOr(ctx, l.log).LogAttrs(ctx, level, msg, attrs...)
 }
 
 // ParamsFilter drops the query's values, so the SQL that Trace logs keeps its placeholders.
