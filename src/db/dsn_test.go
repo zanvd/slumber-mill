@@ -1,7 +1,10 @@
 package db
 
 import (
+	"bytes"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -9,6 +12,11 @@ import (
 )
 
 const baseDSN = "user:pass@tcp(mysql:3306)/slumber_mill"
+
+var pools = map[string]func(string, *slog.Logger) (*mysql.Config, error){
+	"app":       appConfig,
+	"migration": migrationConfig,
+}
 
 func TestParseDSNForcesSessionSettings(t *testing.T) {
 	tests := []struct {
@@ -29,11 +37,8 @@ func TestParseDSNForcesSessionSettings(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			for pool, parse := range map[string]func(string) (*mysql.Config, error){
-				"app":       appConfig,
-				"migration": migrationConfig,
-			} {
-				cfg, err := parse(tc.dsn)
+			for pool, parse := range pools {
+				cfg, err := parse(tc.dsn, discardLogger())
 				if err != nil {
 					t.Fatalf("%s pool: unexpected error: %v", pool, err)
 				}
@@ -56,7 +61,8 @@ func TestParseDSNForcesSessionSettings(t *testing.T) {
 }
 
 func TestParseDSNKeepsOtherSettings(t *testing.T) {
-	cfg, err := appConfig("u:p@tcp(db.example:3307)/app?timeout=5s&tls=skip-verify&sql_mode=%27TRADITIONAL%27")
+	cfg, err := appConfig("u:p@tcp(db.example:3307)/app?timeout=5s&tls=skip-verify&sql_mode=%27TRADITIONAL%27",
+		discardLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -87,7 +93,7 @@ func TestParseDSNPoolRules(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			app, err := appConfig(tc.dsn)
+			app, err := appConfig(tc.dsn, discardLogger())
 			if !errors.Is(err, tc.wantAppErr) {
 				t.Errorf("appConfig() error = %v, want %v", err, tc.wantAppErr)
 			}
@@ -96,7 +102,7 @@ func TestParseDSNPoolRules(t *testing.T) {
 					app.MultiStatements, app.InterpolateParams)
 			}
 
-			mig, err := migrationConfig(tc.dsn)
+			mig, err := migrationConfig(tc.dsn, discardLogger())
 			if !errors.Is(err, tc.wantMigErr) {
 				t.Errorf("migrationConfig() error = %v, want %v", err, tc.wantMigErr)
 			}
@@ -118,18 +124,56 @@ func TestParseDSNInvalid(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := appConfig(tc.dsn); err == nil {
-				t.Error("appConfig() error = nil, want a parse error")
+			for pool, parse := range pools {
+				if _, err := parse(tc.dsn, discardLogger()); err == nil {
+					t.Errorf("%s pool: error = nil, want a parse error", pool)
+				}
 			}
-			if _, err := migrationConfig(tc.dsn); err == nil {
-				t.Error("migrationConfig() error = nil, want a parse error")
-			}
-			if _, err := Open(tc.dsn); err == nil {
+			if _, err := Open(tc.dsn, discardLogger()); err == nil {
 				t.Error("Open() error = nil, want a parse error")
 			}
-			if _, err := Migrate(t.Context(), tc.dsn); err == nil {
+			if _, err := Migrate(t.Context(), tc.dsn, discardLogger()); err == nil {
 				t.Error("Migrate() error = nil, want a parse error")
 			}
 		})
 	}
+}
+
+func TestLoggerRequired(t *testing.T) {
+	for pool, parse := range pools {
+		if _, err := parse(baseDSN, nil); !errors.Is(err, errNoLogger) {
+			t.Errorf("%s pool: error = %v, want %v", pool, err, errNoLogger)
+		}
+	}
+	if _, err := Open(baseDSN, nil); !errors.Is(err, errNoLogger) {
+		t.Errorf("Open() error = %v, want %v", err, errNoLogger)
+	}
+	if _, err := Migrate(t.Context(), baseDSN, nil); !errors.Is(err, errNoLogger) {
+		t.Errorf("Migrate() error = %v, want %v", err, errNoLogger)
+	}
+}
+
+func TestDriverLogsThroughSlog(t *testing.T) {
+	for pool, parse := range pools {
+		t.Run(pool, func(t *testing.T) {
+			var buf bytes.Buffer
+			cfg, err := parse(baseDSN, slog.New(slog.NewJSONHandler(&buf, nil)))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// The driver's own call, from connection.go, with the file and line it prepends.
+			cfg.Logger.Print("connection.go:803 ", "closing bad idle connection: ", io.EOF)
+
+			rec := decodeRecord(t, &buf)
+			want := "connection.go:803 closing bad idle connection: EOF"
+			if rec["level"] != "ERROR" || rec["msg"] != want || rec["component"] != "mysql" {
+				t.Errorf("logged %v, want an ERROR %q from component mysql", rec, want)
+			}
+		})
+	}
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
 }

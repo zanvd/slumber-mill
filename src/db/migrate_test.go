@@ -80,13 +80,13 @@ func TestUnsafeDSNRefusedBeforeConnecting(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Open(tc.dsn); !errors.Is(err, tc.wantOpen) {
+			if _, err := Open(tc.dsn, discardLogger()); !errors.Is(err, tc.wantOpen) {
 				t.Errorf("Open() error = %v, want %v", err, tc.wantOpen)
 			}
 			if tc.wantMigrate == nil {
 				return
 			}
-			if _, err := Migrate(t.Context(), tc.dsn); !errors.Is(err, tc.wantMigrate) {
+			if _, err := Migrate(t.Context(), tc.dsn, discardLogger()); !errors.Is(err, tc.wantMigrate) {
 				t.Errorf("Migrate() error = %v, want %v", err, tc.wantMigrate)
 			}
 		})

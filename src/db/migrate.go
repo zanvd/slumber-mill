@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"path"
 	"slices"
 	"strconv"
@@ -39,12 +40,13 @@ type migration struct {
 
 // Migrate applies the embedded migrations that the DSN's database hasn't recorded, in order,
 // and returns the names of those it applied. Concurrent callers wait for each other.
-func Migrate(ctx context.Context, dsn string) (applied []string, err error) {
+// The driver logs through log.
+func Migrate(ctx context.Context, dsn string, log *slog.Logger) (applied []string, err error) {
 	migrations, err := loadMigrations(migrationFiles)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := migrationConfig(dsn)
+	cfg, err := migrationConfig(dsn, log)
 	if err != nil {
 		return nil, err
 	}

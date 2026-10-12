@@ -25,7 +25,7 @@ const (
 func NewDatabase(tb testing.TB) string {
 	tb.Helper()
 	dsn := NewEmptyDatabase(tb)
-	if _, err := db.Migrate(tb.Context(), dsn); err != nil {
+	if _, err := db.Migrate(tb.Context(), dsn, Logger(tb)); err != nil {
 		tb.Fatalf("error migrating the test database: %v", err)
 	}
 	return dsn

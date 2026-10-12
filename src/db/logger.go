@@ -82,3 +82,12 @@ func (l gormLogger) trace(ctx context.Context, level slog.Level, msg string, too
 func (gormLogger) ParamsFilter(_ context.Context, sql string, _ ...any) (string, []any) {
 	return sql, nil
 }
+
+// driverLogger receives the MySQL driver's messages, which it logs only for errors and without a context.
+type driverLogger struct {
+	log *slog.Logger
+}
+
+func (l driverLogger) Print(v ...any) {
+	l.log.LogAttrs(context.Background(), slog.LevelError, fmt.Sprint(v...), slog.String("component", "mysql"))
+}

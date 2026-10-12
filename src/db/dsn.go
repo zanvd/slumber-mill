@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -12,10 +13,11 @@ import (
 var (
 	errInterpolateParams = errors.New("interpolateParams=true is not allowed in the DSN")
 	errMultiStatements   = errors.New("multiStatements=true is allowed only on the migration pool")
+	errNoLogger          = errors.New("a logger is required")
 )
 
-func appConfig(dsn string) (*mysql.Config, error) {
-	cfg, err := parseDSN(dsn)
+func appConfig(dsn string, log *slog.Logger) (*mysql.Config, error) {
+	cfg, err := parseDSN(dsn, log)
 	if err != nil {
 		return nil, err
 	}
@@ -25,8 +27,8 @@ func appConfig(dsn string) (*mysql.Config, error) {
 	return cfg, nil
 }
 
-func migrationConfig(dsn string) (*mysql.Config, error) {
-	cfg, err := parseDSN(dsn)
+func migrationConfig(dsn string, log *slog.Logger) (*mysql.Config, error) {
+	cfg, err := parseDSN(dsn, log)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +36,11 @@ func migrationConfig(dsn string) (*mysql.Config, error) {
 	return cfg, nil
 }
 
-func parseDSN(dsn string) (cfg *mysql.Config, err error) {
+// parseDSN applies the DSN rules, and has the driver log through log rather than its own plain-text logger.
+func parseDSN(dsn string, log *slog.Logger) (cfg *mysql.Config, err error) {
+	if log == nil {
+		return nil, errNoLogger
+	}
 	// The driver panics on parameters it has removed, such as strict.
 	defer func() {
 		if r := recover(); r != nil {
@@ -60,6 +66,7 @@ func parseDSN(dsn string) (cfg *mysql.Config, err error) {
 		cfg.Params = make(map[string]string, 1)
 	}
 	cfg.Params["time_zone"] = "'+00:00'"
+	cfg.Logger = driverLogger{log: log}
 	return cfg, nil
 }
 

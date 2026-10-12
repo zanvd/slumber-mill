@@ -28,9 +28,10 @@ func TestMigrateConcurrently(t *testing.T) {
 	const runs = 5
 	results := make([][]string, runs)
 	errs := make([]error, runs)
+	log := testutil.Logger(t)
 	var wg sync.WaitGroup
 	for i := range runs {
-		wg.Go(func() { results[i], errs[i] = db.Migrate(t.Context(), dsn) })
+		wg.Go(func() { results[i], errs[i] = db.Migrate(t.Context(), dsn, log) })
 	}
 	wg.Wait()
 
@@ -87,7 +88,7 @@ func TestMigrateAgain(t *testing.T) {
 			}
 			before := recordedMigrations(t, gdb)
 
-			applied, err := db.Migrate(t.Context(), dsn)
+			applied, err := db.Migrate(t.Context(), dsn, testutil.Logger(t))
 			if err != nil {
 				t.Fatalf("Migrate() error = %v", err)
 			}
@@ -131,7 +132,7 @@ func tables(t *testing.T, gdb *gorm.DB) []string {
 
 func open(t *testing.T, dsn string) *gorm.DB {
 	t.Helper()
-	gdb, err := db.Open(dsn)
+	gdb, err := db.Open(dsn, testutil.Logger(t))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

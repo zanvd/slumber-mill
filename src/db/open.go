@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -18,8 +19,9 @@ const (
 
 // Open connects to MySQL with the application's pool and GORM settings.
 // The DSN is normalised first, and refused if it asks for interpolateParams or multiStatements.
-func Open(dsn string) (*gorm.DB, error) {
-	cfg, err := appConfig(dsn)
+// The driver logs through log.
+func Open(dsn string, log *slog.Logger) (*gorm.DB, error) {
+	cfg, err := appConfig(dsn, log)
 	if err != nil {
 		return nil, err
 	}
