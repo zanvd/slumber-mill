@@ -9,6 +9,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 
 	"github.com/zanvd/slumber-mill/src/db"
@@ -105,10 +106,22 @@ func (r *Repository) insertAsset(ctx context.Context, a Asset) error {
 		Select("public_id", "tenant_id", "idempotency_key", "title", "status",
 			"source_sha256", "source_bytes", "target_lufs").
 		Create(&row).Error
-	if err != nil {
+	switch {
+	case err == nil:
+		return nil
+	case rejected(err):
 		return translate("error inserting asset", err)
+	default:
+		return fmt.Errorf("error inserting asset: %w: %v", errOutcomeUnknown, err)
 	}
-	return nil
+}
+
+// rejected reports whether MySQL itself refused a statement, which rolls back an autocommit write.
+// GORM's dialector turns the duplicate-key and foreign-key errors into its own.
+// Anything else, such as a deadline or a lost connection, may have come after the commit.
+func rejected(err error) bool {
+	_, fromServer := errors.AsType[*mysql.MySQLError](err)
+	return fromServer || errors.Is(err, gorm.ErrDuplicatedKey) || errors.Is(err, gorm.ErrForeignKeyViolated)
 }
 
 func (r *Repository) assetByID(ctx context.Context, tenantID uint64, id uuid.UUID) (Asset, error) {

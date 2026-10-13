@@ -2,6 +2,7 @@ package asset
 
 import (
 	"errors"
+	"fmt"
 	"time"
 	"uuid"
 )
@@ -12,6 +13,8 @@ var (
 
 	errDuplicate = errors.New("duplicate key")
 	errDatabase  = errors.New("database error")
+	// errOutcomeUnknown marks a write that MySQL may have committed although the call failed.
+	errOutcomeUnknown = fmt.Errorf("%w: outcome unknown", errDatabase)
 )
 
 type Status string

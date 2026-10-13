@@ -332,12 +332,76 @@ func TestCreateCommitsAfterTheRequestEnds(t *testing.T) {
 	if err == nil || errors.Is(err, ErrNotFound) {
 		t.Errorf("Create() error = %v, want the re-read's internal error", err)
 	}
-	var ids []db.ID
-	rows, err := s.pool.QueryContext(t.Context(), "SELECT public_id FROM assets")
+	ids := s.assetIDs(t)
+	if len(ids) != 1 {
+		t.Fatalf("%d assets, want 1", len(ids))
+	}
+	if sources := assertFiles(t, s.root, tenant, 1); len(sources) == 1 && sources[0] != ids[0].String() {
+		t.Errorf("source file %s, want %s", sources[0], ids[0])
+	}
+}
+
+// TestCreateKeepsSourceWhenInsertTimesOut holds the tenant's row, so the insert's foreign-key check waits
+// past the insert's deadline. MySQL commits the row once the lock is released, and its source is still there.
+func TestCreateKeepsSourceWhenInsertTimesOut(t *testing.T) {
+	s := newStack(t)
+	s.svc.insertTimeout = 500 * time.Millisecond
+	tenant := s.tenant(t, "owner")
+	lock := s.lockTenant(t, tenant)
+
+	_, _, err := s.tryCreate(t, tenant, "Rain", "audio", "upload-42")
+	if !errors.Is(err, errOutcomeUnknown) {
+		t.Fatalf("Create() error = %v, want %v", err, errOutcomeUnknown)
+	}
+	sources := assertFiles(t, s.root, tenant, 1)
+	if ids := s.assetIDs(t); len(ids) != 0 {
+		t.Fatalf("%d assets while the insert waits, want 0", len(ids))
+	}
+
+	if err := lock.Commit(); err != nil {
+		t.Fatalf("error releasing the tenant's row: %v", err)
+	}
+	// Releasing the row granted the waiting insert its shared lock, which it holds until it commits,
+	// so locking the row again waits for the insert to finish.
+	if err := s.lockTenant(t, tenant).Rollback(); err != nil {
+		t.Fatalf("error releasing the tenant's row: %v", err)
+	}
+	ids := s.assetIDs(t)
+	if len(ids) != 1 || len(sources) != 1 || ids[0].String() != sources[0] {
+		t.Fatalf("assets %v with source files %v, want one asset and its source", ids, sources)
+	}
+
+	a, replayed := s.create(t, tenant, "Rain", "audio", "upload-42")
+	if !replayed || a.ID.String() != sources[0] {
+		t.Errorf("retry = %s, replayed %t; want a replay of %s", a.ID, replayed, sources[0])
+	}
+	assertFiles(t, s.root, tenant, 1)
+}
+
+// lockTenant holds the tenant's row FOR UPDATE until the returned transaction ends.
+func (s *stack) lockTenant(t *testing.T, tenantID uint64) *sql.Tx {
+	t.Helper()
+	tx, err := s.pool.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("error beginning a transaction: %v", err)
+	}
+	t.Cleanup(func() { tx.Rollback() })
+	var id uint64
+	err = tx.QueryRowContext(t.Context(), "SELECT id FROM tenants WHERE id = ? FOR UPDATE", tenantID).Scan(&id)
+	if err != nil {
+		t.Fatalf("error locking tenant %d: %v", tenantID, err)
+	}
+	return tx
+}
+
+func (s *stack) assetIDs(t *testing.T) []db.ID {
+	t.Helper()
+	rows, err := s.pool.QueryContext(t.Context(), "SELECT public_id FROM assets ORDER BY id")
 	if err != nil {
 		t.Fatalf("error reading assets: %v", err)
 	}
 	defer rows.Close()
+	var ids []db.ID
 	for rows.Next() {
 		var id db.ID
 		if err := rows.Scan(&id); err != nil {
@@ -345,12 +409,10 @@ func TestCreateCommitsAfterTheRequestEnds(t *testing.T) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) != 1 {
-		t.Fatalf("%d assets, want 1", len(ids))
+	if err := rows.Err(); err != nil {
+		t.Fatalf("error reading assets: %v", err)
 	}
-	if sources := assertFiles(t, s.root, tenant, 1); len(sources) == 1 && sources[0] != ids[0].String() {
-		t.Errorf("source file %s, want %s", sources[0], ids[0])
-	}
+	return ids
 }
 
 func TestPagination(t *testing.T) {
@@ -579,26 +641,47 @@ func TestRepositoryErrors(t *testing.T) {
 	tenant := s.tenant(t, "owner")
 	a, _ := s.create(t, tenant, "Rain", "audio", "")
 
-	t.Run("duplicate public ID", func(t *testing.T) {
-		dup := a
-		dup.IdempotencyKey = ""
-		if err := s.repo.insertAsset(t.Context(), dup); !errors.Is(err, errDuplicate) {
-			t.Errorf("insertAsset() error = %v, want %v", err, errDuplicate)
-		}
-	})
-	t.Run("unknown tenant", func(t *testing.T) {
-		err := s.repo.insertAsset(t.Context(), Asset{ID: uuid.NewV7(), TenantID: tenant + 1000, Title: "Rain",
-			Status: StatusQueued, SourceBytes: 1})
-		if !errors.Is(err, errDatabase) {
-			t.Fatalf("insertAsset() error = %v, want %v", err, errDatabase)
-		}
-		if _, ok := errors.AsType[*mysql.MySQLError](err); ok {
-			t.Errorf("the driver's error is reachable through %v", err)
-		}
-		if errors.Is(err, gorm.ErrForeignKeyViolated) {
-			t.Errorf("GORM's error is reachable through %v", err)
-		}
-	})
+	newAsset := func(edit func(*Asset)) Asset {
+		n := Asset{ID: uuid.NewV7(), TenantID: tenant, Title: "Rain", Status: StatusQueued, SourceBytes: 1}
+		edit(&n)
+		return n
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	inserts := []struct {
+		name        string
+		ctx         context.Context
+		asset       Asset
+		want        error
+		wantUnknown bool
+	}{
+		{"duplicate public ID", t.Context(), newAsset(func(n *Asset) { n.ID = a.ID }), errDuplicate, false},
+		{"unknown tenant, an error GORM translates", t.Context(),
+			newAsset(func(n *Asset) { n.TenantID = tenant + 1000 }), errDatabase, false},
+		{"title too long, an error GORM passes on", t.Context(),
+			newAsset(func(n *Asset) { n.Title = strings.Repeat("x", 256) }), errDatabase, false},
+		{"context cancelled", cancelled, newAsset(func(*Asset) {}), errOutcomeUnknown, true},
+	}
+	for _, tc := range inserts {
+		t.Run("insert/"+tc.name, func(t *testing.T) {
+			err := s.repo.insertAsset(tc.ctx, tc.asset)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("insertAsset() error = %v, want %v", err, tc.want)
+			}
+			if errors.Is(err, errOutcomeUnknown) != tc.wantUnknown {
+				t.Errorf("insertAsset() error = %v; outcome unknown should be %t", err, tc.wantUnknown)
+			}
+			if _, ok := errors.AsType[*mysql.MySQLError](err); ok {
+				t.Errorf("the driver's error is reachable through %v", err)
+			}
+			for _, inner := range []error{gorm.ErrDuplicatedKey, gorm.ErrForeignKeyViolated, context.Canceled} {
+				if errors.Is(err, inner) {
+					t.Errorf("%v is reachable through %v", inner, err)
+				}
+			}
+		})
+	}
 	t.Run("not found", func(t *testing.T) {
 		if _, err := s.repo.assetByID(t.Context(), tenant, uuid.NewV7()); err != ErrNotFound {
 			t.Errorf("assetByID() error = %v, want %v", err, ErrNotFound)

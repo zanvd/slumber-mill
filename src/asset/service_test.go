@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -418,7 +419,7 @@ func TestCreateFailures(t *testing.T) {
 			wantCalls: []string{"Promote", "Remove tmp"},
 		},
 		{
-			name:      "insert fails",
+			name:      "insert rejected",
 			repoErrs:  map[string]error{"insertAsset": errBoom},
 			wantErr:   errBoom,
 			wantCalls: []string{"Promote", "insertAsset", "Remove sources"},
@@ -538,11 +539,50 @@ func TestCreateInsertOutlivesTheRequest(t *testing.T) {
 			}
 
 			deadline, ok := f.repo.insertCtx.Deadline()
-			if !ok || deadline.Before(start.Add(insertTimeout)) || deadline.After(end.Add(insertTimeout)) {
-				t.Errorf("insert deadline = %v (set %t), want %v after the call", deadline, ok, insertTimeout)
+			if !ok || deadline.Before(start.Add(defaultInsertTimeout)) || deadline.After(end.Add(defaultInsertTimeout)) {
+				t.Errorf("insert deadline = %v (set %t), want %v after the call", deadline, ok, defaultInsertTimeout)
 			}
 			if got := logging.LoggerFromContext(f.repo.insertCtx); got != log {
 				t.Error("the insert's context lost the request's logger")
+			}
+		})
+	}
+}
+
+// TestCreateKeepsSourceWhenInsertOutcomeUnknown has the insert store its row and then fail as a timed-out
+// or dropped connection does: the source stays for the row that may exist.
+func TestCreateKeepsSourceWhenInsertOutcomeUnknown(t *testing.T) {
+	for _, key := range []string{"", "upload-42"} {
+		t.Run("key "+key, func(t *testing.T) {
+			f := newFixture(t)
+			f.repo.errAfterInsert = fmt.Errorf("error inserting asset: %w: %v", errOutcomeUnknown,
+				context.DeadlineExceeded)
+			var logs bytes.Buffer
+			ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil)))
+
+			a, replayed, err := f.svc.Create(ctx, f.params(t, "Rain", "audio", key))
+			if !errors.Is(err, errOutcomeUnknown) || errors.Is(err, ErrNotFound) {
+				t.Errorf("Create() error = %v, want %v", err, errOutcomeUnknown)
+			}
+			if replayed || !reflect.DeepEqual(a, Asset{}) {
+				t.Errorf("Create() = %+v, replayed %t; want nothing", a, replayed)
+			}
+			if len(f.repo.assets) != 1 {
+				t.Fatalf("inserted %d assets, want 1", len(f.repo.assets))
+			}
+			id := f.repo.assets[0].ID.String()
+			wantCalls := []string{"Promote", "insertAsset"}
+			if key != "" {
+				wantCalls = slices.Insert(wantCalls, 0, "assetByIdempotencyKey")
+			}
+			if !slices.Equal(f.calls.list, wantCalls) {
+				t.Errorf("calls = %v, want %v", f.calls.list, wantCalls)
+			}
+			if files := filesUnder(t, f.root); !slices.Equal(files, []string{"sources/7/" + id}) {
+				t.Errorf("files = %v, want only sources/7/%s", files, id)
+			}
+			if !strings.Contains(logs.String(), `"level":"WARN"`) || !strings.Contains(logs.String(), id) {
+				t.Errorf("logs = %s, want a warning naming %s", logs.String(), id)
 			}
 		})
 	}

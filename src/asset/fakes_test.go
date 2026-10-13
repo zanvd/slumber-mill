@@ -36,8 +36,10 @@ type fakeRepo struct {
 	// beforeInsert runs inside insertAsset before it looks at its context,
 	// as if another request got there first or the client hung up.
 	beforeInsert func(f *fakeRepo)
-	insertCtx    context.Context
-	listArgs     []listArgs
+	// errAfterInsert is returned by an insert that stored its row, as when the commit's reply is lost.
+	errAfterInsert error
+	insertCtx      context.Context
+	listArgs       []listArgs
 }
 
 func (f *fakeRepo) err(ctx context.Context, method string) error {
@@ -69,7 +71,7 @@ func (f *fakeRepo) insertAsset(ctx context.Context, a Asset) error {
 	}
 	a.CreatedAt, a.UpdatedAt = fakeNow, fakeNow
 	f.assets = append(f.assets, a)
-	return nil
+	return f.errAfterInsert
 }
 
 func (f *fakeRepo) assetByID(ctx context.Context, tenantID uint64, id uuid.UUID) (Asset, error) {

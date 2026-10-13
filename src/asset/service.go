@@ -28,9 +28,9 @@ const (
 	maxTitleChars          = 255
 	maxIdempotencyKeyBytes = 255
 
-	// insertTimeout bounds the upload's insert, which doesn't stop when the request's context does:
+	// defaultInsertTimeout bounds the upload's insert, which doesn't stop when the request's context does:
 	// a client hanging up mid-insert mustn't make a committed row look failed and lose its source.
-	insertTimeout = 15 * time.Second
+	defaultInsertTimeout = 15 * time.Second
 )
 
 type repo interface {
@@ -53,10 +53,12 @@ type fileStore interface {
 type Service struct {
 	repo  repo
 	files fileStore
+	// insertTimeout is defaultInsertTimeout outside tests.
+	insertTimeout time.Duration
 }
 
 func NewService(r repo, files fileStore) *Service {
-	return &Service{repo: r, files: files}
+	return &Service{repo: r, files: files, insertTimeout: defaultInsertTimeout}
 }
 
 // Upload is a file staged by Stage. Pass it to Create, which takes it over, or to Discard.
@@ -128,7 +130,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed
 	}
 	staged = ""
 
-	insertCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
+	insertCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.insertTimeout)
 	err = s.repo.insertAsset(insertCtx, Asset{
 		ID:             id,
 		TenantID:       p.TenantID,
@@ -140,6 +142,12 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed
 		TargetLUFS:     p.TargetLUFS,
 	})
 	cancel()
+	if errors.Is(err, errOutcomeUnknown) {
+		logging.LoggerFromContext(ctx).LogAttrs(ctx, slog.LevelWarn,
+			"kept the source of an asset whose insert may have committed",
+			slog.String("asset_id", id.String()), slog.String("error", err.Error()))
+		return Asset{}, false, fmt.Errorf("error creating asset: %w", err)
+	}
 	if err != nil {
 		s.remove(ctx, source)
 		if !errors.Is(err, errDuplicate) || p.IdempotencyKey == "" {
