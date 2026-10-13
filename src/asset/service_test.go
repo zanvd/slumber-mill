@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -46,6 +47,7 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{svc: NewService(repo, files), repo: repo, files: files, calls: c, root: root}
 }
 
+// stage stages content and forgets the calls that took, so a test sees only what it calls next.
 func (f *fixture) stage(t *testing.T, content string) Upload {
 	t.Helper()
 	u, err := f.svc.Stage(t.Context(), strings.NewReader(content))
@@ -392,7 +394,8 @@ func TestCreateFailures(t *testing.T) {
 	tests := []struct {
 		name         string
 		key          string
-		errs         map[string]error
+		repoErrs     map[string]error
+		fileErrs     map[string]error
 		beforeInsert func(*fakeRepo)
 		wantErr      error
 		wantCalls    []string
@@ -402,33 +405,34 @@ func TestCreateFailures(t *testing.T) {
 		{
 			name:      "key lookup fails",
 			key:       "upload-42",
-			errs:      map[string]error{"assetByIdempotencyKey": errBoom},
+			repoErrs:  map[string]error{"assetByIdempotencyKey": errBoom},
 			wantErr:   errBoom,
 			wantCalls: []string{"assetByIdempotencyKey", "Remove tmp"},
 		},
 		{
 			name:      "promote fails",
-			errs:      map[string]error{"Promote": errBoom},
+			fileErrs:  map[string]error{"Promote": errBoom},
 			wantErr:   errBoom,
 			wantCalls: []string{"Promote", "Remove tmp"},
 		},
 		{
 			name:      "insert fails",
-			errs:      map[string]error{"insertAsset": errBoom},
+			repoErrs:  map[string]error{"insertAsset": errBoom},
 			wantErr:   errBoom,
 			wantCalls: []string{"Promote", "insertAsset", "Remove sources"},
 		},
 		{
 			name:      "duplicate without a key",
-			errs:      map[string]error{"insertAsset": errDuplicate},
+			repoErrs:  map[string]error{"insertAsset": errDuplicate},
 			wantErr:   errDuplicate,
 			wantCalls: []string{"Promote", "insertAsset", "Remove sources"},
 		},
 		{
-			name:      "duplicate with no asset holding the key",
-			key:       "upload-42",
-			errs:      map[string]error{"insertAsset": errDuplicate},
-			wantCalls: []string{"assetByIdempotencyKey", "Promote", "insertAsset", "Remove sources", "assetByIdempotencyKey"},
+			name:     "duplicate with no asset holding the key",
+			key:      "upload-42",
+			repoErrs: map[string]error{"insertAsset": errDuplicate},
+			wantCalls: []string{"assetByIdempotencyKey", "Promote", "insertAsset", "Remove sources",
+				"assetByIdempotencyKey"},
 		},
 		{
 			name: "duplicate and the winner can't be read",
@@ -437,11 +441,12 @@ func TestCreateFailures(t *testing.T) {
 				r.assets = append(r.assets, stored(tenantID, "Rain", "audio", "upload-42"))
 				r.errs["assetByIdempotencyKey"] = errBoom
 			},
-			wantCalls: []string{"assetByIdempotencyKey", "Promote", "insertAsset", "Remove sources", "assetByIdempotencyKey"},
+			wantCalls: []string{"assetByIdempotencyKey", "Promote", "insertAsset", "Remove sources",
+				"assetByIdempotencyKey"},
 		},
 		{
 			name:       "created asset can't be read",
-			errs:       map[string]error{"assetByID": ErrNotFound},
+			repoErrs:   map[string]error{"assetByID": ErrNotFound},
 			wantCalls:  []string{"Promote", "insertAsset", "assetByID"},
 			wantSource: true,
 		},
@@ -450,10 +455,8 @@ func TestCreateFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
 			p := f.params(t, "Rain", "audio", tc.key)
-			for name, err := range tc.errs {
-				f.repo.errs[name] = err
-				f.files.errs[name] = err
-			}
+			maps.Copy(f.repo.errs, tc.repoErrs)
+			maps.Copy(f.files.errs, tc.fileErrs)
 			f.repo.beforeInsert = tc.beforeInsert
 
 			a, replayed, err := f.svc.Create(t.Context(), p)
