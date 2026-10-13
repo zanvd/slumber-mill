@@ -592,7 +592,10 @@ Tenants supply URLs, so the client must not become a proxy into the private netw
 - A `net.Dialer.Control` checks the **IP actually being dialled** (after DNS resolution, which defeats rebinding)
   with `IsPublic(netip.Addr)`. It rejects anything that isn't global unicast, private, loopback, link-local,
   multicast and unspecified addresses, IPv4-mapped forms of those, `0.0.0.0/8`, `100.64.0.0/10`, `192.0.0.0/24`,
-  `198.18.0.0/15`, `240.0.0.0/4` and `64:ff9b::/96` (NAT64).
+  `192.88.99.0/24` (6to4 relay anycast), `198.18.0.0/15`, `240.0.0.0/4`, `64:ff9b::/96` and `64:ff9b:1::/48` (NAT64),
+  `2001::/23` (IETF protocol assignments), `2002::/16` (6to4), `5f00::/16` (SRv6 SIDs) and `fec0::/10` (site-local).
+  A network-specific NAT64 prefix, which each network's operator picks, can embed private IPv4 addresses,
+  so no fixed list can cover it.
 - `Proxy: nil`, since environment proxies would bypass the check; redirects aren't followed (`http.ErrUseLastResponse`).
 - Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s.
 - `ErrBlockedAddress` is permanent. `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE=true` is for local development and tests only.
