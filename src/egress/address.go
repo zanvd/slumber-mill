@@ -14,7 +14,7 @@ const resolveTimeout = 5 * time.Second
 
 var (
 	ErrBlockedAddress = errors.New("blocked address")
-	errUnresolvable   = errors.New("unresolvable host")
+	ErrUnresolvable   = errors.New("unresolvable host")
 )
 
 // The blocked ranges netip's predicates don't cover. Read-only.
@@ -85,11 +85,11 @@ func (c *HostChecker) CheckHost(ctx context.Context, host string) error {
 	case ctx.Err() != nil:
 		return fmt.Errorf("error checking host %q: %w", host, ctx.Err())
 	case err != nil && lookupCtx.Err() != nil:
-		return fmt.Errorf("error checking host %q: %w: timed out after %s", host, errUnresolvable, resolveTimeout)
+		return fmt.Errorf("error checking host %q: %w: timed out after %s", host, ErrUnresolvable, resolveTimeout)
 	case err != nil:
-		return fmt.Errorf("error checking host %q: %w", host, errUnresolvable)
+		return fmt.Errorf("error checking host %q: %w", host, ErrUnresolvable)
 	case len(addrs) == 0:
-		return fmt.Errorf("error checking host %q: %w: no addresses", host, errUnresolvable)
+		return fmt.Errorf("error checking host %q: %w: no addresses", host, ErrUnresolvable)
 	}
 	for _, addr := range addrs {
 		if err := checkAddr(host, addr); err != nil {
