@@ -638,9 +638,11 @@ On the last page, `next_cursor` is `null`.
   nothing is buffered in memory. `Service.Create` then takes the tenant ID, title, idempotency key and staged upload.
   A handler that fails before calling it discards the staged file.
 - **Validation:** exactly one file part (the handler); a non-empty file and a title that is present,
-  valid UTF-8 and at most 255 characters (the service).
+  valid UTF-8 and at most 255 characters (the service). The service first trims the title's surrounding
+  whitespace, so a whitespace-only title counts as missing and the limit counts the trimmed title.
 - **Order of operations:** promote the file to `sources/<tenant>/<asset>` **before** inserting the row,
-  so no worker can claim an asset whose source isn't there. If the insert fails, delete the file.
+  so no worker can claim an asset whose source isn't there. If MySQL rejects the insert, delete the file;
+  if the outcome is unknown (a timeout or a lost connection), keep it, since an orphan is harmless.
   A crash in between leaves an orphan file (harmless, sweepable), never a row pointing at nothing.
 - **One insert** creates the asset as `queued`; there's no separate job to enqueue.
   The response re-reads the row, so it has real timestamps.
