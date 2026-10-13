@@ -28,7 +28,6 @@ type Lease struct {
 	Attempt      int
 }
 
-// Failure describes a failed attempt.
 type Failure struct {
 	// Permanent fails the row whatever its attempts.
 	Permanent   bool
@@ -156,6 +155,7 @@ func (l *Leases) Fail(ctx context.Context, held Lease, f Failure) (final bool, e
 }
 
 // Release requeues the row and gives back its attempt, so it is due again at once.
+// The next claim gets this lease's fence back, so the holder must not write with it again.
 func (l *Leases) Release(ctx context.Context, held Lease) error {
 	set := l.leaving(l.t.queued)
 	set["attempts"] = gorm.Expr("attempts - 1")
@@ -233,7 +233,6 @@ func (l *Leases) leaving(state string) map[string]any {
 	}
 }
 
-// finish applies a fenced update and then writes in one transaction, or only the update when writes is nil.
 func (l *Leases) finish(ctx context.Context, held Lease, set map[string]any, writes func(tx *gorm.DB) error) error {
 	if writes == nil {
 		return l.fenced(l.db.WithContext(ctx), held, set)
@@ -246,7 +245,6 @@ func (l *Leases) finish(ctx context.Context, held Lease, set map[string]any, wri
 	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 }
 
-// fenced updates the row only while held is still its lease, and returns ErrLeaseLost when it isn't.
 func (l *Leases) fenced(tx *gorm.DB, held Lease, set map[string]any) error {
 	res := tx.Table(l.t.name).
 		Where("id = ? AND "+l.t.column+" = ? AND attempts = ?", held.ID, l.t.leased, held.Attempt).
