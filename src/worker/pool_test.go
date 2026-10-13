@@ -343,11 +343,61 @@ func TestOutcomeWriteErrors(t *testing.T) {
 				synctest.Sleep(time.Minute)
 				r.stop()
 
-				if got := len(src.calls().fails); got != 2 {
-					t.Errorf("%d fails, want both leases failed", got)
+				calls := src.calls()
+				if len(calls.fails) != 2 || len(calls.releases) != 0 {
+					t.Errorf("fails, releases = %d, %d, want both leases failed once each", len(calls.fails), len(calls.releases))
 				}
 				if got := logs.find(t, tc.wantMsg); len(got) != 2 || got[0]["outcome"] != "failed" {
 					t.Errorf("records %q = %v, want two for the failed outcome", tc.wantMsg, got)
+				}
+			})
+		})
+	}
+}
+
+func TestFailedReleaseIsTheLastWrite(t *testing.T) {
+	tests := []struct {
+		name       string
+		releaseErr error
+		wantMsg    string
+	}{
+		{"lease lost", fmt.Errorf("error releasing: %w", ErrLeaseLost), "lease lost before the outcome was written"},
+		{"database error", errBoom, "writing the outcome failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				cfg, logs := testConfig(t)
+				src := newFakeSource(lease)
+				src.releaseErr = tc.releaseErr
+				src.process = func(ctx context.Context, _ Lease) error {
+					if err := busy(ctx, 10*time.Second); err != nil {
+						return err
+					}
+					return errBoom
+				}
+				r := startPool(t, src, cfg)
+				synctest.Sleep(5 * time.Second)
+				r.cancel()
+				r.wait()
+				if took := time.Since(start); took != 10*time.Second {
+					t.Errorf("Run returned at %v, want 10s, right after the release", took)
+				}
+
+				check := func(when string) {
+					t.Helper()
+					calls := src.calls()
+					if len(calls.releases) != 1 || len(calls.fails) != 0 {
+						t.Errorf("%s: releases, fails = %d, %d, want the one release and nothing after it",
+							when, len(calls.releases), len(calls.fails))
+					}
+				}
+				check("when Run returned")
+				synctest.Sleep(time.Minute)
+				check("a minute later")
+				if got := logs.find(t, tc.wantMsg); len(got) != 1 || got[0]["outcome"] != "released" {
+					t.Errorf("records %q = %v, want one for the released outcome", tc.wantMsg, got)
 				}
 			})
 		})
