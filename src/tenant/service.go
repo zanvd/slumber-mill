@@ -176,9 +176,13 @@ func (s *Service) validateCreate(ctx context.Context, p CreateParams) error {
 	case len(p.Slug) > maxSlugBytes:
 		v.Add("slug", "must be at most 64 characters")
 	}
-	if len(p.WebhookURL) > maxWebhookURLBytes {
+	switch {
+	case p.WebhookURL == "":
+	case len(p.WebhookURL) > maxWebhookURLBytes:
 		v.Add("webhook_url", "must be at most 2048 bytes")
-	} else if p.WebhookURL != "" {
+	case !visibleASCII(p.WebhookURL):
+		v.Add("webhook_url", "must be printable ASCII without spaces")
+	default:
 		u, err := url.Parse(p.WebhookURL)
 		switch {
 		case err != nil || !httpURL(u):
@@ -201,6 +205,15 @@ func (s *Service) validateCreate(ctx context.Context, p CreateParams) error {
 		v.Add("target_lufs", "must be between -70 and -5")
 	}
 	return v.Err()
+}
+
+func visibleASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] < '!' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 func slugChars(s string) bool {

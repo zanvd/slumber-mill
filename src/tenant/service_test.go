@@ -80,6 +80,7 @@ func TestCreateValidation(t *testing.T) {
 		slugChars  = "must be lower-case letters, digits and hyphens, and start and end with a letter or digit"
 		urlSyntax  = "must be an absolute http or https URL with a host"
 		urlLength  = "must be at most 2048 bytes"
+		urlASCII   = "must be printable ASCII without spaces"
 		userinfo   = "must not contain a user name or password"
 		fragment   = "must not contain a fragment"
 		lufsRange  = "must be between -70 and -5"
@@ -136,9 +137,21 @@ func TestCreateValidation(t *testing.T) {
 		{"scheme only", webhookURL("https://"), "webhook_url", urlSyntax},
 		{"empty host", webhookURL("https:///hooks"), "webhook_url", urlSyntax},
 		{"port without host", webhookURL("https://:443/hooks"), "webhook_url", urlSyntax},
-		{"space in host", webhookURL("https://exa mple.com/"), "webhook_url", urlSyntax},
-		{"control character", webhookURL("https://example.com/\x7f"), "webhook_url", urlSyntax},
-		{"leading space", webhookURL(" https://example.com/"), "webhook_url", urlSyntax},
+		{"percent-encoded space", webhookURL("https://example.com/a%20b?q=%09"), "", ""},
+		{"percent-encoded non-ASCII", webhookURL("https://example.com/caf%C3%A9"), "", ""},
+		{"space in host", webhookURL("https://exa mple.com/"), "webhook_url", urlASCII},
+		{"space in path", webhookURL("https://example.com/a b"), "webhook_url", urlASCII},
+		{"space in query", webhookURL("https://example.com/hooks?q=a b"), "webhook_url", urlASCII},
+		{"leading space", webhookURL(" https://example.com/"), "webhook_url", urlASCII},
+		{"trailing space", webhookURL("https://example.com/hooks "), "webhook_url", urlASCII},
+		{"tab", webhookURL("https://example.com/a\tb"), "webhook_url", urlASCII},
+		{"trailing newline", webhookURL("https://example.com/hooks\n"), "webhook_url", urlASCII},
+		{"NUL", webhookURL("https://example.com/\x00"), "webhook_url", urlASCII},
+		{"DEL", webhookURL("https://example.com/\x7f"), "webhook_url", urlASCII},
+		{"non-ASCII host", webhookURL("https://exämple.com/hooks"), "webhook_url", urlASCII},
+		{"non-ASCII path", webhookURL("https://example.com/café"), "webhook_url", urlASCII},
+		{"invalid UTF-8 byte", webhookURL("https://example.com/\x80"), "webhook_url", urlASCII},
+		{"too long and not ASCII", webhookURL(urlPrefix + strings.Repeat("é", maxURLPath)), "webhook_url", urlLength},
 		{"user and password", webhookURL("https://user:pass@example.com/"), "webhook_url", userinfo},
 		{"user", webhookURL("https://user@example.com/"), "webhook_url", userinfo},
 		{"empty userinfo", webhookURL("https://@example.com/"), "webhook_url", userinfo},
@@ -336,6 +349,8 @@ func TestCreateSkipsHostCheckForBadURL(t *testing.T) {
 		"https://user@example.com/",
 		"https://example.com/#top",
 		"https://example.com/" + strings.Repeat("a", 2048),
+		"https://exämple.com/",
+		"https://example.com/a b",
 	} {
 		t.Run(u, func(t *testing.T) {
 			f := newFixture()
