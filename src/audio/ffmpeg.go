@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zanvd/slumber-mill/src/logging"
 )
 
 const (
@@ -27,6 +29,81 @@ const (
 	// would open further files or URLs, so they aren't among them.
 	allowedDemuxers = "wav,mp3,flac,ogg,mov,aac,matroska,aiff"
 )
+
+// FFmpeg runs ffprobe and ffmpeg from PATH.
+type FFmpeg struct {
+	run runner
+}
+
+func New() *FFmpeg { return &FFmpeg{run: execRunner{}} }
+
+// Process probes src, measures it, renders outputs normalised to targetLUFS and verifies each one.
+// A *Rejection means retrying can't help. A missing source isn't one: its error matches fs.ErrNotExist.
+func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, outputs []Output) (Result, error) {
+	if err := validate(targetLUFS, outputs); err != nil {
+		return Result{}, err
+	}
+	source, err := f.probe(ctx, src)
+	if err != nil {
+		return Result{}, err
+	}
+	layouts := planLayouts(source.Channels, outputs)
+	input, measured, offsets, err := f.measure(ctx, src, source, targetLUFS, layouts)
+	if err != nil {
+		return Result{}, err
+	}
+	predicted := make([]Normalization, len(layouts))
+	for i, m := range measured {
+		predicted[i] = predict(m, targetLUFS)
+	}
+	rendered, err := f.render(ctx, src, targetLUFS, layouts, measured, offsets, outputs)
+	if err != nil {
+		return Result{}, err
+	}
+	log := logging.LoggerFromContext(ctx)
+	for i, l := range layouts {
+		if predicted[i] != rendered[i] {
+			log.WarnContext(ctx, "loudnorm's mode differs from the prediction",
+				"layout", l.name, "predicted", predicted[i], "rendered", rendered[i],
+				"measured_lufs", measured[i].LUFS, "measured_true_peak_dbtp", measured[i].TruePeakDBTP,
+				"measured_lra_lu", measured[i].LRALU)
+		}
+	}
+
+	renditions := make([]Rendition, len(outputs))
+	for i, l := range layouts {
+		for _, o := range l.outputs {
+			renditions[o] = Rendition{
+				Profile:       outputs[o].Profile,
+				Path:          outputs[o].Path,
+				Channels:      l.channels,
+				Measured:      measured[i],
+				Predicted:     predicted[i],
+				Normalization: rendered[i],
+			}
+		}
+	}
+	var failures []string
+	for i := range renditions {
+		r := &renditions[i]
+		if r.Loudness, err = f.verify(ctx, r.Path, targetLUFS); err != nil {
+			return Result{}, fmt.Errorf("error verifying %s: %w", r.Profile.Name, err)
+		}
+		if msg := check(r.Profile.Name, r.Loudness, targetLUFS); msg != "" {
+			failures = append(failures, msg)
+		}
+	}
+	if len(failures) > 0 {
+		return Result{}, reject(strings.Join(failures, "; "), nil)
+	}
+
+	return Result{
+		Source:     source,
+		Input:      input,
+		Warnings:   warnings(input, renditions),
+		Renditions: renditions,
+	}, nil
+}
 
 // Version runs ffmpeg -version and ffprobe -version and returns the first line of each, for logging.
 func (f *FFmpeg) Version(ctx context.Context) (ffmpeg, ffprobe string, err error) {
