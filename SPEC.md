@@ -328,8 +328,9 @@ CREATE TABLE webhook_deliveries (
   spaces in slugs and `Idempotency-Key` values.
 - **Tenant fields are validated before the insert.** A slug is 1–64 lower-case ASCII letters, digits and hyphens,
   starting and ending with a letter or digit, which also keeps `/` out of the webhook secret's AAD (§8).
-  A webhook URL is optional: at most 2048 bytes, an absolute `http` or `https` URL with a host,
-  and without userinfo, which would sit in the row in plaintext, or a fragment.
+  A webhook URL is optional: at most 2048 bytes of printable ASCII without spaces,
+  an absolute `http` or `https` URL with a host, and without userinfo, which would sit in the row in plaintext,
+  or a fragment.
   `target_lufs` is finite and from −70 to −5 LUFS, loudnorm's range, and is rounded to one decimal place
   before the insert, so the tenant `tenant create` returns matches the row.
 - **Closed sets are `ENUM` or `SET`:** `status`, `state`, `type`, `profile`, `codec`, `normalization` and `warnings`.
