@@ -65,28 +65,41 @@ func parseLog(ebur128, stderr string, chunk int) *ffmpegLog {
 func withTrailingSpaces(stderr string) string { return strings.ReplaceAll(stderr, "]\n", "] \n") }
 
 func TestFFmpegLogReadsReportsByName(t *testing.T) {
-	for _, chunk := range []int{1, 7, len(pass1Stderr)} {
-		l := parseLog(inputInstance, withTrailingSpaces(pass1Stderr), chunk)
-		for _, want := range []struct {
-			name string
-			m    Loudness
-			mode string
-		}{
-			{"loudnorm@stereo", Loudness{LUFS: -17.69, TruePeakDBTP: -7.26, LRALU: 0.1, ThresholdLUFS: -27.69}, "linear"},
-			{"loudnorm@mono", Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7}, "dynamic"},
-		} {
-			m, report, err := l.loudnorm(want.name)
-			if err != nil {
-				t.Fatalf("chunk %d: loudnorm(%q) error = %v", chunk, want.name, err)
+	chunks := []struct {
+		name string
+		size int
+	}{
+		{"a byte at a time", 1},
+		{"7 bytes at a time", 7},
+		{"all at once", len(pass1Stderr)},
+	}
+	reports := []struct {
+		instance string
+		m        Loudness
+		mode     string
+	}{
+		{"loudnorm@stereo", Loudness{LUFS: -17.69, TruePeakDBTP: -7.26, LRALU: 0.1, ThresholdLUFS: -27.69}, "linear"},
+		{"loudnorm@mono", Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7}, "dynamic"},
+	}
+	for _, chunk := range chunks {
+		t.Run(chunk.name, func(t *testing.T) {
+			l := parseLog(inputInstance, withTrailingSpaces(pass1Stderr), chunk.size)
+			for _, want := range reports {
+				t.Run(want.instance, func(t *testing.T) {
+					m, report, err := l.loudnorm(want.instance)
+					if err != nil {
+						t.Fatalf("loudnorm(%q) error = %v", want.instance, err)
+					}
+					if m != want.m || report.NormalizationType != want.mode {
+						t.Errorf("loudnorm(%q) = %+v, %q, want %+v, %q",
+							want.instance, m, report.NormalizationType, want.m, want.mode)
+					}
+				})
 			}
-			if m != want.m || report.NormalizationType != want.mode {
-				t.Errorf("chunk %d: loudnorm(%q) = %+v, %q, want %+v, %q",
-					chunk, want.name, m, report.NormalizationType, want.m, want.mode)
+			if got, err := l.maxMomentary(); err != nil || got != -17.6 {
+				t.Errorf("maxMomentary() = %v, %v, want -17.6", got, err)
 			}
-		}
-		if got, err := l.maxMomentary(); err != nil || got != -17.6 {
-			t.Errorf("chunk %d: maxMomentary() = %v, %v, want -17.6", chunk, got, err)
-		}
+		})
 	}
 }
 
@@ -162,38 +175,55 @@ func TestFFmpegLogMomentary(t *testing.T) {
 
 func TestCutInstance(t *testing.T) {
 	tests := []struct {
-		line     string
-		name     string
-		rest     string
-		prefixed bool
+		name         string
+		line         string
+		wantInstance string
+		wantRest     string
+		wantOK       bool
 	}{
-		{"[loudnorm@mono @ 0x55b9c1ba24c0] ", "loudnorm@mono", " ", true},
-		{"[ebur128@input @ 0x1] t: 0.1", "ebur128@input", " t: 0.1", true},
-		{"[aist#0:0/pcm_s16le @ 0x2] Guessed Channel Layout: stereo", "aist#0:0/pcm_s16le", " Guessed Channel Layout: stereo", true},
-		{"[loudnorm@mono]", "", "", false},
-		{"[loudnorm@mono @ nowhere] x", "", "", false},
-		{"[loudnorm@mono @ 0x1", "", "", false},
-		{`	"input_i" : "-20.70",`, "", "", false},
-		{"", "", "", false},
+		{"report header", "[loudnorm@mono @ 0x55b9c1ba24c0] ", "loudnorm@mono", " ", true},
+		{"frame line", "[ebur128@input @ 0x1] t: 0.1", "ebur128@input", " t: 0.1", true},
+		{"another component", "[aist#0:0/pcm_s16le @ 0x2] Guessed Channel Layout: stereo",
+			"aist#0:0/pcm_s16le", " Guessed Channel Layout: stereo", true},
+		{"no address", "[loudnorm@mono]", "", "", false},
+		{"address not hex", "[loudnorm@mono @ nowhere] x", "", "", false},
+		{"unclosed", "[loudnorm@mono @ 0x1", "", "", false},
+		{"report body", `	"input_i" : "-20.70",`, "", "", false},
+		{"empty", "", "", "", false},
 	}
 	for _, tc := range tests {
-		name, rest, ok := cutInstance(tc.line)
-		if name != tc.name || rest != tc.rest || ok != tc.prefixed {
-			t.Errorf("cutInstance(%q) = %q, %q, %t, want %q, %q, %t",
-				tc.line, name, rest, ok, tc.name, tc.rest, tc.prefixed)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			instance, rest, ok := cutInstance(tc.line)
+			if instance != tc.wantInstance || rest != tc.wantRest || ok != tc.wantOK {
+				t.Errorf("cutInstance(%q) = %q, %q, %t, want %q, %q, %t",
+					tc.line, instance, rest, ok, tc.wantInstance, tc.wantRest, tc.wantOK)
+			}
+		})
 	}
 }
 
 func TestParseLevel(t *testing.T) {
-	for _, s := range []string{"-inf", "inf", "-20.70", "0.00"} {
-		if _, err := parseLevel(s); err != nil {
-			t.Errorf("parseLevel(%q) error = %v", s, err)
-		}
+	tests := []struct {
+		name    string
+		s       string
+		want    float64
+		wantErr bool
+	}{
+		{"minus infinity", "-inf", math.Inf(-1), false},
+		{"infinity", "inf", math.Inf(1), false},
+		{"level", "-20.70", -20.7, false},
+		{"zero", "0.00", 0, false},
+		{"nan", "nan", 0, true},
+		{"empty", "", 0, true},
+		{"text", "loud", 0, true},
+		{"out of range", strings.Repeat("9", 400), 0, true},
 	}
-	for _, s := range []string{"nan", "", "loud", strings.Repeat("9", 400)} {
-		if v, err := parseLevel(s); err == nil {
-			t.Errorf("parseLevel(%q) = %v, want an error", s, v)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseLevel(tc.s)
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Errorf("parseLevel(%q) = %v, %v, want %v and an error: %t", tc.s, got, err, tc.want, tc.wantErr)
+			}
+		})
 	}
 }

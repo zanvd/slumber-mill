@@ -451,10 +451,22 @@ func TestProcessRefusesBadArguments(t *testing.T) {
 			}
 		})
 	}
-	for _, target := range []float64{-70, -5} {
-		if err := validate(target, outputs()); err != nil {
-			t.Errorf("validate(%v) error = %v, want loudnorm's limits accepted", target, err)
-		}
+}
+
+func TestValidateAcceptsLoudnormsLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		target float64
+	}{
+		{"lowest target", -70},
+		{"highest target", -5},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validate(tc.target, outputs()); err != nil {
+				t.Errorf("validate(%v) error = %v, want it accepted", tc.target, err)
+			}
+		})
 	}
 }
 
@@ -580,12 +592,30 @@ func TestPredict(t *testing.T) {
 		{"thunder", Loudness{LUFS: -38.85, TruePeakDBTP: -1.26, LRALU: 0.1}, Dynamic},
 	}
 	for _, tc := range tests {
-		if got := predict(tc.m, -16); got != tc.want {
-			t.Errorf("%s: predict(%+v) = %s, want %s", tc.name, tc.m, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := predict(tc.m, -16); got != tc.want {
+				t.Errorf("predict(%+v) = %s, want %s", tc.m, got, tc.want)
+			}
+		})
 	}
-	if got := measuredLRA(Loudness{}); got != 0.01 {
-		t.Errorf("measuredLRA of 0 = %v, want 0.01", got)
+}
+
+func TestMeasuredLRA(t *testing.T) {
+	tests := []struct {
+		name string
+		lra  float64
+		want float64
+	}{
+		{"0 is passed as 0.01", 0, 0.01},
+		{"0.01 is kept", 0.01, 0.01},
+		{"anything larger is kept", 0.1, 0.1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := measuredLRA(Loudness{LRALU: tc.lra}); got != tc.want {
+				t.Errorf("measuredLRA(%v) = %v, want %v", tc.lra, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -611,32 +641,37 @@ func TestWarnings(t *testing.T) {
 			[]Warning{WarningSuddenLoudEvent, WarningDynamicNormalization, WarningSourceMayClip}},
 	}
 	for _, tc := range tests {
-		if got := warnings(tc.in, tc.renditions); !slices.Equal(got, tc.want) {
-			t.Errorf("%s: warnings() = %v, want %v", tc.name, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := warnings(tc.in, tc.renditions); !slices.Equal(got, tc.want) {
+				t.Errorf("warnings() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
 func TestCheck(t *testing.T) {
 	tests := []struct {
+		name   string
 		target float64
 		m      Loudness
 		ok     bool
 	}{
-		{-16, Loudness{LUFS: -16, TruePeakDBTP: -1.5}, true},
-		{-16, Loudness{LUFS: -17, TruePeakDBTP: -3}, true},
-		{-16, Loudness{LUFS: -15, TruePeakDBTP: -3}, true},
-		{-16.3, Loudness{LUFS: -17.3, TruePeakDBTP: -3}, true},
-		{-16.3, Loudness{LUFS: -15.3, TruePeakDBTP: -3}, true},
-		{-16, Loudness{LUFS: -17.01, TruePeakDBTP: -3}, false},
-		{-16, Loudness{LUFS: -14.99, TruePeakDBTP: -3}, false},
-		{-16, Loudness{LUFS: -16, TruePeakDBTP: -1.49}, false},
-		{-16, Loudness{LUFS: math.Inf(-1), TruePeakDBTP: math.Inf(-1)}, false},
+		{"on target, peak on the ceiling", -16, Loudness{LUFS: -16, TruePeakDBTP: -1.5}, true},
+		{"1 LU under", -16, Loudness{LUFS: -17, TruePeakDBTP: -3}, true},
+		{"1 LU over", -16, Loudness{LUFS: -15, TruePeakDBTP: -3}, true},
+		{"1 LU under a fractional target", -16.3, Loudness{LUFS: -17.3, TruePeakDBTP: -3}, true},
+		{"1 LU over a fractional target", -16.3, Loudness{LUFS: -15.3, TruePeakDBTP: -3}, true},
+		{"just over 1 LU under", -16, Loudness{LUFS: -17.01, TruePeakDBTP: -3}, false},
+		{"just over 1 LU over", -16, Loudness{LUFS: -14.99, TruePeakDBTP: -3}, false},
+		{"peak just above the ceiling", -16, Loudness{LUFS: -16, TruePeakDBTP: -1.49}, false},
+		{"silent", -16, Loudness{LUFS: math.Inf(-1), TruePeakDBTP: math.Inf(-1)}, false},
 	}
 	for _, tc := range tests {
-		if msg := check("aac_64k", tc.m, tc.target); (msg == "") != tc.ok {
-			t.Errorf("check(%+v, %v) = %q, want it to pass: %t", tc.m, tc.target, msg, tc.ok)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if msg := check("aac_64k", tc.m, tc.target); (msg == "") != tc.ok {
+				t.Errorf("check(%+v, %v) = %q, want it to pass: %t", tc.m, tc.target, msg, tc.ok)
+			}
+		})
 	}
 }
 
@@ -659,32 +694,49 @@ func TestPlanLayouts(t *testing.T) {
 	stereo := Profile{Name: "s", BitrateKbps: 128, MaxChannels: 2}
 	mono := Profile{Name: "m", BitrateKbps: 64, MaxChannels: 1}
 	tests := []struct {
+		name     string
 		channels int
 		profiles []Profile
 		want     []layout
 	}{
-		{2, []Profile{stereo, mono}, []layout{{"stereo", 2, []int{0}}, {"mono", 1, []int{1}}}},
-		{1, []Profile{stereo, mono}, []layout{{"mono", 1, []int{0, 1}}}},
-		{6, []Profile{mono, stereo, mono}, []layout{{"mono", 1, []int{0, 2}}, {"stereo", 2, []int{1}}}},
+		{"stereo source", 2, []Profile{stereo, mono}, []layout{{"stereo", 2, []int{0}}, {"mono", 1, []int{1}}}},
+		{"mono source", 1, []Profile{stereo, mono}, []layout{{"mono", 1, []int{0, 1}}}},
+		{"5.1 source, repeated layout", 6, []Profile{mono, stereo, mono},
+			[]layout{{"mono", 1, []int{0, 2}}, {"stereo", 2, []int{1}}}},
 	}
 	for _, tc := range tests {
-		var outs []Output
-		for _, p := range tc.profiles {
-			outs = append(outs, Output{Profile: p, Path: "/x"})
-		}
-		got := planLayouts(tc.channels, outs)
-		if !slices.EqualFunc(got, tc.want, func(a, b layout) bool {
-			return a.name == b.name && a.channels == b.channels && slices.Equal(a.outputs, b.outputs)
-		}) {
-			t.Errorf("planLayouts(%d) = %+v, want %+v", tc.channels, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			var outs []Output
+			for _, p := range tc.profiles {
+				outs = append(outs, Output{Profile: p, Path: "/x"})
+			}
+			got := planLayouts(tc.channels, outs)
+			if !slices.EqualFunc(got, tc.want, func(a, b layout) bool {
+				return a.name == b.name && a.channels == b.channels && slices.Equal(a.outputs, b.outputs)
+			}) {
+				t.Errorf("planLayouts(%d) = %+v, want %+v", tc.channels, got, tc.want)
+			}
+		})
 	}
 }
 
 func TestNum(t *testing.T) {
-	for v, want := range map[float64]string{-16: "-16", -17.69: "-17.69", -0.1: "-0.1", 0.01: "0.01", 50: "50"} {
-		if got := num(v); got != want {
-			t.Errorf("num(%v) = %q, want %q", v, got, want)
-		}
+	tests := []struct {
+		name string
+		v    float64
+		want string
+	}{
+		{"whole target", -16, "-16"},
+		{"two decimals", -17.69, "-17.69"},
+		{"one decimal", -0.1, "-0.1"},
+		{"the smallest LRA", 0.01, "0.01"},
+		{"positive", 50, "50"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := num(tc.v); got != tc.want {
+				t.Errorf("num(%v) = %q, want %q", tc.v, got, tc.want)
+			}
+		})
 	}
 }
