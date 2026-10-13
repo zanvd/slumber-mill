@@ -132,9 +132,12 @@ func TestProcessCommands(t *testing.T) {
 	if _, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs()); err != nil {
 		t.Fatalf("Process() error = %v", err)
 	}
-	const common = "-nostdin -hide_banner -nostats -loglevel info"
+	// The whitelists only apply to an input they precede.
+	const whitelists = "-protocol_whitelist file -format_whitelist wav,mp3,flac,ogg,mov,aac,matroska,aiff"
+	const common = "-nostdin -hide_banner -nostats -loglevel info " + whitelists
 	want := []string{
-		"ffprobe -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json /src.wav",
+		"ffprobe -v error " + whitelists +
+			" -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json /src.wav",
 		"ffmpeg " + common + " -i /src.wav -filter_complex " +
 			"[0:a:0]ebur128@input=framelog=info,asplit=2[p0][p1];" +
 			"[p0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4:LRA=50:print_format=json[m0];" +

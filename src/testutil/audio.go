@@ -86,8 +86,26 @@ func Silence(tb testing.TB) string {
 // NotAudio is a text file named like a WAV file.
 func NotAudio(tb testing.TB) string {
 	tb.Helper()
-	path := filepath.Join(tb.TempDir(), "text.wav")
-	if err := os.WriteFile(path, []byte("this is not audio\n"), 0o600); err != nil {
+	return writeFixture(tb, filepath.Join(tb.TempDir(), "text.wav"), "this is not audio\n")
+}
+
+// HLSPlaylist writes an HLS playlist to dir, named .m3u8 so ffmpeg detects it, whose one segment is segment:
+// a path relative to dir, or a URL.
+func HLSPlaylist(tb testing.TB, dir, segment string) string {
+	tb.Helper()
+	return writeFixture(tb, filepath.Join(dir, "playlist.m3u8"),
+		"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\n"+segment+"\n#EXT-X-ENDLIST\n")
+}
+
+// ConcatList writes an ffconcat list to dir that plays file, a path relative to dir.
+func ConcatList(tb testing.TB, dir, file string) string {
+	tb.Helper()
+	return writeFixture(tb, filepath.Join(dir, "list.ffconcat"), "ffconcat version 1.0\nfile '"+file+"'\n")
+}
+
+func writeFixture(tb testing.TB, path, content string) string {
+	tb.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		tb.Fatalf("error writing %s: %v", path, err)
 	}
 	return path

@@ -20,6 +20,9 @@ const (
 	verifyInstance = "loudnorm@verify"
 	// ffprobeInvalid is ffprobe's exit status when it can't read the input.
 	ffprobeInvalid = 1
+	// allowedDemuxers are the containers an input may come in. Playlists, such as hls and concat,
+	// would open further files or URLs, so they aren't among them.
+	allowedDemuxers = "wav,mp3,flac,ogg,mov,aac,matroska,aiff"
 )
 
 // Version runs ffmpeg -version and ffprobe -version and returns the first line of each, for logging.
@@ -61,13 +64,7 @@ type probeOutput struct {
 
 func (f *FFmpeg) probe(ctx context.Context, src string) (Source, error) {
 	var stdout bytes.Buffer
-	args := []string{
-		"-select_streams", "a:0",
-		"-show_entries", "stream=codec_name,sample_rate,channels:format=duration",
-		"-of", "json",
-		src,
-	}
-	if err := f.run.Run(ctx, "ffprobe", args, &stdout, nil); err != nil {
+	if err := f.run.Run(ctx, "ffprobe", probeArgs(src), &stdout, nil); err != nil {
 		if exitErr, ok := errors.AsType[*exitError](err); !ok || exitErr.code != ffprobeInvalid {
 			return Source{}, fmt.Errorf("error probing the source: %w", err)
 		}
@@ -179,8 +176,24 @@ func (f *FFmpeg) verify(ctx context.Context, path string, targetLUFS float64) (L
 
 func loudnormInstance(l layout) string { return "loudnorm@" + l.name }
 
+// inputOptions let ffmpeg and ffprobe open an input only as a local file in one of the allowed containers.
+// They apply to the input that follows them; after it they would be ignored.
+func inputOptions() []string {
+	return []string{"-protocol_whitelist", "file", "-format_whitelist", allowedDemuxers}
+}
+
+func probeArgs(src string) []string {
+	args := append([]string{"-v", "error"}, inputOptions()...)
+	return append(args,
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name,sample_rate,channels:format=duration",
+		"-of", "json",
+		src)
+}
+
 func ffmpegArgs(src string) []string {
-	return []string{"-nostdin", "-hide_banner", "-nostats", "-loglevel", "info", "-i", src}
+	args := append([]string{"-nostdin", "-hide_banner", "-nostats", "-loglevel", "info"}, inputOptions()...)
+	return append(args, "-i", src)
 }
 
 func loudnormTargets(targetLUFS float64) string {
