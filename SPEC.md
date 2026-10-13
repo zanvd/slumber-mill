@@ -443,8 +443,10 @@ and size the timeout, the lease and the pool's CPU limit with that in mind.
 3. **Measure each output layout (pass 1).** For every distinct channel layout among the profiles,
    measure the downmixed signal: `-af aformat=channel_layouts=<layout>,loudnorm=...:print_format=json` (pitfall 15).
    Run `ebur128` once for max momentary loudness. Integrated `-inf` or below −70 LUFS is a **rejection** ("silent").
-4. **Predict linear or dynamic.** Linear gain is only possible if `measured_TP + (target − measured_I) ≤ ceiling`;
-   otherwise loudnorm silently switches to dynamic mode (pitfall 18).
+4. **Predict linear or dynamic.** Linear gain is only possible if `measured_TP + (target − measured_I) ≤ TP`
+   and `measured_LRA ≤ LRA`, where `TP` is the pre-encode true peak passed to loudnorm (not the published ceiling)
+   and `LRA` is loudnorm's; otherwise loudnorm silently switches to dynamic mode (pitfall 18).
+   loudnorm reads a measured LRA of 0 as unmeasured, so pass `max(measured_LRA, 0.01)`.
    Render anyway, but record `normalization='dynamic'` and warn.
 5. **Render (pass 2):** one ffmpeg run, one loudnorm per layout with its own measurements (command below).
    Run it at `-loglevel info`, since the pass-2 report only prints at that level,
@@ -479,8 +481,9 @@ The pass-2 command from step 5 (line breaks added for readability):
 
 Both outputs are 48 kHz MP4/AAC with `+faststart`.
 The integrated target comes from the tenant (default −16 LUFS) and is snapshotted onto the asset at upload.
-Choose the pre-encode `TP` with 2–3 dB of headroom below the published ceiling,
-because the encoder adds true peak (pitfall 17).
+The published ceiling is −1.5 dBTP. loudnorm gets a pre-encode `TP` of −4.0 dBTP, 2.5 dB of headroom below it,
+because the encoder adds true peak (pitfall 17), and `LRA=50`, its maximum in 6.1.1:
+it never blocks linear mode, and lower values pull dynamic renders off target.
 
 ### Why per-rendition loudness (measured)
 
