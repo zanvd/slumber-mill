@@ -2,6 +2,7 @@ package asset
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -227,6 +228,12 @@ func TestCreateValidation(t *testing.T) {
 		{"title not UTF-8", "Rain \xff", "audio", "", fields("title", "must be valid UTF-8")},
 		{"title of 256 characters", strings.Repeat("é", 256), "audio", "", fields("title",
 			"must be at most 255 characters")},
+		{"title of spaces", "   ", "audio", "", fields("title", "is required")},
+		{"title of tabs and newlines", "\t\n\r", "audio", "", fields("title", "is required")},
+		{"title of a non-breaking space", "\u00a0", "audio", "", fields("title", "is required")},
+		{"title of 256 characters between spaces", "  " + strings.Repeat("é", 256) + " ", "audio", "",
+			fields("title", "must be at most 255 characters")},
+		{"title not UTF-8 between spaces", " Rain \xff ", "audio", "", fields("title", "must be valid UTF-8")},
 		{"file empty", ok, "", "", fields("file", "is empty")},
 		{"key with NUL", ok, "audio", "upload\x00", fields("Idempotency-Key", "must be printable ASCII")},
 		{"key with a tab", ok, "audio", "up\tload", fields("Idempotency-Key", "must be printable ASCII")},
@@ -274,6 +281,33 @@ func TestCreateValidation(t *testing.T) {
 	}
 }
 
+func TestCreateTrimsTitle(t *testing.T) {
+	tests := []struct {
+		name, title, want string
+	}{
+		{"spaces", "  Rain  ", "Rain"},
+		{"tabs and newlines", "\t\nRain\r\n", "Rain"},
+		{"non-breaking spaces", "\u00a0Rain\u00a0", "Rain"},
+		{"inner whitespace kept", " Rain  on a roof ", "Rain  on a roof"},
+		{"255 characters between spaces", "  " + strings.Repeat("é", 255) + "  ", strings.Repeat("é", 255)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			a, _, err := f.svc.Create(t.Context(), f.params(t, tc.title, "audio", ""))
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			if a.Title != tc.want {
+				t.Errorf("Create() title = %q, want %q", a.Title, tc.want)
+			}
+			if got := f.repo.assets[len(f.repo.assets)-1].Title; got != tc.want {
+				t.Errorf("inserted title = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCreateAcceptsLimits(t *testing.T) {
 	tests := []struct {
 		name, title, key string
@@ -308,6 +342,8 @@ func TestCreateIdempotency(t *testing.T) {
 		name     string
 		existing []Asset
 		winner   *Asset
+		// reqTitle is the request's title; it defaults to title.
+		reqTitle string
 		// wantAsset is the index into existing, or -1 for the winner, of the asset Create returns.
 		wantAsset int
 		wantErr   error
@@ -318,6 +354,21 @@ func TestCreateIdempotency(t *testing.T) {
 			existing:  []Asset{stored(tenantID, title, content, key)},
 			wantAsset: 0,
 			wantCalls: []string{"assetByIdempotencyKey", "Remove tmp"},
+		},
+		{
+			name:      "replay with a title differing only in surrounding whitespace",
+			existing:  []Asset{stored(tenantID, title, content, key)},
+			reqTitle:  " \tRain\u00a0\n",
+			wantAsset: 0,
+			wantCalls: []string{"assetByIdempotencyKey", "Remove tmp"},
+		},
+		{
+			name:      "lost the race to the same upload with a padded title",
+			winner:    new(stored(tenantID, title, content, key)),
+			reqTitle:  "  Rain ",
+			wantAsset: -1,
+			wantCalls: []string{"assetByIdempotencyKey", "Promote", "insertAsset", "Remove sources",
+				"assetByIdempotencyKey"},
 		},
 		{
 			name:      "same key with a different file",
@@ -354,7 +405,8 @@ func TestCreateIdempotency(t *testing.T) {
 				f.repo.beforeInsert = func(r *fakeRepo) { r.assets = append(r.assets, *tc.winner) }
 			}
 
-			a, replayed, err := f.svc.Create(t.Context(), f.params(t, title, content, key))
+			reqTitle := cmp.Or(tc.reqTitle, title)
+			a, replayed, err := f.svc.Create(t.Context(), f.params(t, reqTitle, content, key))
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Create() error = %v, want %v", err, tc.wantErr)
 			}

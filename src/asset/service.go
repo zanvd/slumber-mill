@@ -97,7 +97,8 @@ type CreateParams struct {
 	TenantID uint64
 	// TargetLUFS is the tenant's loudness target, which the asset keeps as it was at upload.
 	TargetLUFS float64
-	Title      string
+	// Title is trimmed of surrounding whitespace before it is validated and stored.
+	Title string
 	// IdempotencyKey is empty when the request has none.
 	IdempotencyKey string
 	Upload         Upload
@@ -110,6 +111,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed
 	staged := p.Upload.path
 	defer func() { s.remove(ctx, staged) }()
 
+	p.Title = strings.TrimSpace(p.Title)
 	if err := validateCreate(p); err != nil {
 		return Asset{}, false, err
 	}
