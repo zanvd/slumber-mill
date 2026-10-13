@@ -619,9 +619,12 @@ Tenants supply URLs, so the client must not become a proxy into the private netw
 - `Proxy: nil`, since environment proxies would bypass the check; redirects aren't followed (`http.ErrUseLastResponse`).
 - Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s.
 - `ErrBlockedAddress` is permanent. `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE=true` is for local development and tests only.
+  `egress.ErrUnresolvable` (the lookup failed, timed out or returned no addresses) is retryable for deliveries,
+  since DNS failures are often transient.
 - **`tenant create` checks too.** It refuses a webhook URL whose host is an IP literal that isn't public,
-  or a name that doesn't resolve or resolves to any address that isn't public, and honours
-  `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE`. DNS can change after creation, so the dial-time check stays the real guard.
+  or a name that doesn't resolve or resolves to any address that isn't public, with the field errors
+  "host must resolve" and "host must be public", and honours `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE`.
+  DNS can change after creation, so the dial-time check stays the real guard.
 
 ## 9. HTTP API
 
