@@ -358,10 +358,10 @@ func (s *leaseSource) Reap(ctx context.Context) error {
 	return nil
 }
 
-// lost turns db's lost lease into the worker's, which is the one the pool recognises.
+// lost translates db's lost lease into the worker's, which is the one the pool recognises.
 func lost(err error) error {
 	if errors.Is(err, db.ErrLeaseLost) {
-		return fmt.Errorf("%w: %w", worker.ErrLeaseLost, err)
+		return fmt.Errorf("%w: %v", worker.ErrLeaseLost, err)
 	}
 	return err
 }
