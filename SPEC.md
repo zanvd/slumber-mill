@@ -140,6 +140,7 @@ src/                         the Go module: go.mod, go.sum and all Go code
   tenant/                    repository.go, service.go (create, authenticate, webhook target)
   asset/                     repository.go, service.go (upload, get, list, renditions, events), processor.go
   webhook/                   repository.go, service.go (relay, deliver), sign.go (Sign, Verify), client.go
+  egress/                    IsPublic, ErrBlockedAddress, HostChecker: which addresses outbound calls may reach
   audio/                     ffprobe/ffmpeg wrappers, loudness report parsing
   storage/                   local disk with atomic promote, temp sweep
   secret/                    random tokens (sm_, whsec_), AES-GCM box for stored secrets, redacting Value type
@@ -599,11 +600,15 @@ a backup or a read-only SQL injection doesn't hand out what's needed to forge ev
 ### SSRF-safe client
 
 Tenants supply URLs, so the client must not become a proxy into the private network.
+`IsPublic`, `ErrBlockedAddress` and `HostChecker` live in the leaf package `egress`, which `webhook/client.go`'s dialer and `tenant` both use.
 
 - A `net.Dialer.Control` checks the **IP actually being dialled** (after DNS resolution, which defeats rebinding)
   with `IsPublic(netip.Addr)`. It rejects anything that isn't global unicast, private, loopback, link-local,
   multicast and unspecified addresses, IPv4-mapped forms of those, `0.0.0.0/8`, `100.64.0.0/10`, `192.0.0.0/24`,
-  `198.18.0.0/15`, `240.0.0.0/4` and `64:ff9b::/96` (NAT64).
+  `192.88.99.0/24` (6to4 relay anycast), `198.18.0.0/15`, `240.0.0.0/4`, `64:ff9b::/96` and `64:ff9b:1::/48` (NAT64),
+  `2001::/23` (IETF protocol assignments), `2002::/16` (6to4), `5f00::/16` (SRv6 SIDs) and `fec0::/10` (site-local).
+  A network-specific NAT64 prefix, which each network's operator picks, can embed private IPv4 addresses,
+  so no fixed list can cover it.
 - `Proxy: nil`, since environment proxies would bypass the check; redirects aren't followed (`http.ErrUseLastResponse`).
 - Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s.
 - `ErrBlockedAddress` is permanent. `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE=true` is for local development and tests only.
