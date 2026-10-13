@@ -12,11 +12,8 @@ var (
 	ErrSlugTaken       = errors.New("slug already taken")
 	ErrUnauthenticated = errors.New("invalid API key")
 	ErrNoWebhook       = errors.New("tenant has no webhook configured")
-	// ErrNoKeyRing is returned by the calls that seal or open webhook secrets
-	// when the service was built without a key ring.
-	ErrNoKeyRing = errors.New("no secret key ring configured")
-	// ErrNoHostChecker is returned by Create when the service was built without a webhook host checker.
-	ErrNoHostChecker = errors.New("no webhook host checker configured")
+	ErrNoKeyRing       = errors.New("no secret key ring configured")
+	ErrNoHostChecker   = errors.New("no webhook host checker configured")
 
 	errDuplicate = errors.New("duplicate key")
 	errDatabase  = errors.New("database error")
