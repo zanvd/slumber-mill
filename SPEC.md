@@ -428,24 +428,28 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 
 ## 7. Audio processing (encode pool)
 
-Three attempts, backoff from 30 s to 10 min, a 2 h timeout.
-Budget about 75 s per 10 minutes of audio on two cores, roughly 75 minutes for a 10-hour soundscape (pitfall 23),
+Three attempts, backoff from 30 s to 10 min, a 3 h timeout.
+Budget about 140 s per 10 minutes of audio, even with two encodes sharing two cores,
+roughly 2.3 hours for a 10-hour soundscape (pitfall 23),
 and size the timeout, the lease and the pool's CPU limit with that in mind.
 
 ### Steps
 
 1. **Claim** the asset (§6).
-2. **Probe** the source:
-   `ffprobe -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json`.
-   A missing file is retryable (a storage blip). A file ffprobe can't parse, or with no audio stream,
+2. **Probe** the source, with the input whitelists from "ffmpeg execution":
+   `ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json`.
+   A missing file is retryable (a storage blip). A file ffprobe can't parse or may not open, or with no audio stream,
    is a **rejection** ("not audio"); so is anything **shorter than 3 s** ("too short", pitfall 20).
 3. **Measure each output layout (pass 1).** For every distinct channel layout among the profiles,
    measure the downmixed signal: `-af aformat=channel_layouts=<layout>,loudnorm=...:print_format=json` (pitfall 15).
    Run `ebur128` once for max momentary loudness. Integrated `-inf` or below −70 LUFS is a **rejection** ("silent").
-4. **Predict linear or dynamic.** Linear gain is only possible if `measured_TP + (target − measured_I) ≤ ceiling`;
-   otherwise loudnorm silently switches to dynamic mode (pitfall 18).
+4. **Predict linear or dynamic.** Linear gain is only possible if `measured_TP + (target − measured_I) ≤ TP`
+   and `measured_LRA ≤ LRA`, where `TP` is the pre-encode true peak passed to loudnorm (not the published ceiling)
+   and `LRA` is loudnorm's; otherwise loudnorm silently switches to dynamic mode (pitfall 18).
+   loudnorm reads a measured LRA of 0 as unmeasured, so pass `max(measured_LRA, 0.01)`.
    Render anyway, but record `normalization='dynamic'` and warn.
-5. **Render (pass 2):** one ffmpeg run, one loudnorm per layout with its own measurements (command below).
+5. **Render (pass 2):** one ffmpeg run, one loudnorm per layout with its own measurements,
+   and pass 1's `target_offset` as `offset` (command below).
    Run it at `-loglevel info`, since the pass-2 report only prints at that level,
    and **check the exit status before parsing any report** (pitfall 21).
 6. **Verify every rendition** (pitfall 16): integrated loudness within ±1 LU of target and true peak
@@ -460,10 +464,10 @@ The pass-2 command from step 5 (line breaks added for readability):
 -filter_complex "
   [0:a:0]asplit=2[s][m];
   [s]aformat=channel_layouts=stereo,
-     loudnorm=I=..:TP=..:LRA=..:measured_*=<stereo>:linear=true:print_format=json,
+     loudnorm=I=..:TP=..:LRA=..:measured_*=<stereo>:offset=<stereo>:linear=true:print_format=json,
      aresample=48000[o0];
   [m]aformat=channel_layouts=mono,
-     loudnorm=I=..:TP=..:LRA=..:measured_*=<mono>:linear=true:print_format=json,
+     loudnorm=I=..:TP=..:LRA=..:measured_*=<mono>:offset=<mono>:linear=true:print_format=json,
      aresample=48000[o1]"
 -map [o0] -map_metadata -1 -c:a aac -b:a 128k -cutoff 20000 -movflags +faststart -f mp4 tmp0
 -map [o1] -map_metadata -1 -c:a aac -b:a 64k                -movflags +faststart -f mp4 tmp1
@@ -478,8 +482,9 @@ The pass-2 command from step 5 (line breaks added for readability):
 
 Both outputs are 48 kHz MP4/AAC with `+faststart`.
 The integrated target comes from the tenant (default −16 LUFS) and is snapshotted onto the asset at upload.
-Choose the pre-encode `TP` with 2–3 dB of headroom below the published ceiling,
-because the encoder adds true peak (pitfall 17).
+The published ceiling is −1.5 dBTP. loudnorm gets a pre-encode `TP` of −4.0 dBTP, 2.5 dB of headroom below it,
+because the encoder adds true peak (pitfall 17), and `LRA=50`, its maximum in 6.1.1:
+it never blocks linear mode, and lower values pull dynamic renders off target.
 
 ### Why per-rendition loudness (measured)
 
@@ -519,6 +524,13 @@ Loudness and the peak ceiling are therefore **verified properties of each encode
   and `audio` runs commands through a runner interface, so unit tests can fake either.
 - `exec.CommandContext` with `cmd.WaitDelay = 5s`. On failure, return the last 3 lines of stderr;
   if the context was cancelled, return `ctx.Err()`.
+- **Input whitelists:** every run that reads a source or a rendition passes
+  `-protocol_whitelist file -format_whitelist wav,mp3,flac,ogg,mov,aac,matroska,aiff` before its input
+  (after it, ffmpeg ignores them). Otherwise an uploaded HLS or concat playlist is followed into other local files,
+  publishing their audio as the upload's, and URLs are fetched.
+  An mp4 or mov track kept in another file through a `dref` reference stays unopened only because the mov demuxer's
+  `enable_drefs` defaults to off; it can't be pinned off, since ffmpeg fails other inputs, such as WAV,
+  with "Option enable_drefs not found". `TestProcessIgnoresExternalTracks` guards that default.
 - **`SysProcAttr{Setpgid: true}`**, so a terminal Ctrl-C reaches only the worker,
   which drains first and cancels later (pitfall 24).
 - No parent-death signal is needed in containers: however the worker exits,
@@ -970,8 +982,14 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 21. **An interrupted ffmpeg still prints a report:**
     on SIGTERM it exits 255 after printing a complete-looking report for the part it processed.
 22. **AAC isn't loop-accurate:** a 480,000-sample tone decoded to 480,256 samples despite an MP4 edit list.
-23. **Budget the CPU.** loudnorm runs at about 40× realtime on two cores, a plain decode at about 400×;
+23. **Budget the CPU.** In the prototype, loudnorm ran at about 40× realtime on two cores, a plain decode at about 400×;
     measuring, rendering and verifying 10 minutes took about 45 s with one layout and one check.
+    The `audio` package, with two layouts and two checks, one encode at a time in the 8-CPU `dev` container,
+    took 137 s per 10 minutes of stereo in a first run (pass 1 47 s, pass 2 46 s, verification 29 s and 15 s),
+    with loudnorm alone at about 29× that day, and 89 s in three later runs while the host was otherwise idle
+    (30 s, 31 s, 18 s and 10 s; loudnorm alone at 34×); a review measured 88–92 s there.
+    Under `docker run --cpus 2`, one encode took 91 s and 91.5 s of CPU, so an encode uses about one core,
+    and two at once, the pool's size at `GOMAXPROCS` = 2, took 122 s each.
 
 ### Processes and operations
 
