@@ -173,6 +173,54 @@ func TestFailedHeartbeatKeepsTheWork(t *testing.T) {
 	}
 }
 
+func TestHeartbeatStopsBeforeTheOutcome(t *testing.T) {
+	tests := []struct {
+		name  string
+		drain bool
+	}{
+		{"failed", false},
+		{"released while draining", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				cfg, _ := testConfig(t)
+				src := newFakeSource(lease)
+				src.extend = func(ctx context.Context, _ int) error {
+					return busy(context.WithoutCancel(ctx), 3*time.Second)
+				}
+				src.process = func(ctx context.Context, _ Lease) error {
+					if err := busy(ctx, 11*time.Second); err != nil {
+						return err
+					}
+					return errBoom
+				}
+				r := startPool(t, src, cfg)
+				if tc.drain {
+					synctest.Sleep(5 * time.Second)
+					r.cancel()
+				}
+				synctest.Sleep(time.Minute)
+				r.stop()
+
+				calls := src.calls()
+				writes, other := calls.fails, calls.releases
+				if tc.drain {
+					writes, other = calls.releases, calls.fails
+				}
+				if len(writes) != 1 || len(other) != 0 || writes[0].at.Sub(start) != 13*time.Second {
+					t.Errorf("outcome written at %v, other outcome at %v, want one at 13s, when the beat in flight ended",
+						offsets(start, callTimes(writes)), offsets(start, callTimes(other)))
+				}
+				if got, want := offsets(start, callTimes(calls.beats)), ticks(10*time.Second, 1); !slices.Equal(got, want) {
+					t.Errorf("beats at %v, want %v and none once Process returned", got, want)
+				}
+			})
+		})
+	}
+}
+
 func TestOutcomes(t *testing.T) {
 	ret := func(err error) func(context.Context) error {
 		return func(context.Context) error { return err }
