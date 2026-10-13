@@ -53,6 +53,21 @@ Done when:   <the §13 tests that must exist and pass>, and the definition of do
 Decided:     <decisions made with the user, or "nothing">
 ```
 
+## Model and effort
+
+Set `model` and `effort` on every agent you start, matched to the task, and never above Opus and `xhigh`.
+Use only Opus, Sonnet and Haiku.
+
+| Task | Model | Effort |
+|---|---|---|
+| Concurrency, leasing, security and ffmpeg: the relay, the processor, the webhook client, upload handling | Opus | `xhigh` |
+| Ordinary domain code: repositories, services, handlers | Opus | `high` |
+| Small, fully specified changes: types, the Makefile, CI, the README, docs | Sonnet | `medium` or `high` |
+| Mechanical checks | Haiku | `low` |
+
+- A reviewer gets the implementer's model, one effort level lower when the change is small.
+- A resumed agent keeps the model and effort it started with.
+
 ## While implementers work
 
 - Answer their questions from the spec, citing the section, and resume them with `SendMessage`.
