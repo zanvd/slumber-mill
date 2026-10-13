@@ -2,6 +2,7 @@ package asset
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 	"uuid"
 
 	"github.com/zanvd/slumber-mill/src/logging"
@@ -479,6 +481,68 @@ func TestCreateFailures(t *testing.T) {
 				}
 			} else if len(files) > 0 {
 				t.Errorf("files left behind: %v", files)
+			}
+		})
+	}
+}
+
+// TestCreateInsertOutlivesTheRequest shows that a request whose context ends before or during the insert
+// still commits its row, and that the row keeps its source file.
+func TestCreateInsertOutlivesTheRequest(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		// duringInsert cancels the request's context inside the insert rather than before Create.
+		duringInsert bool
+		wantCalls    []string
+	}{
+		{
+			name:      "cancelled before Create",
+			wantCalls: []string{"Promote", "insertAsset", "assetByID"},
+		},
+		{
+			name:         "cancelled during the insert",
+			key:          "upload-42",
+			duringInsert: true,
+			wantCalls:    []string{"assetByIdempotencyKey", "Promote", "insertAsset", "assetByID"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			p := f.params(t, "Rain", "audio", tc.key)
+			log := slog.New(slog.DiscardHandler)
+			ctx, cancel := context.WithCancel(logging.CtxWithLogger(t.Context(), log))
+			defer cancel()
+			if tc.duringInsert {
+				f.repo.beforeInsert = func(*fakeRepo) { cancel() }
+			} else {
+				cancel()
+			}
+
+			start := time.Now()
+			_, _, err := f.svc.Create(ctx, p)
+			end := time.Now()
+			if err == nil || errors.Is(err, ErrNotFound) {
+				t.Errorf("Create() error = %v, want the re-read's internal error", err)
+			}
+			if len(f.repo.assets) != 1 {
+				t.Fatalf("inserted %d assets, want 1", len(f.repo.assets))
+			}
+			if !slices.Equal(f.calls.list, tc.wantCalls) {
+				t.Errorf("calls = %v, want %v", f.calls.list, tc.wantCalls)
+			}
+			source := "sources/7/" + f.repo.assets[0].ID.String()
+			if files := filesUnder(t, f.root); !slices.Equal(files, []string{source}) {
+				t.Errorf("files = %v, want only %s", files, source)
+			}
+
+			deadline, ok := f.repo.insertCtx.Deadline()
+			if !ok || deadline.Before(start.Add(insertTimeout)) || deadline.After(end.Add(insertTimeout)) {
+				t.Errorf("insert deadline = %v (set %t), want %v after the call", deadline, ok, insertTimeout)
+			}
+			if got := logging.LoggerFromContext(f.repo.insertCtx); got != log {
+				t.Error("the insert's context lost the request's logger")
 			}
 		})
 	}

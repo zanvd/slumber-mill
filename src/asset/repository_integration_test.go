@@ -3,6 +3,7 @@
 package asset
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -312,6 +313,43 @@ func TestConcurrentCreates(t *testing.T) {
 	sources := assertFiles(t, s.root, tenant, 1)
 	if len(sources) == 1 && sources[0] != results[0].asset.ID.String() {
 		t.Errorf("source file %s, want %s", sources[0], results[0].asset.ID)
+	}
+}
+
+// TestCreateCommitsAfterTheRequestEnds cancels the request before Create: the row still commits
+// and keeps its source file, and only the re-read fails.
+func TestCreateCommitsAfterTheRequestEnds(t *testing.T) {
+	s := newStack(t)
+	tenant := s.tenant(t, "owner")
+	u, err := s.svc.Stage(t.Context(), strings.NewReader("audio"))
+	if err != nil {
+		t.Fatalf("Stage() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, _, err = s.svc.Create(ctx, CreateParams{TenantID: tenant, TargetLUFS: -16, Title: "Rain", Upload: u})
+	if err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("Create() error = %v, want the re-read's internal error", err)
+	}
+	var ids []db.ID
+	rows, err := s.pool.QueryContext(t.Context(), "SELECT public_id FROM assets")
+	if err != nil {
+		t.Fatalf("error reading assets: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id db.ID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("error reading assets: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("%d assets, want 1", len(ids))
+	}
+	if sources := assertFiles(t, s.root, tenant, 1); len(sources) == 1 && sources[0] != ids[0].String() {
+		t.Errorf("source file %s, want %s", sources[0], ids[0])
 	}
 }
 

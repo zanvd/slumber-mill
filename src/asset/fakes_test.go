@@ -28,13 +28,23 @@ func (c *calls) add(name string) {
 
 // fakeRepo keeps assets in memory. An asset's internal ID is its index in assets plus one,
 // and a key that is already in use in the tenant makes insertAsset fail as the unique index would.
+// Like a database driver, every method fails once its context is done.
 type fakeRepo struct {
 	calls  *calls
 	assets []Asset
 	errs   map[string]error
-	// beforeInsert runs inside insertAsset, as if another request got there first.
+	// beforeInsert runs inside insertAsset before it looks at its context,
+	// as if another request got there first or the client hung up.
 	beforeInsert func(f *fakeRepo)
+	insertCtx    context.Context
 	listArgs     []listArgs
+}
+
+func (f *fakeRepo) err(ctx context.Context, method string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.errs[method]
 }
 
 type listArgs struct {
@@ -42,12 +52,13 @@ type listArgs struct {
 	limit            int
 }
 
-func (f *fakeRepo) insertAsset(_ context.Context, a Asset) error {
+func (f *fakeRepo) insertAsset(ctx context.Context, a Asset) error {
 	f.calls.add("insertAsset")
+	f.insertCtx = ctx
 	if f.beforeInsert != nil {
 		f.beforeInsert(f)
 	}
-	if err := f.errs["insertAsset"]; err != nil {
+	if err := f.err(ctx, "insertAsset"); err != nil {
 		return err
 	}
 	for _, existing := range f.assets {
@@ -61,17 +72,17 @@ func (f *fakeRepo) insertAsset(_ context.Context, a Asset) error {
 	return nil
 }
 
-func (f *fakeRepo) assetByID(_ context.Context, tenantID uint64, id uuid.UUID) (Asset, error) {
+func (f *fakeRepo) assetByID(ctx context.Context, tenantID uint64, id uuid.UUID) (Asset, error) {
 	f.calls.add("assetByID")
-	if err := f.errs["assetByID"]; err != nil {
+	if err := f.err(ctx, "assetByID"); err != nil {
 		return Asset{}, err
 	}
 	return f.find(func(a Asset) bool { return a.TenantID == tenantID && a.ID == id })
 }
 
-func (f *fakeRepo) assetByIdempotencyKey(_ context.Context, tenantID uint64, key string) (Asset, error) {
+func (f *fakeRepo) assetByIdempotencyKey(ctx context.Context, tenantID uint64, key string) (Asset, error) {
 	f.calls.add("assetByIdempotencyKey")
-	if err := f.errs["assetByIdempotencyKey"]; err != nil {
+	if err := f.err(ctx, "assetByIdempotencyKey"); err != nil {
 		return Asset{}, err
 	}
 	return f.find(func(a Asset) bool { return a.TenantID == tenantID && a.IdempotencyKey == key })
@@ -85,10 +96,10 @@ func (f *fakeRepo) find(match func(Asset) bool) (Asset, error) {
 	return f.assets[i], nil
 }
 
-func (f *fakeRepo) listAssets(_ context.Context, tenantID, before uint64, limit int) ([]Asset, uint64, error) {
+func (f *fakeRepo) listAssets(ctx context.Context, tenantID, before uint64, limit int) ([]Asset, uint64, error) {
 	f.calls.add("listAssets")
 	f.listArgs = append(f.listArgs, listArgs{tenantID, before, limit})
-	if err := f.errs["listAssets"]; err != nil {
+	if err := f.err(ctx, "listAssets"); err != nil {
 		return nil, 0, err
 	}
 	var page []Asset
@@ -107,10 +118,10 @@ func (f *fakeRepo) listAssets(_ context.Context, tenantID, before uint64, limit 
 	return page, 0, nil
 }
 
-func (f *fakeRepo) rendition(_ context.Context, tenantID uint64, assetID uuid.UUID, profile Profile) (
+func (f *fakeRepo) rendition(ctx context.Context, tenantID uint64, assetID uuid.UUID, profile Profile) (
 	Rendition, error) {
 	f.calls.add("rendition")
-	if err := f.errs["rendition"]; err != nil {
+	if err := f.err(ctx, "rendition"); err != nil {
 		return Rendition{}, err
 	}
 	a, err := f.find(func(a Asset) bool { return a.TenantID == tenantID && a.ID == assetID })

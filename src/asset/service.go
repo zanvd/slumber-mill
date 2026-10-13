@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 	"uuid"
 
@@ -26,6 +27,10 @@ const (
 
 	maxTitleChars          = 255
 	maxIdempotencyKeyBytes = 255
+
+	// insertTimeout bounds the upload's insert, which doesn't stop when the request's context does:
+	// a client hanging up mid-insert mustn't make a committed row look failed and lose its source.
+	insertTimeout = 15 * time.Second
 )
 
 type repo interface {
@@ -123,7 +128,8 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed
 	}
 	staged = ""
 
-	err = s.repo.insertAsset(ctx, Asset{
+	insertCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
+	err = s.repo.insertAsset(insertCtx, Asset{
 		ID:             id,
 		TenantID:       p.TenantID,
 		IdempotencyKey: p.IdempotencyKey,
@@ -133,6 +139,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed
 		SourceBytes:    p.Upload.size,
 		TargetLUFS:     p.TargetLUFS,
 	})
+	cancel()
 	if err != nil {
 		s.remove(ctx, source)
 		if !errors.Is(err, errDuplicate) || p.IdempotencyKey == "" {
