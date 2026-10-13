@@ -139,6 +139,7 @@ func TestCreateValidation(t *testing.T) {
 		{"port without host", webhookURL("https://:443/hooks"), "webhook_url", urlSyntax},
 		{"percent-encoded space", webhookURL("https://example.com/a%20b?q=%09"), "", ""},
 		{"percent-encoded non-ASCII", webhookURL("https://example.com/caf%C3%A9"), "", ""},
+		{"first and last printable bytes", webhookURL("https://example.com/!~"), "", ""},
 		{"space in host", webhookURL("https://exa mple.com/"), "webhook_url", urlASCII},
 		{"space in path", webhookURL("https://example.com/a b"), "webhook_url", urlASCII},
 		{"space in query", webhookURL("https://example.com/hooks?q=a b"), "webhook_url", urlASCII},
