@@ -104,6 +104,7 @@ type loudnormReport struct {
 	InputLRA          string `json:"input_lra"`
 	InputThresh       string `json:"input_thresh"`
 	NormalizationType string `json:"normalization_type"`
+	TargetOffset      string `json:"target_offset"`
 }
 
 // loudnorm parses the report of the loudnorm instance with the given name.

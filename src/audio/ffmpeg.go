@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"slices"
@@ -20,6 +21,8 @@ const (
 	verifyInstance = "loudnorm@verify"
 	// ffprobeInvalid is ffprobe's exit status when it can't read the input.
 	ffprobeInvalid = 1
+	// maxOffsetLU is the largest gain offset loudnorm accepts.
+	maxOffsetLU = 99.0
 	// allowedDemuxers are the containers an input may come in. Playlists, such as hls and concat,
 	// would open further files or URLs, so they aren't among them.
 	allowedDemuxers = "wav,mp3,flac,ogg,mov,aac,matroska,aiff"
@@ -102,46 +105,54 @@ func (f *FFmpeg) probe(ctx context.Context, src string) (Source, error) {
 
 // measure runs pass 1: ebur128 on the source as it is, for its momentary loudness, and loudnorm on each
 // layout's downmix and on the source as it is, unless one of the layouts already is.
+// It returns each layout's measurement and the target offset its loudnorm reported, for pass 2.
 func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetLUFS float64, layouts []layout,
-) (Input, []Loudness, error) {
+) (Input, []Loudness, []float64, error) {
 	native := slices.IndexFunc(layouts, func(l layout) bool { return l.channels == source.Channels })
 	log := newFFmpegLog(inputInstance)
 	err := f.run.Run(ctx, "ffmpeg", measureArgs(src, targetLUFS, layouts, native < 0), nil, log)
 	log.flush()
 	if err != nil {
-		return Input{}, nil, fmt.Errorf("error measuring the source: %w", err)
+		return Input{}, nil, nil, fmt.Errorf("error measuring the source: %w", err)
 	}
 	measured := make([]Loudness, len(layouts))
+	offsets := make([]float64, len(layouts))
 	for i, l := range layouts {
-		m, _, err := log.loudnorm(loudnormInstance(l))
+		m, report, err := log.loudnorm(loudnormInstance(l))
 		if err != nil {
-			return Input{}, nil, err
+			return Input{}, nil, nil, err
 		}
 		if m.LUFS < silentLUFS {
-			return Input{}, nil, reject(MessageSilent, fmt.Errorf("the %s downmix measures %v LUFS", l.name, m.LUFS))
+			return Input{}, nil, nil, reject(MessageSilent, fmt.Errorf("the %s downmix measures %v LUFS", l.name, m.LUFS))
 		}
-		measured[i] = m
+		// Silence reports an offset of inf, so this comes after the check for it.
+		offset, err := parseLevel(report.TargetOffset)
+		if err != nil || math.Abs(offset) > maxOffsetLU {
+			return Input{}, nil, nil, fmt.Errorf("error reading the report from %s: target_offset %q is unusable",
+				loudnormInstance(l), report.TargetOffset)
+		}
+		measured[i], offsets[i] = m, offset
 	}
 	var in Loudness
 	if native >= 0 {
 		in = measured[native]
 	} else if in, _, err = log.loudnorm(sourceInstance); err != nil {
-		return Input{}, nil, err
+		return Input{}, nil, nil, err
 	}
 	maxMomentary, err := log.maxMomentary()
 	if err != nil {
-		return Input{}, nil, err
+		return Input{}, nil, nil, err
 	}
 	return Input{LUFS: in.LUFS, TruePeakDBTP: in.TruePeakDBTP, LRALU: in.LRALU, MaxMomentaryLUFS: maxMomentary},
-		measured, nil
+		measured, offsets, nil
 }
 
 // render runs pass 2 and returns the mode each layout's loudnorm reported.
 func (f *FFmpeg) render(ctx context.Context, src string, targetLUFS float64, layouts []layout,
-	measured []Loudness, outputs []Output,
+	measured []Loudness, offsets []float64, outputs []Output,
 ) ([]Normalization, error) {
 	log := newFFmpegLog("")
-	err := f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, outputs), nil, log)
+	err := f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, offsets, outputs), nil, log)
 	log.flush()
 	if err != nil {
 		return nil, fmt.Errorf("error rendering: %w", err)
@@ -225,7 +236,9 @@ func measureArgs(src string, targetLUFS float64, layouts []layout, measureSource
 	return args
 }
 
-func renderArgs(src string, targetLUFS float64, layouts []layout, measured []Loudness, outputs []Output) []string {
+func renderArgs(src string, targetLUFS float64, layouts []layout, measured []Loudness, offsets []float64,
+	outputs []Output,
+) []string {
 	var graph strings.Builder
 	fmt.Fprintf(&graph, "[0:a:0]asplit=%d", len(layouts))
 	for i := range layouts {
@@ -234,9 +247,9 @@ func renderArgs(src string, targetLUFS float64, layouts []layout, measured []Lou
 	for i, l := range layouts {
 		m := measured[i]
 		fmt.Fprintf(&graph, ";[s%d]aformat=channel_layouts=%s,%s=%s:measured_I=%s:measured_TP=%s:measured_LRA=%s"+
-			":measured_thresh=%s:linear=true:print_format=json,aresample=48000",
+			":measured_thresh=%s:offset=%s:linear=true:print_format=json,aresample=48000",
 			i, l.name, loudnormInstance(l), loudnormTargets(targetLUFS),
-			num(m.LUFS), num(m.TruePeakDBTP), num(measuredLRA(m)), num(m.ThresholdLUFS))
+			num(m.LUFS), num(m.TruePeakDBTP), num(measuredLRA(m)), num(m.ThresholdLUFS), num(offsets[i]))
 		if len(l.outputs) > 1 {
 			fmt.Fprintf(&graph, ",asplit=%d", len(l.outputs))
 		}

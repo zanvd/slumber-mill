@@ -54,7 +54,7 @@ func commands(t *testing.T, src string) map[string]command {
 	return map[string]command{
 		"probe":   {"ffprobe", probeArgs(src)},
 		"measure": {"ffmpeg", measureArgs(src, testTargetLUFS, layouts, false)},
-		"render":  {"ffmpeg", renderArgs(src, testTargetLUFS, layouts, measured, outputs)},
+		"render":  {"ffmpeg", renderArgs(src, testTargetLUFS, layouts, measured, []float64{0, 0}, outputs)},
 		"verify":  {"ffmpeg", verifyArgs(src, testTargetLUFS)},
 	}
 }

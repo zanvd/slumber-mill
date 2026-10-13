@@ -58,10 +58,14 @@ func probeJSON(channels int, duration string) string {
 }
 
 func report(instance string, m Loudness, mode Normalization) string {
+	return reportWithOffset(instance, m, mode, "0.00")
+}
+
+func reportWithOffset(instance string, m Loudness, mode Normalization, offset string) string {
 	return fmt.Sprintf("[%s @ 0x5581] \n{\n\t\"input_i\" : \"%.2f\",\n\t\"input_tp\" : \"%.2f\",\n"+
 		"\t\"input_lra\" : \"%.2f\",\n\t\"input_thresh\" : \"%.2f\",\n\t\"output_i\" : \"-16.00\",\n"+
-		"\t\"normalization_type\" : \"%s\",\n\t\"target_offset\" : \"0.00\"\n}\n",
-		instance, m.LUFS, m.TruePeakDBTP, m.LRALU, m.ThresholdLUFS, mode)
+		"\t\"normalization_type\" : \"%s\",\n\t\"target_offset\" : \"%s\"\n}\n",
+		instance, m.LUFS, m.TruePeakDBTP, m.LRALU, m.ThresholdLUFS, mode, offset)
 }
 
 func frames(momentary ...float64) string {
@@ -84,8 +88,8 @@ var (
 func stereoScript() []fakeResponse {
 	return []fakeResponse{
 		{stdout: probeJSON(2, "10.000000")},
-		{stderr: frames(-120.7, -17.6, -17.8) + report("loudnorm@mono", monoMeasured, Dynamic) +
-			report("loudnorm@stereo", stereoMeasured, Dynamic)},
+		{stderr: frames(-120.7, -17.6, -17.8) + reportWithOffset("loudnorm@mono", monoMeasured, Dynamic, "0.07") +
+			reportWithOffset("loudnorm@stereo", stereoMeasured, Dynamic, "-0.31")},
 		{stderr: report("loudnorm@mono", monoEncoded, Dynamic) + report("loudnorm@stereo", stereoEncoded, Linear)},
 		{stderr: report(verifyInstance, stereoEncoded, Dynamic)},
 		{stderr: report(verifyInstance, monoEncoded, Dynamic)},
@@ -146,9 +150,9 @@ func TestProcessCommands(t *testing.T) {
 		"ffmpeg -y " + common + " -i /src.wav -filter_complex " +
 			"[0:a:0]asplit=2[s0][s1];" +
 			"[s0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4:LRA=50:measured_I=-17.69:measured_TP=-7.26:" +
-			"measured_LRA=0.1:measured_thresh=-27.69:linear=true:print_format=json,aresample=48000[o0];" +
+			"measured_LRA=0.1:measured_thresh=-27.69:offset=-0.31:linear=true:print_format=json,aresample=48000[o0];" +
 			"[s1]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4:LRA=50:measured_I=-20.7:measured_TP=-6.59:" +
-			"measured_LRA=0.1:measured_thresh=-30.7:linear=true:print_format=json,aresample=48000[o1] " +
+			"measured_LRA=0.1:measured_thresh=-30.7:offset=0.07:linear=true:print_format=json,aresample=48000[o1] " +
 			"-map [o0] -map_metadata -1 -c:a aac -b:a 128k -cutoff 20000 -movflags +faststart -f mp4 /data/tmp/part-1 " +
 			"-map [o1] -map_metadata -1 -c:a aac -b:a 64k -movflags +faststart -f mp4 /data/tmp/part-2",
 		"ffmpeg " + common + " -i /data/tmp/part-1 -filter_complex " +
@@ -288,7 +292,8 @@ func TestProcessRejectsFromReports(t *testing.T) {
 		{
 			name: "silent",
 			script: func(s []fakeResponse) []fakeResponse {
-				s[1].stderr = frames(-120.7) + report("loudnorm@stereo", silent, Dynamic) + report("loudnorm@mono", silent, Dynamic)
+				s[1].stderr = frames(-120.7) + reportWithOffset("loudnorm@stereo", silent, Dynamic, "inf") +
+					reportWithOffset("loudnorm@mono", silent, Dynamic, "inf")
 				return s
 			},
 			want: MessageSilent, wantRuns: 2,
@@ -336,6 +341,39 @@ func TestProcessRejectsFromReports(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProcessRefusesUnusableOffsets(t *testing.T) {
+	for _, offset := range []string{"inf", "-inf", "nan", "99.01", "", "loud"} {
+		t.Run(offset, func(t *testing.T) {
+			script := stereoScript()
+			script[1].stderr = frames(-17.6) + reportWithOffset("loudnorm@stereo", stereoMeasured, Dynamic, offset) +
+				report("loudnorm@mono", monoMeasured, Dynamic)
+			run := &fakeRunner{responses: script}
+			_, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs())
+			if err == nil || !strings.Contains(err.Error(), "target_offset") {
+				t.Errorf("Process() error = %v, want the offset refused", err)
+			}
+			if _, ok := errors.AsType[*Rejection](err); ok {
+				t.Errorf("Process() error = %v, want it not to be a rejection", err)
+			}
+			if len(run.calls) != 2 {
+				t.Errorf("Process() ran %d commands, want it to stop before pass 2", len(run.calls))
+			}
+		})
+	}
+	t.Run("loudnorm's limit", func(t *testing.T) {
+		script := stereoScript()
+		script[1].stderr = frames(-17.6) + reportWithOffset("loudnorm@stereo", stereoMeasured, Dynamic, "-99.00") +
+			report("loudnorm@mono", monoMeasured, Dynamic)
+		run := &fakeRunner{responses: script}
+		if _, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs()); err != nil {
+			t.Fatalf("Process() error = %v", err)
+		}
+		if render := strings.Join(run.calls[2].args, " "); !strings.Contains(render, ":offset=-99:") {
+			t.Errorf("pass 2 %q doesn't pass offset=-99", render)
+		}
+	})
 }
 
 func TestProcessMissingReport(t *testing.T) {

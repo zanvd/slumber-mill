@@ -162,7 +162,7 @@ func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, ou
 		return Result{}, err
 	}
 	layouts := planLayouts(source.Channels, outputs)
-	input, measured, err := f.measure(ctx, src, source, targetLUFS, layouts)
+	input, measured, offsets, err := f.measure(ctx, src, source, targetLUFS, layouts)
 	if err != nil {
 		return Result{}, err
 	}
@@ -170,7 +170,7 @@ func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, ou
 	for i, m := range measured {
 		predicted[i] = predict(m, targetLUFS)
 	}
-	rendered, err := f.render(ctx, src, targetLUFS, layouts, measured, outputs)
+	rendered, err := f.render(ctx, src, targetLUFS, layouts, measured, offsets, outputs)
 	if err != nil {
 		return Result{}, err
 	}
