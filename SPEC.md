@@ -326,6 +326,12 @@ CREATE TABLE webhook_deliveries (
   and the API accepts only printable ASCII in `Idempotency-Key`.
   `ascii_bin` ignores trailing spaces (PAD SPACE), so `'x '` equals `'x'`, and validation rejects leading and trailing
   spaces in slugs and `Idempotency-Key` values.
+- **Tenant fields are validated before the insert.** A slug is 1–64 lower-case ASCII letters, digits and hyphens,
+  starting and ending with a letter or digit, which also keeps `/` out of the webhook secret's AAD (§8).
+  A webhook URL is optional: at most 2048 bytes, an absolute `http` or `https` URL with a host,
+  and without userinfo, which would sit in the row in plaintext, or a fragment.
+  `target_lufs` is finite and from −70 to −5 LUFS, loudnorm's range, and is rounded to one decimal place
+  before the insert, so the tenant `tenant create` returns matches the row.
 - **Closed sets are `ENUM` or `SET`:** `status`, `state`, `type`, `profile`, `codec`, `normalization` and `warnings`.
   In strict mode, MySQL 8's default, a value outside the list fails the insert (error 1265),
   so a typo in code can't be stored. New members are only ever appended, which is instant;
@@ -612,6 +618,9 @@ Tenants supply URLs, so the client must not become a proxy into the private netw
 - `Proxy: nil`, since environment proxies would bypass the check; redirects aren't followed (`http.ErrUseLastResponse`).
 - Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s.
 - `ErrBlockedAddress` is permanent. `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE=true` is for local development and tests only.
+- **`tenant create` checks too.** It refuses a webhook URL whose host is an IP literal that isn't public,
+  or a name that doesn't resolve or resolves to any address that isn't public, and honours
+  `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE`. DNS can change after creation, so the dial-time check stays the real guard.
 
 ## 9. HTTP API
 
