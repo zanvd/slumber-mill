@@ -430,7 +430,8 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 ## 7. Audio processing (encode pool)
 
 Three attempts, backoff from 30 s to 10 min, a 3 h timeout.
-Budget about 140 s per 10 minutes of audio, roughly 2.3 hours for a 10-hour soundscape (pitfall 23),
+Budget about 140 s per 10 minutes of audio, even with two encodes sharing two cores,
+roughly 2.3 hours for a 10-hour soundscape (pitfall 23),
 and size the timeout, the lease and the pool's CPU limit with that in mind.
 
 ### Steps
@@ -528,6 +529,9 @@ Loudness and the peak ceiling are therefore **verified properties of each encode
   `-protocol_whitelist file -format_whitelist wav,mp3,flac,ogg,mov,aac,matroska,aiff` before its input
   (after it, ffmpeg ignores them). Otherwise an uploaded HLS or concat playlist is followed into other local files,
   publishing their audio as the upload's, and URLs are fetched.
+  An mp4 or mov track kept in another file through a `dref` reference stays unopened only because the mov demuxer's
+  `enable_drefs` defaults to off; it can't be pinned off, since ffmpeg fails other inputs, such as WAV,
+  with "Option enable_drefs not found". `TestProcessIgnoresExternalTracks` guards that default.
 - **`SysProcAttr{Setpgid: true}`**, so a terminal Ctrl-C reaches only the worker,
   which drains first and cancels later (pitfall 24).
 - No parent-death signal is needed in containers: however the worker exits,
@@ -979,9 +983,12 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 22. **AAC isn't loop-accurate:** a 480,000-sample tone decoded to 480,256 samples despite an MP4 edit list.
 23. **Budget the CPU.** In the prototype, loudnorm ran at about 40× realtime on two cores, a plain decode at about 400×;
     measuring, rendering and verifying 10 minutes took about 45 s with one layout and one check.
-    The `audio` package, with two layouts and two checks, took 137 s per 10 minutes of stereo in a first run
-    on the `dev` image (pass 1 47 s, pass 2 46 s, verification 29 s and 15 s), with loudnorm alone at about 29× that day,
-    and 89 s in three later runs while the host was otherwise idle (30 s, 31 s, 18 s and 10 s; loudnorm alone at 34×).
+    The `audio` package, with two layouts and two checks, one encode at a time in the 8-CPU `dev` container,
+    took 137 s per 10 minutes of stereo in a first run (pass 1 47 s, pass 2 46 s, verification 29 s and 15 s),
+    with loudnorm alone at about 29× that day, and 89 s in three later runs while the host was otherwise idle
+    (30 s, 31 s, 18 s and 10 s; loudnorm alone at 34×); a review measured 88–92 s there.
+    Under `docker run --cpus 2`, one encode took 91 s and 91.5 s of CPU, so an encode uses about one core,
+    and two at once, the pool's size at `GOMAXPROCS` = 2, took 122 s each.
 
 ### Processes and operations
 
