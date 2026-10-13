@@ -161,7 +161,7 @@ func checkErr(t *testing.T, err, want error) {
 		}
 		return
 	}
-	for _, target := range []error{ErrBlockedAddress, errUnresolvable, context.Canceled, context.DeadlineExceeded} {
+	for _, target := range []error{ErrBlockedAddress, ErrUnresolvable, context.Canceled, context.DeadlineExceeded} {
 		if got := errors.Is(err, target); got != (target == want) {
 			t.Errorf("errors.Is(%v, %v) = %v, want %v", err, target, got, !got)
 		}
@@ -197,9 +197,9 @@ func TestCheckHost(t *testing.T) {
 		{"NAT64 of a public address", "nat64.example", addrs("64:ff9b::808:808"), nil, ErrBlockedAddress, "64:ff9b::808:808", 1},
 		{"zoned public result", "zoned.example", addrs("8.8.8.8", "2001:4860:4860::8888%eth0"), nil, ErrBlockedAddress, "2001:4860:4860::8888%eth0", 1},
 		{"localhost", "localhost", addrs("::1", "127.0.0.1"), nil, ErrBlockedAddress, "::1", 1},
-		{"empty result", "empty.example", nil, nil, errUnresolvable, "", 1},
-		{"resolver error", "missing.example", nil, dnsErr, errUnresolvable, "", 1},
-		{"resolver error with addresses", "missing.example", addrs("8.8.8.8"), dnsErr, errUnresolvable, "", 1},
+		{"empty result", "empty.example", nil, nil, ErrUnresolvable, "", 1},
+		{"resolver error", "missing.example", nil, dnsErr, ErrUnresolvable, "", 1},
+		{"resolver error with addresses", "missing.example", addrs("8.8.8.8"), dnsErr, ErrUnresolvable, "", 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -268,14 +268,15 @@ func TestCheckHostContext(t *testing.T) {
 	const timedOut = "timed out after 5s"
 	tests := []struct {
 		name        string
-		parent      parentFunc
+		parent      parentFuncCallers can now use errors.Is to tell a host that doesn't resolve from one that resolves to a blocked address. That was already possible for ErrBlockedAddress. A host doesn't resolve when the lookup fails, times
+out or returns no addresses (§8).
 		wait        bool
 		wantElapsed time.Duration
 		want        error
 		wantMsg     string
 	}{
-		{"lookup hangs", context.WithCancel, true, resolveTimeout, errUnresolvable, timedOut},
-		{"lookup outlasts a later caller deadline", timeout(time.Minute), true, resolveTimeout, errUnresolvable, timedOut},
+		{"lookup hangs", context.WithCancel, true, resolveTimeout, ErrUnresolvable, timedOut},
+		{"lookup outlasts a later caller deadline", timeout(time.Minute), true, resolveTimeout, ErrUnresolvable, timedOut},
 		{"caller deadline is sooner", timeout(2 * time.Second), true, 2 * time.Second, context.DeadlineExceeded, ""},
 		{"caller cancels during the lookup", cancelledAfter(time.Second), true, time.Second, context.Canceled, ""},
 		{"caller cancelled before the lookup", cancelled, true, 0, context.Canceled, ""},
