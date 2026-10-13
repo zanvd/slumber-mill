@@ -247,7 +247,7 @@ func leaseCases(lt leasedTable) []leaseCase {
 				return l.Complete(ctx, Lease{}, writes)
 			},
 			want:       []wantStatement{{contains: []string{fence}, set: leaving}},
-			wantTx:     []sql.IsolationLevel{sql.LevelDefault},
+			wantTx:     []sql.IsolationLevel{sql.LevelReadCommitted},
 			wantWrites: true,
 		},
 		{
@@ -276,7 +276,7 @@ func leaseCases(lt leasedTable) []leaseCase {
 				return err
 			},
 			want:       []wantStatement{{contains: []string{fence}, set: failing}},
-			wantTx:     []sql.IsolationLevel{sql.LevelDefault},
+			wantTx:     []sql.IsolationLevel{sql.LevelReadCommitted},
 			wantWrites: true,
 		},
 		{

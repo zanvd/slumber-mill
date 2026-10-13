@@ -243,7 +243,7 @@ func (l *Leases) finish(ctx context.Context, held Lease, set map[string]any, wri
 			return err
 		}
 		return writes(tx)
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 }
 
 // fenced updates the row only while held is still its lease, and returns ErrLeaseLost when it isn't.
