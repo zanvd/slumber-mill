@@ -268,8 +268,7 @@ func TestCheckHostContext(t *testing.T) {
 	const timedOut = "timed out after 5s"
 	tests := []struct {
 		name        string
-		parent      parentFuncCallers can now use errors.Is to tell a host that doesn't resolve from one that resolves to a blocked address. That was already possible for ErrBlockedAddress. A host doesn't resolve when the lookup fails, times
-out or returns no addresses (§8).
+		parent      parentFunc
 		wait        bool
 		wantElapsed time.Duration
 		want        error
