@@ -5,8 +5,6 @@ package worker_test
 import (
 	"cmp"
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,8 +12,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/zanvd/slumber-mill/src/db"
 	"github.com/zanvd/slumber-mill/src/worker"
 )
 
@@ -28,9 +26,9 @@ const (
 	kindLockWait   errorKind = "lock wait timeout"
 	kindUnexpected errorKind = "unexpected"
 	kindLeaseLost  errorKind = "lease lost"
-	kindInjected   errorKind = "injected"
-	kindTimedOut   errorKind = "timed out"
-	kindCancelled  errorKind = "cancelled"
+	kindInjected   errorKind = "injected failure"
+	kindHeartbeat  errorKind = "heartbeat timed out"
+	kindShutdown   errorKind = "cancelled by shutdown"
 	kindSlowQuery  errorKind = "slow query"
 )
 
@@ -42,9 +40,17 @@ type errorLog struct {
 }
 
 type errorStore struct {
+	stopping atomic.Bool // set while the pools shut down
+
 	mu      sync.Mutex
 	counts  map[errorKind]int
 	samples map[errorKind][]string
+}
+
+// record is what classify needs from a log record: the pool's attributes, and GORM's for a failed query.
+type record struct {
+	msg, sql, outcome string
+	cause             any
 }
 
 func newErrorLog() errorLog {
@@ -54,23 +60,31 @@ func newErrorLog() errorLog {
 func (errorLog) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h errorLog) Handle(ctx context.Context, r slog.Record) error {
-	var cause any
+	rec := record{msg: r.Message}
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "error" {
-			cause = a.Value.Any()
-			return false
+		switch a.Key {
+		case "error":
+			rec.cause = a.Value.Any()
+		case "sql":
+			rec.sql = a.Value.String()
+		case "outcome":
+			rec.outcome = a.Value.String()
 		}
 		return true
 	})
-	if cause == nil && r.Level < slog.LevelWarn {
+	if rec.cause == nil && r.Level < slog.LevelWarn {
 		return nil
 	}
-	kind := classify(ctx, r.Message, cause)
+	kind := h.classify(ctx, rec)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.counts[kind]++
 	if len(h.samples[kind]) < maxSamples {
-		h.samples[kind] = append(h.samples[kind], fmt.Sprintf("%s %v: %v", r.Message, h.attrs, cause))
+		sample := fmt.Sprintf("%s %v: %v", rec.msg, h.attrs, rec.cause)
+		if rec.sql != "" {
+			sample += " in " + rec.sql
+		}
+		h.samples[kind] = append(h.samples[kind], sample)
 	}
 	return nil
 }
@@ -81,41 +95,76 @@ func (h errorLog) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h errorLog) WithGroup(string) slog.Handler { return h }
 
-// classify works on the message as well as the error, because GORM logs failed queries with the error as a string.
-// Whatever it doesn't recognise is unexpected. ctx is the record's, which for a failed query is the query's.
-func classify(ctx context.Context, msg string, cause any) errorKind {
-	text := msg
-	if cause != nil {
-		text = fmt.Sprintf("%s: %v", msg, cause)
+// classify recognises the records the soak expects by where they come from as well as by their error,
+// so a timeout or cancellation anywhere else is unexpected. ctx is the record's, which for a failed query
+// is the query's own.
+func (h errorLog) classify(ctx context.Context, rec record) errorKind {
+	text := rec.msg
+	if rec.cause != nil {
+		text = fmt.Sprintf("%s: %v", rec.msg, rec.cause)
 	}
-	err, _ := cause.(error)
-	has := func(s string) bool { return strings.Contains(text, s) }
 	switch {
-	case has("Error 1213"):
+	case strings.Contains(text, "Error 1213"):
 		return kindDeadlock
-	case has("Error 1205"):
+	case strings.Contains(text, "Error 1205"):
 		return kindLockWait
-	case errors.Is(err, worker.ErrLeaseLost), errors.Is(err, db.ErrLeaseLost), has("lease lost"):
-		return kindLeaseLost
-	case errors.Is(err, errRetryable), errors.Is(err, errRejected):
-		return kindInjected
-	// The DSN sets no I/O timeouts, so an i/o timeout is a context's deadline passing while a connection is dialled,
-	// which the net package reports that way; and a cancelled dial is an operation that was canceled.
-	case errors.Is(err, context.DeadlineExceeded), has(context.DeadlineExceeded.Error()), has("i/o timeout"):
-		return kindTimedOut
-	// A transaction whose context is cancelled is rolled back, so its next statement finds it done.
-	case errors.Is(err, context.Canceled), has(context.Canceled.Error()), has("operation was canceled"),
-		has(sql.ErrTxDone.Error()), has("shutdown grace expired"):
-		return kindCancelled
-	// The driver closes a connection when its context ends, even as a statement on it finishes,
-	// so the transaction's next statement finds the connection bad.
-	case ctx.Err() != nil && has(driver.ErrBadConn.Error()):
-		return kindCancelled
-	case cause == nil && msg == "slow query":
-		return kindSlowQuery
-	default:
-		return kindUnexpected
 	}
+	err, _ := rec.cause.(error)
+	stopping := h.stopping.Load()
+	switch rec.msg {
+	case "lease lost, cancelling the work", "lease lost before the outcome was written":
+		if errors.Is(err, worker.ErrLeaseLost) {
+			return kindLeaseLost
+		}
+	case "heartbeat failed":
+		// The pool logs this only while the work goes on, so the deadline is the beat's own, a third of the lease.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return kindHeartbeat
+		}
+	case "work finished":
+		switch rec.outcome {
+		case "discarded":
+			// The pool discards only work whose lease was lost, whatever error the work stopped with.
+			return kindLeaseLost
+		case "released":
+			// The pool releases work only once its context or the work's is cancelled, which only shutdown does.
+			if stopping {
+				return kindShutdown
+			}
+		case "failed":
+			if errors.Is(err, errRetryable) || errors.Is(err, errRejected) {
+				return kindInjected
+			}
+		}
+	case "shutdown grace expired, cancelling the work":
+		if stopping {
+			return kindShutdown
+		}
+	case "query failed":
+		switch {
+		// A heartbeat that finds the lease lost cancels the work, interrupting the statement completing it.
+		case errors.Is(context.Cause(ctx), worker.ErrLeaseLost):
+			return kindLeaseLost
+		case isExtend(rec.sql) && errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return kindHeartbeat
+		// Shutdown cancels the claims, the reaps and, after the grace, the work. Whatever the driver then reports
+		// for a statement whose context has ended is the cancellation's doing: the context's error, a transaction
+		// rolled back under its next statement, or a connection the driver closed as a statement finished.
+		case stopping && ctx.Err() != nil:
+			return kindShutdown
+		}
+	case "slow query":
+		if rec.cause == nil {
+			return kindSlowQuery
+		}
+	}
+	return kindUnexpected
+}
+
+// isExtend reports whether sql is a heartbeat's: the only update that sets lease_expires_at alone.
+func isExtend(sql string) bool {
+	return strings.HasPrefix(sql, "UPDATE ") &&
+		strings.Contains(sql, " SET `lease_expires_at`=NOW(6) + INTERVAL ? MICROSECOND WHERE ")
 }
 
 func (s *errorStore) count(kind errorKind) int {

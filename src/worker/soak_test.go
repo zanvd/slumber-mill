@@ -22,12 +22,14 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -60,6 +62,8 @@ const (
 	drainRounds  = 20
 	drainTimeout = time.Minute
 
+	lockWaitTimeout = 1 // seconds
+
 	rejectedMessage = "The file isn't audio."
 	failedMessage   = "Processing failed. Try uploading the file again."
 )
@@ -74,7 +78,7 @@ func TestLeaseSoak(t *testing.T) {
 	duration := soakDuration(t)
 	errs := newErrorLog()
 	log := slog.New(errs)
-	dsn := testutil.NewDatabase(t)
+	dsn := withLockWaitTimeout(t, testutil.NewDatabase(t))
 	gdb := open(t, dsn, log)
 	tenantID := createTenant(t, gdb)
 
@@ -133,8 +137,10 @@ func TestLeaseSoak(t *testing.T) {
 	pause(t.Context(), duration)
 	stopUploads()
 	uploaded.Wait()
+	errs.stopping.Store(true)
 	stop()
 	stopped.Wait()
+	errs.stopping.Store(false)
 
 	if rows := violations(t, gdb, leasedQuery); len(rows) > 0 {
 		t.Errorf("rows still leased after the pools shut down: %v", rows)
@@ -729,6 +735,22 @@ func exec(t *testing.T, gdb *gorm.DB, query string, args ...any) {
 	}
 }
 
+// withLockWaitTimeout returns dsn with the session's lock wait cut to a second. Every statement in the soak runs on
+// a context shorter than MySQL's default of 50 s, so without it a lock wait would end as a timeout or cancellation
+// rather than error 1205.
+func withLockWaitTimeout(t *testing.T, dsn string) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("error parsing the test DSN: %v", err)
+	}
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	cfg.Params["innodb_lock_wait_timeout"] = strconv.Itoa(lockWaitTimeout)
+	return cfg.FormatDSN()
+}
+
 func open(t *testing.T, dsn string, log *slog.Logger) *gorm.DB {
 	t.Helper()
 	gdb, err := db.Open(dsn, log)
@@ -740,6 +762,9 @@ func open(t *testing.T, dsn string, log *slog.Logger) *gorm.DB {
 		t.Fatalf("error getting the connection pool: %v", err)
 	}
 	t.Cleanup(func() { pool.Close() })
+	if n := count(t, gdb, "SELECT @@SESSION.innodb_lock_wait_timeout"); n != lockWaitTimeout {
+		t.Fatalf("innodb_lock_wait_timeout = %d, want %d", n, lockWaitTimeout)
+	}
 	return gdb
 }
 
