@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/zanvd/slumber-mill/src/egress"
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/validation"
@@ -39,6 +40,8 @@ type box interface {
 }
 
 // hostChecker rejects a webhook host that doesn't resolve, or resolves to an address that isn't public.
+// Create expects egress.ErrUnresolvable or egress.ErrBlockedAddress for such a host, or a context error;
+// any other error is an internal one.
 type hostChecker interface {
 	CheckHost(ctx context.Context, host string) error
 }
@@ -165,7 +168,8 @@ func webhookSecretAAD(slug string) []byte {
 }
 
 // validateCreate checks the fields, and the webhook URL's host only once its syntax is valid.
-// A cancelled context is returned as itself rather than as a rejected host.
+// A cancelled context is returned as itself rather than as a rejected host,
+// and so is a host check that fails for any reason other than the host itself.
 func (s *Service) validateCreate(ctx context.Context, p CreateParams) error {
 	var v validation.Collector
 	switch {
@@ -196,8 +200,16 @@ func (s *Service) validateCreate(ctx context.Context, p CreateParams) error {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return fmt.Errorf("error checking webhook host: %w", ctxErr)
 				}
-				logging.LoggerFromContext(ctx).InfoContext(ctx, "webhook host rejected", "error", err)
-				v.Add("webhook_url", "host must resolve, and only to public addresses")
+				switch {
+				case errors.Is(err, egress.ErrUnresolvable):
+					logging.LoggerFromContext(ctx).InfoContext(ctx, "webhook host rejected", "error", err)
+					v.Add("webhook_url", "host must resolve")
+				case errors.Is(err, egress.ErrBlockedAddress):
+					logging.LoggerFromContext(ctx).InfoContext(ctx, "webhook host rejected", "error", err)
+					v.Add("webhook_url", "host must be public")
+				default:
+					return fmt.Errorf("error checking webhook host: %w", err)
+				}
 			}
 		}
 	}

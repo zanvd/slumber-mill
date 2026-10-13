@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zanvd/slumber-mill/src/egress"
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/testutil"
@@ -21,14 +22,16 @@ import (
 )
 
 var (
-	_ repo = (*Repository)(nil)
-	_ box  = (*secret.Box)(nil)
+	_ repo        = (*Repository)(nil)
+	_ box         = (*secret.Box)(nil)
+	_ hostChecker = (*egress.HostChecker)(nil)
 )
 
 const (
-	testURL       = "https://hooks.example.com/slumber"
-	acmeAAD       = "tenants/acme/webhook_secret"
-	hostRejection = "host must resolve, and only to public addresses"
+	testURL          = "https://hooks.example.com/slumber"
+	acmeAAD          = "tenants/acme/webhook_secret"
+	hostUnresolvable = "host must resolve"
+	hostBlocked      = "host must be public"
 )
 
 // testCtx carries a logger that writes to the test's output.
@@ -316,16 +319,44 @@ func TestCreateChecksWebhookHost(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsBlockedHost(t *testing.T) {
-	f := newFixture()
-	f.hosts.err = errors.New("10.0.0.1 is not a public address")
-	_, _, err := f.svc.Create(testCtx(t), validParams())
-	got := fieldsOf(t, err)
-	if len(got) != 1 || got["webhook_url"] != hostRejection {
-		t.Errorf("fields = %v, want webhook_url: %s", got, hostRejection)
+func TestCreateRejectsBadHosts(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"unresolvable", fmt.Errorf("lookup hooks.example.com: %w", egress.ErrUnresolvable), hostUnresolvable},
+		{"blocked", fmt.Errorf("hooks.example.com resolves to 10.0.0.1: %w", egress.ErrBlockedAddress), hostBlocked},
 	}
-	if strings.Contains(err.Error(), "10.0.0.1") {
-		t.Errorf("error %q quotes the checker's error", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture()
+			f.hosts.err = tc.err
+			_, _, err := f.svc.Create(testCtx(t), validParams())
+			got := fieldsOf(t, err)
+			if len(got) != 1 || got["webhook_url"] != tc.want {
+				t.Errorf("fields = %v, want webhook_url: %s", got, tc.want)
+			}
+			if strings.Contains(err.Error(), "10.0.0.1") {
+				t.Errorf("error %q quotes the checker's error", err)
+			}
+			if len(f.repo.calls) != 0 || len(f.box.sealAADs) != 0 {
+				t.Errorf("repo calls = %v, seals = %d, want none", f.repo.calls, len(f.box.sealAADs))
+			}
+		})
+	}
+}
+
+func TestCreateReturnsOtherHostErrors(t *testing.T) {
+	f := newFixture()
+	boom := errors.New("resolver exploded")
+	f.hosts.err = boom
+	_, _, err := f.svc.Create(testCtx(t), validParams())
+	if !errors.Is(err, boom) {
+		t.Fatalf("Create() error = %v, want %v", err, boom)
+	}
+	if _, ok := errors.AsType[*validation.Error](err); ok {
+		t.Errorf("Create() error = %v, want no validation error", err)
 	}
 	if len(f.repo.calls) != 0 || len(f.box.sealAADs) != 0 {
 		t.Errorf("repo calls = %v, seals = %d, want none", f.repo.calls, len(f.box.sealAADs))
@@ -334,10 +365,10 @@ func TestCreateRejectsBlockedHost(t *testing.T) {
 
 func TestCreateChecksHostAlongsideOtherFields(t *testing.T) {
 	f := newFixture()
-	f.hosts.err = errors.New("no such host")
+	f.hosts.err = egress.ErrUnresolvable
 	_, _, err := f.svc.Create(testCtx(t), CreateParams{Slug: "", WebhookURL: testURL, TargetLUFS: -16})
 	got := fieldsOf(t, err)
-	if got["slug"] != "is required" || got["webhook_url"] != hostRejection {
+	if got["slug"] != "is required" || got["webhook_url"] != hostUnresolvable {
 		t.Errorf("fields = %v, want slug and webhook_url", got)
 	}
 }
@@ -661,7 +692,7 @@ func TestSecretsStayOutOfLogsAndErrors(t *testing.T) {
 	}
 	_, _, err = f.svc.Create(ctx, validParams())
 	call(err)
-	f.hosts.err = errors.New("hooks.example.com resolves to 10.0.0.1")
+	f.hosts.err = fmt.Errorf("hooks.example.com resolves to 10.0.0.1: %w", egress.ErrBlockedAddress)
 	_, _, err = f.svc.Create(ctx, CreateParams{Slug: "blocked", WebhookURL: testURL, TargetLUFS: -16})
 	call(err)
 	f.hosts.err = nil
