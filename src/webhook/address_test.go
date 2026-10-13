@@ -131,9 +131,9 @@ func (r *fakeResolver) LookupNetIP(ctx context.Context, network, host string) ([
 // checkErr fails unless err is nil when want is, or else matches want and none of the other outcomes.
 func checkErr(t *testing.T, err, want error) {
 	t.Helper()
-	if want == nil {
-		if err != nil {
-			t.Fatalf("CheckHost() error = %v, want nil", err)
+	if err == nil || want == nil {
+		if err != want {
+			t.Fatalf("CheckHost() error = %v, want %v", err, want)
 		}
 		return
 	}
@@ -240,19 +240,21 @@ func TestCheckHostContext(t *testing.T) {
 			return context.WithTimeout(ctx, d)
 		}
 	}
+	const timedOut = "timed out after 5s"
 	tests := []struct {
 		name        string
 		parent      parentFunc
 		wait        bool
 		wantElapsed time.Duration
 		want        error
+		wantMsg     string
 	}{
-		{"lookup hangs", context.WithCancel, true, resolveTimeout, errUnresolvable},
-		{"lookup outlasts a later caller deadline", timeout(time.Minute), true, resolveTimeout, errUnresolvable},
-		{"caller deadline is sooner", timeout(2 * time.Second), true, 2 * time.Second, context.DeadlineExceeded},
-		{"caller cancels during the lookup", cancelledAfter(time.Second), true, time.Second, context.Canceled},
-		{"caller cancelled before the lookup", cancelled, true, 0, context.Canceled},
-		{"caller cancelled, resolver ignores it", cancelled, false, 0, context.Canceled},
+		{"lookup hangs", context.WithCancel, true, resolveTimeout, errUnresolvable, timedOut},
+		{"lookup outlasts a later caller deadline", timeout(time.Minute), true, resolveTimeout, errUnresolvable, timedOut},
+		{"caller deadline is sooner", timeout(2 * time.Second), true, 2 * time.Second, context.DeadlineExceeded, ""},
+		{"caller cancels during the lookup", cancelledAfter(time.Second), true, time.Second, context.Canceled, ""},
+		{"caller cancelled before the lookup", cancelled, true, 0, context.Canceled, ""},
+		{"caller cancelled, resolver ignores it", cancelled, false, 0, context.Canceled, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -266,6 +268,9 @@ func TestCheckHostContext(t *testing.T) {
 					t.Errorf("CheckHost() returned after %v, want %v", elapsed, tc.wantElapsed)
 				}
 				checkErr(t, err, tc.want)
+				if !strings.Contains(err.Error(), tc.wantMsg) {
+					t.Errorf("error %q doesn't say %q", err, tc.wantMsg)
+				}
 			})
 		})
 	}
