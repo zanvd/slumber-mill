@@ -272,7 +272,7 @@ Commit messages follow Commitizen's conventional commits rules, the format `cz c
 
   `bump` is reserved for `cz bump`.
 - **scope** is optional: one lower-case word with no spaces. Use a package (`db`, `worker`, `tenant`, `asset`,
-  `webhook`, `audio`, `storage`, `secret`, `apiv1`, `validation`, `logging`, `httpsrv`, `testutil`, `cmd`)
+  `webhook`, `egress`, `audio`, `storage`, `secret`, `apiv1`, `validation`, `logging`, `httpsrv`, `testutil`, `cmd`)
   or an area (`migrations`, `docker`, `compose`, `deps`, `spec`, `readme`, `git`).
   Leave it out rather than invent a vague one.
 - **`!`** after the type or scope marks a breaking change, which bumps the major version.
