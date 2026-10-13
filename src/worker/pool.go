@@ -77,7 +77,7 @@ func (p *Pool) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// RunUntilIdle processes work until no slot finds any due, and returns the first claim error.
+// RunUntilIdle processes work until no slot finds any due, and returns ctx's error or the slots' claim errors.
 // It doesn't reap. It's for tests.
 func (p *Pool) RunUntilIdle(ctx context.Context) error {
 	ctx = logging.CtxWithLogger(ctx, p.log)
