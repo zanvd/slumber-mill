@@ -22,7 +22,7 @@ func TestNewPool(t *testing.T) {
 	valid, _ := testConfig(t)
 	tests := []struct {
 		name string
-		src  Source
+		src  source
 		edit func(*Config)
 	}{
 		{"no source", nil, func(*Config) {}},
@@ -832,7 +832,7 @@ func TestRunUntilIdle(t *testing.T) {
 	})
 }
 
-func runUntilIdle(t *testing.T, src Source, cfg Config, ctx context.Context, want error) {
+func runUntilIdle(t *testing.T, src source, cfg Config, ctx context.Context, want error) {
 	t.Helper()
 	p, err := NewPool(src, cfg)
 	if err != nil {

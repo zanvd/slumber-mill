@@ -8,8 +8,8 @@ import (
 // ErrLeaseLost means a fenced write matched no row: the lease expired and was reaped, or another worker holds it.
 var ErrLeaseLost = errors.New("lease lost")
 
-// Implemented by asset.Processor and webhook.Service; worker.Pool drives it.
-type Source interface {
+// source is a table of leased work, which a Pool claims from and drives through each lease to its outcome.
+type source interface {
 	Claim(ctx context.Context) (Lease, bool, error)       // false: nothing is due
 	Extend(ctx context.Context, l Lease) error            // heartbeat; ErrLeaseLost when fenced out
 	Process(ctx context.Context, l Lease) error           // does the work, then completes it, fenced

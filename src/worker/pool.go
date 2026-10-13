@@ -21,22 +21,26 @@ type Config struct {
 	WorkerID     string
 	Pool         string
 	Concurrency  int
-	Lease        time.Duration // as long as the Source's claims last; heartbeats renew it every Lease/3
+	Lease        time.Duration // as long as the source's claims last; heartbeats renew it every Lease/3
 	PollInterval time.Duration // an idle slot waits 0.5–1.5× this before claiming again
 	Grace        time.Duration // how long in-flight work may run once shutdown starts
 	ReapInterval time.Duration // zero means Lease/3
 	Log          *slog.Logger
 }
 
-// Pool runs Concurrency slots that claim and process work from one Source, and a reaper.
+// Pool runs Concurrency slots that claim and process work from one source, and a reaper.
 type Pool struct {
-	src       Source
+	src       source
 	cfg       Config
 	heartbeat time.Duration
 	log       *slog.Logger
 }
 
-func NewPool(src Source, cfg Config) (*Pool, error) {
+// NewPool returns a Pool that drives src. Claim reports false when nothing is due;
+// Extend returns ErrLeaseLost once fenced out; Process does the work and completes it, fenced;
+// Fail retries with backoff or gives up; Release requeues the work without using an attempt;
+// and Reap requeues work whose lease expired.
+func NewPool(src source, cfg Config) (*Pool, error) {
 	switch {
 	case src == nil:
 		return nil, errors.New("a source is required")

@@ -229,7 +229,7 @@ type running struct {
 	stopped chan struct{}
 }
 
-func startPool(t *testing.T, src Source, cfg Config) *running {
+func startPool(t *testing.T, src source, cfg Config) *running {
 	t.Helper()
 	p, err := NewPool(src, cfg)
 	if err != nil {
