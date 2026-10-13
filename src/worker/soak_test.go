@@ -645,8 +645,9 @@ func checkInvariants(t *testing.T, gdb *gorm.DB, uploads int64, assets, deliveri
 				notDone = append(notDone, id)
 			}
 		}
+		// A completion with domain writes is a transaction, which has committed only if Complete returned nil.
 		for id := range done {
-			if table.completed[id] == 0 && !table.unsure[id] {
+			if table.completed[id] == 0 && (table.onReady != nil || !table.unsure[id]) {
 				unexplained = append(unexplained, id)
 			}
 		}
