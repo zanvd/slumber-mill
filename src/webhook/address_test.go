@@ -195,6 +195,7 @@ func TestCheckHost(t *testing.T) {
 		{"private then public", "rebind.example", addrs("192.168.1.1", "8.8.8.8"), nil, ErrBlockedAddress, "192.168.1.1", 1},
 		{"IPv4-mapped private", "mapped.example", addrs("8.8.8.8", "::ffff:172.16.0.1"), nil, ErrBlockedAddress, "::ffff:172.16.0.1", 1},
 		{"NAT64 of a public address", "nat64.example", addrs("64:ff9b::808:808"), nil, ErrBlockedAddress, "64:ff9b::808:808", 1},
+		{"zoned public result", "zoned.example", addrs("8.8.8.8", "2001:4860:4860::8888%eth0"), nil, ErrBlockedAddress, "2001:4860:4860::8888%eth0", 1},
 		{"localhost", "localhost", addrs("::1", "127.0.0.1"), nil, ErrBlockedAddress, "::1", 1},
 		{"empty result", "empty.example", nil, nil, errUnresolvable, "", 1},
 		{"resolver error", "missing.example", nil, dnsErr, errUnresolvable, "", 1},
