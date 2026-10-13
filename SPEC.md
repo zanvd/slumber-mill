@@ -395,8 +395,7 @@ FOR UPDATE SKIP LOCKED
 ### Worker runtime
 
 ```go
-// Implemented by asset.Processor and webhook.Service; worker.Pool drives it.
-type Source interface {
+type source interface {
     Claim(ctx context.Context) (Lease, bool, error)       // false: nothing is due
     Extend(ctx context.Context, l Lease) error            // heartbeat; ErrLeaseLost when fenced out
     Process(ctx context.Context, l Lease) error           // does the work, then completes it, fenced
