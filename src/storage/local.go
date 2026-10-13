@@ -22,7 +22,10 @@ const (
 	dirPerm       = 0o750
 )
 
-var ErrInvalidProfile = errors.New("invalid rendition profile")
+var (
+	ErrInvalidProfile = errors.New("invalid rendition profile")
+	errNonPositiveAge = errors.New("the temp sweep's age must be positive")
+)
 
 type Local struct {
 	root string
@@ -85,8 +88,12 @@ func (l *Local) Remove(path string) error {
 
 // SweepTemp removes the regular part-* files directly in root/tmp that were last modified more than olderThan ago,
 // and returns how many it removed. It leaves symlinks and directories alone, and skips files that vanish meanwhile,
-// since every process sharing the root sweeps at startup.
+// since every process sharing the root sweeps at startup. An olderThan of zero or less removes nothing and is an error,
+// because it would catch files that other processes are still writing.
 func (l *Local) SweepTemp(olderThan time.Duration) (int, error) {
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("%w: got %v", errNonPositiveAge, olderThan)
+	}
 	dir := filepath.Join(l.root, tmpDir)
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {

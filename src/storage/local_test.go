@@ -358,6 +358,36 @@ func TestSweepTempRemovesOldTempFiles(t *testing.T) {
 	})
 }
 
+func TestSweepTempRefusesNonPositiveAge(t *testing.T) {
+	tests := []struct {
+		name      string
+		olderThan time.Duration
+	}{
+		{"zero", 0},
+		{"negative", -time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := NewLocal(t.TempDir())
+			fresh, old := writeTemp(t, l, "fresh"), writeTemp(t, l, "old")
+			chtimes(t, old, time.Now().Add(-48*time.Hour))
+
+			removed, err := l.SweepTemp(tc.olderThan)
+			if !errors.Is(err, errNonPositiveAge) {
+				t.Errorf("SweepTemp(%v) error = %v, want errNonPositiveAge", tc.olderThan, err)
+			}
+			if removed != 0 {
+				t.Errorf("SweepTemp(%v) removed %d files, want 0", tc.olderThan, removed)
+			}
+			for _, path := range []string{fresh, old} {
+				if !exists(t, path) {
+					t.Errorf("SweepTemp(%v) removed %s", tc.olderThan, path)
+				}
+			}
+		})
+	}
+}
+
 func TestSweepTempWithoutTempDir(t *testing.T) {
 	removed, err := NewLocal(t.TempDir()).SweepTemp(time.Hour)
 	if err != nil || removed != 0 {
