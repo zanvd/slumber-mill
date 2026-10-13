@@ -286,6 +286,13 @@ func TestSweepTemp(t *testing.T) {
 		if err := os.Mkdir(tmp, 0o750); err != nil {
 			t.Fatal(err)
 		}
+		// New entries get the real time, decades after the bubble's clock, and os.Chtimes can't backdate
+		// a symlink itself. Moving the clock a day past the real time makes the links old too.
+		info, err := os.Lstat(tmp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Until(info.ModTime()) + 24*time.Hour)
 		now := time.Now()
 		targets := make(map[string]string)
 		for _, tc := range tests {
@@ -379,14 +386,14 @@ func symlinkToFile(t *testing.T, path, outside string, mtime time.Time) string {
 	target := filepath.Join(outside, filepath.Base(path))
 	writeFile(t, target, "x")
 	chtimes(t, target, mtime)
-	symlink(t, target, path)
+	symlink(t, target, path, mtime)
 	return target
 }
 
 func symlinkToDir(t *testing.T, path, outside string, mtime time.Time) string {
 	dir := filepath.Join(outside, filepath.Base(path))
 	inner := directory(t, dir, "", mtime)
-	symlink(t, dir, path)
+	symlink(t, dir, path, mtime)
 	return inner
 }
 
@@ -428,10 +435,18 @@ func chtimes(t *testing.T, path string, mtime time.Time) {
 	}
 }
 
-func symlink(t *testing.T, target, path string) {
+// symlink fails the test unless the link's own mtime is at or before maxMtime.
+func symlink(t *testing.T, target, path string, maxMtime time.Time) {
 	t.Helper()
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().After(maxMtime) {
+		t.Fatalf("symlink %s has mtime %v, after %v", path, info.ModTime(), maxMtime)
 	}
 }
 
