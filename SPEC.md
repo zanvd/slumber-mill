@@ -140,6 +140,7 @@ src/                         the Go module: go.mod, go.sum and all Go code
   tenant/                    repository.go, service.go (create, authenticate, webhook target)
   asset/                     repository.go, service.go (upload, get, list, renditions, events), processor.go
   webhook/                   repository.go, service.go (relay, deliver), sign.go (Sign, Verify), client.go
+  egress/                    IsPublic, ErrBlockedAddress, HostChecker: which addresses outbound calls may reach
   audio/                     ffprobe/ffmpeg wrappers, loudness report parsing
   storage/                   local disk with atomic promote, temp sweep
   secret/                    random tokens (sm_, whsec_), AES-GCM box for stored secrets, redacting Value type
@@ -588,6 +589,7 @@ a backup or a read-only SQL injection doesn't hand out what's needed to forge ev
 ### SSRF-safe client
 
 Tenants supply URLs, so the client must not become a proxy into the private network.
+`IsPublic`, `ErrBlockedAddress` and `HostChecker` live in the leaf package `egress`, which `webhook/client.go`'s dialer and `tenant` both use.
 
 - A `net.Dialer.Control` checks the **IP actually being dialled** (after DNS resolution, which defeats rebinding)
   with `IsPublic(netip.Addr)`. It rejects anything that isn't global unicast, private, loopback, link-local,

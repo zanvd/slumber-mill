@@ -1,4 +1,6 @@
-package webhook
+// Package egress decides which addresses outbound connections to tenant-supplied hosts may reach.
+// Tenant uses it at creation, and webhook's dialer on every connection.
+package egress
 
 import (
 	"context"
@@ -31,7 +33,7 @@ var blockedPrefixes = [...]netip.Prefix{
 	netip.MustParsePrefix("fec0::/10"),
 }
 
-// IsPublic reports whether a webhook may be delivered to addr.
+// IsPublic reports whether an outbound connection may reach addr.
 // An IPv4-mapped address is judged by the IPv4 address it carries, and an address with a zone is never public.
 func IsPublic(addr netip.Addr) bool {
 	if addr.Zone() != "" {
@@ -81,13 +83,13 @@ func (c *HostChecker) CheckHost(ctx context.Context, host string) error {
 	addrs, err := c.resolver.LookupNetIP(lookupCtx, "ip", host)
 	switch {
 	case ctx.Err() != nil:
-		return fmt.Errorf("error checking webhook host %q: %w", host, ctx.Err())
+		return fmt.Errorf("error checking host %q: %w", host, ctx.Err())
 	case err != nil && lookupCtx.Err() != nil:
-		return fmt.Errorf("error checking webhook host %q: %w: timed out after %s", host, errUnresolvable, resolveTimeout)
+		return fmt.Errorf("error checking host %q: %w: timed out after %s", host, errUnresolvable, resolveTimeout)
 	case err != nil:
-		return fmt.Errorf("error checking webhook host %q: %w", host, errUnresolvable)
+		return fmt.Errorf("error checking host %q: %w", host, errUnresolvable)
 	case len(addrs) == 0:
-		return fmt.Errorf("error checking webhook host %q: %w: no addresses", host, errUnresolvable)
+		return fmt.Errorf("error checking host %q: %w: no addresses", host, errUnresolvable)
 	}
 	for _, addr := range addrs {
 		if err := checkAddr(host, addr); err != nil {
@@ -99,7 +101,7 @@ func (c *HostChecker) CheckHost(ctx context.Context, host string) error {
 
 func checkAddr(host string, addr netip.Addr) error {
 	if !IsPublic(addr) {
-		return fmt.Errorf("error checking webhook host %q: %w %s", host, ErrBlockedAddress, addr)
+		return fmt.Errorf("error checking host %q: %w %s", host, ErrBlockedAddress, addr)
 	}
 	return nil
 }
