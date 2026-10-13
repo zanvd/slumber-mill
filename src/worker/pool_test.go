@@ -413,6 +413,48 @@ func TestShutdownReleasesAfterGrace(t *testing.T) {
 	})
 }
 
+func TestShutdownWaitsForProcessPastTheGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg, _ := testConfig(t)
+		src := newFakeSource(lease)
+		src.process = func(ctx context.Context, _ Lease) error {
+			<-ctx.Done()
+			_ = busy(context.WithoutCancel(ctx), time.Minute)
+			return errBoom
+		}
+		r := startPool(t, src, cfg)
+		synctest.Sleep(5 * time.Second)
+		stopping := time.Now()
+		r.cancel()
+
+		synctest.Sleep(cfg.Grace + time.Minute - time.Second)
+		if calls := src.calls(); len(calls.fails) != 0 || len(calls.releases) != 0 {
+			t.Fatalf("fails, releases = %d, %d while Process ignores the cancellation, want none",
+				len(calls.fails), len(calls.releases))
+		}
+		if r.returned() {
+			t.Fatal("Run returned while Process was still running")
+		}
+		synctest.Sleep(time.Second)
+		if !r.returned() {
+			t.Errorf("Run hasn't returned %v after cancel, when Process did", time.Since(stopping))
+		}
+		r.wait()
+
+		calls := src.calls()
+		returnedAt := stopping.Add(cfg.Grace + time.Minute)
+		if len(calls.fails) != 0 || len(calls.releases) != 1 || !calls.releases[0].at.Equal(returnedAt) {
+			t.Errorf("fails, releases at %v, %v after cancel, want one release at %v, when Process returned",
+				offsets(stopping, callTimes(calls.fails)), offsets(stopping, callTimes(calls.releases)), cfg.Grace+time.Minute)
+		}
+		for _, b := range calls.beats {
+			if b.at.After(stopping.Add(cfg.Grace)) {
+				t.Errorf("beat at %v after cancel, want none after the %v grace", b.at.Sub(stopping), cfg.Grace)
+			}
+		}
+	})
+}
+
 func TestShutdownLetsWorkFinishWithinGrace(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg, logs := testConfig(t)

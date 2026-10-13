@@ -251,6 +251,15 @@ func (r *running) stop() {
 	r.wait()
 }
 
+func (r *running) returned() bool {
+	select {
+	case <-r.stopped:
+		return true
+	default:
+		return false
+	}
+}
+
 // wait waits for Run to return, and fails the test if any of the pool's goroutines outlived it.
 func (r *running) wait() {
 	r.t.Helper()
