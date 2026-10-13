@@ -37,9 +37,9 @@ type Pool struct {
 }
 
 // NewPool returns a Pool that drives src. Claim reports false when nothing is due;
-// Extend returns ErrLeaseLost once fenced out; Process does the work and completes it, fenced;
-// Fail retries with backoff or gives up; Release requeues the work without using an attempt;
-// and Reap requeues work whose lease expired.
+// Process does the work and completes it, fenced; Fail retries with backoff or gives up;
+// Release requeues the work without using an attempt; Reap requeues or fails work whose lease expired;
+// and Extend, Process, Fail and Release return ErrLeaseLost once fenced out.
 func NewPool(src source, cfg Config) (*Pool, error) {
 	switch {
 	case src == nil:
