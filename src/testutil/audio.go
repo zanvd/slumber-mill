@@ -1,10 +1,12 @@
 package testutil
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -122,7 +124,7 @@ func seconds(d time.Duration) string { return strconv.FormatFloat(d.Seconds(), '
 func audioFixture(tb testing.TB, name string, inputs []string, filter string, extra ...string) string {
 	tb.Helper()
 	path := filepath.Join(tb.TempDir(), name)
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y"}
+	var args []string
 	for _, in := range inputs {
 		args = append(args, "-f", "lavfi", "-i", in)
 	}
@@ -130,10 +132,92 @@ func audioFixture(tb testing.TB, name string, inputs []string, filter string, ex
 		args = append(args, "-filter_complex", filter)
 	}
 	args = append(args, extra...)
-	args = append(args, "-c:a", "pcm_s16le", path)
-	out, err := exec.CommandContext(tb.Context(), "ffmpeg", args...).CombinedOutput()
-	if err != nil {
-		tb.Fatalf("error generating the audio fixture %s; audio tests need ffmpeg: %v\n%s", name, err, out)
-	}
+	runFFmpeg(tb, name, append(args, "-c:a", "pcm_s16le", path)...)
 	return path
 }
+
+func runFFmpeg(tb testing.TB, fixture string, args ...string) {
+	tb.Helper()
+	args = append([]string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y"}, args...)
+	out, err := exec.CommandContext(tb.Context(), "ffmpeg", args...).CombinedOutput()
+	if err != nil {
+		tb.Fatalf("error generating the audio fixture %s; audio tests need ffmpeg: %v\n%s", fixture, err, out)
+	}
+}
+
+// ExternalTrackM4A writes an M4A file to dir whose one track points, through an alias in its "dref" box,
+// at the file named target in dir. With external tracks enabled, the mov demuxer reads the track from target.
+func ExternalTrackM4A(tb testing.TB, dir, target string) string {
+	tb.Helper()
+	const name = "external-track.m4a"
+	// Without +faststart, moov follows mdat, so resizing it moves no chunk offsets.
+	base := filepath.Join(tb.TempDir(), "base.m4a")
+	runFFmpeg(tb, name, "-f", "lavfi", "-i", noise("pink", 0.5, 1, noiseDuration), "-c:a", "aac", "-f", "mp4", base)
+	data, err := os.ReadFile(base)
+	if err != nil {
+		tb.Fatalf("error reading %s: %v", base, err)
+	}
+	dref := mp4Box("dref", be32(0), be32(1), aliasEntry(target))
+	edited, ok := replaceMP4Box(data, []string{"moov", "trak", "mdia", "minf", "dinf", "dref"}, dref)
+	if !ok {
+		tb.Fatalf("error building %s: no moov/trak/mdia/minf/dinf/dref box in %s", name, base)
+	}
+	return writeFixture(tb, filepath.Join(dir, name), string(edited))
+}
+
+// aliasEntry is a dref "alis" entry in the layout the mov demuxer reads: a Macintosh alias record
+// one level up from the alias and one down to its target, whose absolute path (record type 2) ends in name.
+func aliasEntry(name string) []byte {
+	path := []byte("/" + name)
+	pathLen := len(path)
+	if len(path)%2 == 1 {
+		path = append(path, 0)
+	}
+	fileName := make([]byte, 63)
+	copy(fileName, name)
+	record := slices.Concat(
+		make([]byte, 10),
+		[]byte{0}, make([]byte, 27), // volume name: length, then the name
+		make([]byte, 12),
+		[]byte{byte(len(name))}, fileName,
+		make([]byte, 16),
+		be16(1), be16(1), // levels from the alias up, and down to the target
+		make([]byte, 16),
+		be16(2), be16(pathLen), path,
+		be16(0xffff), be16(0), // end of the records
+	)
+	return mp4Box("alis", be32(0), record)
+}
+
+// replaceMP4Box replaces the box at path, each element a box type nested in the one before,
+// and resizes the boxes around it.
+func replaceMP4Box(data []byte, path []string, box []byte) ([]byte, bool) {
+	for off := 0; off+8 <= len(data); {
+		size := int(binary.BigEndian.Uint32(data[off:]))
+		if size < 8 || off+size > len(data) {
+			return nil, false
+		}
+		if string(data[off+4:off+8]) == path[0] {
+			replacement := box
+			if len(path) > 1 {
+				inner, ok := replaceMP4Box(data[off+8:off+size], path[1:], box)
+				if !ok {
+					return nil, false
+				}
+				replacement = mp4Box(path[0], inner)
+			}
+			return slices.Concat(data[:off], replacement, data[off+size:]), true
+		}
+		off += size
+	}
+	return nil, false
+}
+
+func mp4Box(typ string, parts ...[]byte) []byte {
+	body := slices.Concat(parts...)
+	return slices.Concat(be32(8+len(body)), []byte(typ), body)
+}
+
+func be16(v int) []byte { return binary.BigEndian.AppendUint16(nil, uint16(v)) }
+
+func be32(v int) []byte { return binary.BigEndian.AppendUint32(nil, uint32(v)) }
