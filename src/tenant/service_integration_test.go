@@ -267,8 +267,8 @@ func TestSealedSecretOpensOnlyInItsOwnRow(t *testing.T) {
 	}
 
 	_, err := s.svc.WebhookTarget(testCtx(t), b.ID)
-	if err == nil {
-		t.Fatal("WebhookTarget() opened another row's secret")
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrNoWebhook) || errors.Is(err, errDatabase) {
+		t.Fatalf("WebhookTarget() of another row's secret: error = %v, want a failed open", err)
 	}
 	for _, form := range append(leakForms(aSealed), leakForms(aSealed[1:])...) {
 		if strings.Contains(err.Error(), form) {
@@ -309,8 +309,9 @@ func TestSealedSecretOpensUnderAnyKeyInTheRing(t *testing.T) {
 	if err != nil || !bytes.Equal(w.Secret.Bytes(), bCreds.WebhookSecret.Bytes()) {
 		t.Errorf("WebhookTarget() of the new create error = %v, or a different secret", err)
 	}
-	if _, err := old.svc.WebhookTarget(testCtx(t), b.ID); err == nil {
-		t.Error("a ring without key 2 opened a secret sealed under it")
+	_, err = old.svc.WebhookTarget(testCtx(t), b.ID)
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrNoWebhook) || errors.Is(err, errDatabase) {
+		t.Errorf("WebhookTarget() under a ring without key 2: error = %v, want a failed open", err)
 	}
 }
 
