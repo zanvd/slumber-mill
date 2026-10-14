@@ -281,7 +281,7 @@ func TestCreateAsset(t *testing.T) {
 			wantStatus: http.StatusBadRequest, wantError: malformed, wantCalls: []string{"Stage", "Discard"},
 			wantClose: true},
 		{name: "unauthenticated", raw: full, noAuth: true, wantStatus: http.StatusUnauthorized,
-			wantError: new(apiv1.NewError("unauthorized", "missing or invalid API key"))},
+			wantError: new(apiv1.NewError("unauthorized", "missing or invalid API key")), wantClose: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

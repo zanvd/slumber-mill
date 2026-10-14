@@ -1,17 +1,21 @@
 package httpsrv
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 	"uuid"
 
@@ -561,5 +565,249 @@ func TestRecovery(t *testing.T) {
 
 	if w := f.serve(authed(target)); w.Code != http.StatusOK {
 		t.Errorf("request after the panic: status = %d, want 200", w.Code)
+	}
+}
+
+// rawConn dials f's in-memory server for requests written by hand. Call it inside a synctest bubble.
+// Reads on the connection fail after clientPatience, so a server that never answers fails the test.
+func (f *fixture) rawConn(t *testing.T) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	client := f.uploadClient(t)
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport is %T, want *http.Transport", client.Transport)
+	}
+	conn, err := tr.DialContext(t.Context(), "tcp", "api.test:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetReadDeadline(time.Now().Add(clientPatience)); err != nil {
+		t.Fatal(err)
+	}
+	return conn, bufio.NewReader(conn)
+}
+
+func send(t *testing.T, conn net.Conn, s string) {
+	t.Helper()
+	if _, err := io.WriteString(conn, s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readResponse reads a whole response from br.
+func readResponse(t *testing.T, br *bufio.Reader) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp, body
+}
+
+// A client that declares a request body and never sends it gets its response at once, saying the connection
+// will close, and then loses the connection at once, whichever route answers.
+func TestUnreadBodyReleasesConnection(t *testing.T) {
+	id := uuid.NewV7().String()
+	rendition := bytes.Repeat([]byte("a"), 64<<10)
+	const auth = "Authorization: Bearer " + validKey + "\r\n"
+	tests := []struct {
+		name string
+		// target is the request line's method and path.
+		target string
+		// header holds extra header lines, each ending in CRLF.
+		header     string
+		assetErr   error
+		wantStatus int
+		wantBody   []byte
+	}{
+		{name: "upload without a key", target: "POST /v1/assets",
+			header: "Content-Type: " + formContentType + "\r\n", wantStatus: http.StatusUnauthorized},
+		{name: "upload without a key expecting 100-continue", target: "POST /v1/assets",
+			header:     "Content-Type: " + formContentType + "\r\nExpect: 100-continue\r\n",
+			wantStatus: http.StatusUnauthorized},
+		{name: "healthz", target: "GET /healthz", wantStatus: http.StatusOK},
+		{name: "unknown route", target: "POST /nope", wantStatus: http.StatusNotFound},
+		{name: "missing asset", target: "GET /v1/assets/" + id, header: auth, assetErr: asset.ErrNotFound,
+			wantStatus: http.StatusNotFound},
+		{name: "trailing-slash redirect", target: "POST /v1/assets/", wantStatus: http.StatusTemporaryRedirect},
+		// The rendition outgrows net/http's response buffer, so the response starts while the handler runs.
+		{name: "rendition", target: "GET /v1/assets/" + id + "/renditions/aac_128k", header: auth,
+			wantStatus: http.StatusOK, wantBody: rendition},
+	}
+	framings := []struct{ name, header string }{
+		{name: "declared length", header: "Content-Length: 1000\r\n"},
+		{name: "chunked", header: "Transfer-Encoding: chunked\r\n"},
+	}
+	for _, tt := range tests {
+		for _, fr := range framings {
+			t.Run(tt.name+", "+fr.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					f := newFixture(t, Config{})
+					f.assets.err = tt.assetErr
+					f.assets.content = rendition
+					var ctx context.Context
+					f.assets.onCall = func(c assetCall) { ctx = c.ctx }
+					ctxErr := make(chan error, 1)
+					f.assets.fileClosed = func() { ctxErr <- ctx.Err() }
+					conn, br := f.rawConn(t)
+
+					start := time.Now()
+					send(t, conn, tt.target+" HTTP/1.1\r\nHost: api.test\r\n"+tt.header+fr.header+"\r\n")
+					resp, body := readResponse(t, br)
+					if resp.StatusCode != tt.wantStatus || !resp.Close || time.Since(start) != 0 {
+						t.Fatalf("status %d with connection closed = %v after %v, want %d closing at once; body %s",
+							resp.StatusCode, resp.Close, time.Since(start), tt.wantStatus, body)
+					}
+					if tt.wantBody != nil && !bytes.Equal(body, tt.wantBody) {
+						t.Errorf("got a %d-byte body, want %d bytes", len(body), len(tt.wantBody))
+					}
+					if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+						t.Errorf("reading after the %d returned %v after %v, want io.EOF at once",
+							tt.wantStatus, err, time.Since(start))
+					}
+					select {
+					case err := <-ctxErr:
+						if err != nil {
+							t.Errorf("the handler's context ended while it wrote the rendition: %v", err)
+						}
+					default:
+						if tt.wantBody != nil {
+							t.Error("the handler never closed the rendition")
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
+// A request without a body, or whose body the handler read to its end, keeps its connection for the next request,
+// which starts with a live context. One whose body the handler left unread closes it,
+// even when the client sent the body in full.
+func TestConnectionReuse(t *testing.T) {
+	// A connection whose context was cancelled stays cancelled. A deadline expiring under net/http's
+	// background read cancels it only when it wins a race with net/http's cleanup, so the request is
+	// repeated until a cancel would be all but certain.
+	const rounds = 10
+	id := uuid.NewV7().String()
+	upload := string(multipartBody(t, titlePart("Rain"), filePart("RIFF-audio")))
+	const uploadHeader = "POST /v1/assets HTTP/1.1\r\nHost: api.test\r\nContent-Type: " + formContentType + "\r\n"
+	const auth = "Authorization: Bearer " + validKey + "\r\n"
+	const healthz = "GET /healthz HTTP/1.1\r\nHost: api.test\r\n\r\n"
+	tests := []struct {
+		name string
+		req  string
+		// late is sent after req while the handler is held in the asset service, so it arrives after the header.
+		late       string
+		wantStatus int
+		wantClose  bool
+	}{
+		{name: "no body", req: healthz, wantStatus: http.StatusOK},
+		{name: "upload with a declared length",
+			req:        fmt.Sprintf("%s%sContent-Length: %d\r\n\r\n%s", uploadHeader, auth, len(upload), upload),
+			wantStatus: http.StatusAccepted},
+		{name: "chunked upload",
+			req: fmt.Sprintf("%s%sTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n",
+				uploadHeader, auth, len(upload), upload),
+			wantStatus: http.StatusAccepted},
+		{name: "upload without a key, sent in full",
+			req:        fmt.Sprintf("%sContent-Length: %d\r\n\r\n%s", uploadHeader, len(upload), upload),
+			wantStatus: http.StatusUnauthorized, wantClose: true},
+		{name: "unread body sent with the header",
+			req:        "GET /healthz HTTP/1.1\r\nHost: api.test\r\nContent-Length: 5\r\n\r\nhello",
+			wantStatus: http.StatusOK, wantClose: true},
+		// net/http reads 4 KiB with the header, so most of this body is still on the connection.
+		{name: "unread body larger than the read buffer",
+			req:        "GET /healthz HTTP/1.1\r\nHost: api.test\r\nContent-Length: 10000\r\n\r\n" + strings.Repeat("x", 10000),
+			wantStatus: http.StatusOK, wantClose: true},
+		{name: "unread body sent after the header",
+			req:  "GET /v1/assets/" + id + " HTTP/1.1\r\nHost: api.test\r\n" + auth + "Content-Length: 5\r\n\r\n",
+			late: "hello", wantStatus: http.StatusOK, wantClose: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.assets.asset = queuedAsset()
+				held := make(chan struct{})
+				getErr := make(chan error, 1)
+				f.assets.onCall = func(c assetCall) {
+					if tt.late != "" {
+						<-held
+					} else if c.method == "Get" {
+						getErr <- c.ctx.Err()
+					}
+				}
+				conn, br := f.rawConn(t)
+
+				start := time.Now()
+				send(t, conn, tt.req)
+				if tt.late != "" {
+					synctest.Wait()
+					send(t, conn, tt.late)
+					synctest.Wait()
+				}
+				close(held)
+				resp, body := readResponse(t, br)
+				if resp.StatusCode != tt.wantStatus || resp.Close != tt.wantClose {
+					t.Fatalf("status %d with connection closed = %v, want %d and closed = %v; body %s",
+						resp.StatusCode, resp.Close, tt.wantStatus, tt.wantClose, body)
+				}
+
+				if tt.wantClose {
+					if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+						t.Errorf("reading after the %d returned %v after %v, want io.EOF at once",
+							tt.wantStatus, err, time.Since(start))
+					}
+					return
+				}
+				for i := 1; i < rounds; i++ {
+					send(t, conn, tt.req)
+					if resp, body := readResponse(t, br); resp.StatusCode != tt.wantStatus || resp.Close {
+						t.Fatalf("round %d: status %d with connection closed = %v, want %d and kept open; body %s",
+							i, resp.StatusCode, resp.Close, tt.wantStatus, body)
+					}
+				}
+				send(t, conn, "GET /v1/assets/"+id+" HTTP/1.1\r\nHost: api.test\r\n"+auth+"\r\n")
+				if resp, body := readResponse(t, br); resp.StatusCode != http.StatusOK || resp.Close {
+					t.Fatalf("next request: status %d with connection closed = %v, want 200 and kept open; body %s",
+						resp.StatusCode, resp.Close, body)
+				}
+				select {
+				case err := <-getErr:
+					if err != nil {
+						t.Errorf("the next request's context was done when its handler ran: %v", err)
+					}
+				default:
+					t.Error("the next request never reached the asset service")
+				}
+			})
+		})
+	}
+}
+
+// A handler aborted with http.ErrAbortHandler before the declared body arrives must not keep the connection.
+func TestAbortedHandlerReleasesConnection(t *testing.T) {
+	for _, framing := range []string{"Content-Length: 1000\r\n", "Transfer-Encoding: chunked\r\n"} {
+		t.Run(framing[:strings.Index(framing, ":")], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.srv.engine.POST("/abort", func(*gin.Context) { panic(http.ErrAbortHandler) })
+				conn, br := f.rawConn(t)
+
+				start := time.Now()
+				send(t, conn, "POST /abort HTTP/1.1\r\nHost: api.test\r\n"+framing+"\r\n")
+				if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+					t.Errorf("reading after the abort returned %v after %v, want io.EOF at once",
+						err, time.Since(start))
+				}
+			})
+		})
 	}
 }

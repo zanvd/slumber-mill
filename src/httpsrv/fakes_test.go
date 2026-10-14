@@ -62,9 +62,11 @@ type fakeAssets struct {
 	createErr error
 	replayed  bool
 	// staged runs once Stage has read its part, with what it read.
-	staged    func(content string)
-	panicOnce any
-	onCall    func(c assetCall)
+	staged func(content string)
+	// fileClosed runs when the handler closes a rendition it opened.
+	fileClosed func()
+	panicOnce  any
+	onCall     func(c assetCall)
 
 	mu    sync.Mutex
 	calls []assetCall
@@ -138,7 +140,7 @@ func (f *fakeAssets) OpenRendition(ctx context.Context, tenantID uint64, id, pro
 	if f.err != nil {
 		return asset.Rendition{}, nil, f.err
 	}
-	file := &fakeFile{Reader: bytes.NewReader(f.content), seekErr: f.seekErr}
+	file := &fakeFile{Reader: bytes.NewReader(f.content), seekErr: f.seekErr, onClose: f.fileClosed}
 	f.mu.Lock()
 	f.files = append(f.files, file)
 	f.mu.Unlock()
@@ -148,6 +150,7 @@ func (f *fakeAssets) OpenRendition(ctx context.Context, tenantID uint64, id, pro
 type fakeFile struct {
 	*bytes.Reader
 	seekErr error
+	onClose func()
 	closed  bool
 }
 
@@ -160,6 +163,9 @@ func (f *fakeFile) Seek(offset int64, whence int) (int64, error) {
 
 func (f *fakeFile) Close() error {
 	f.closed = true
+	if f.onClose != nil {
+		f.onClose()
+	}
 	return nil
 }
 
