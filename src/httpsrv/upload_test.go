@@ -1,6 +1,7 @@
 package httpsrv
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -610,6 +611,93 @@ func TestCreateAssetTooManyUploads(t *testing.T) {
 			t.Errorf("upload after the slots freed: status = %d, want 202; body %s", res.status, res.body)
 		}
 	})
+}
+
+// A client that sends the headers and then nothing must not keep the connection once its upload is refused.
+func TestRejectedUploadReleasesConnection(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		// fillSlots holds one upload in Stage first, which fills a cap of 1.
+		fillSlots bool
+		// header is the request's framing and type, sent without a body.
+		header     string
+		wantStatus int
+	}{
+		{name: "429 with a declared length", cfg: Config{MaxUploadsPerTenant: 1}, fillSlots: true,
+			header:     "Content-Type: " + formContentType + "\r\nContent-Length: 1000",
+			wantStatus: http.StatusTooManyRequests},
+		{name: "429 chunked", cfg: Config{MaxUploadsPerTenant: 1}, fillSlots: true,
+			header:     "Content-Type: " + formContentType + "\r\nTransfer-Encoding: chunked",
+			wantStatus: http.StatusTooManyRequests},
+		{name: "413 on a declared length", cfg: Config{MaxUploadBytes: 100},
+			header:     "Content-Type: " + formContentType + "\r\nContent-Length: 1000",
+			wantStatus: http.StatusRequestEntityTooLarge},
+		{name: "400 before the body", header: "Content-Type: text/plain\r\nContent-Length: 1000",
+			wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, tt.cfg)
+				f.assets.asset = queuedAsset()
+				client := f.uploadClient(t)
+				if tt.fillSlots {
+					release := make(chan struct{})
+					f.assets.staged = func(string) { <-release }
+					body := bytes.NewReader(multipartBody(t, titlePart("Rain"), filePart("held")))
+					held := make(chan error, 1)
+					go func() {
+						_, err := post(t.Context(), client, upload{apiKey: validKey, body: body})
+						held <- err
+					}()
+					defer func() {
+						close(release)
+						if err := <-held; err != nil {
+							t.Errorf("held upload: %v", err)
+						}
+					}()
+					synctest.Wait()
+				}
+
+				tr, ok := client.Transport.(*http.Transport)
+				if !ok {
+					t.Fatalf("client transport is %T, want *http.Transport", client.Transport)
+				}
+				conn, err := tr.DialContext(t.Context(), "tcp", "api.test:80")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				start := time.Now()
+				req := "POST /v1/assets HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer " + validKey + "\r\n" +
+					tt.header + "\r\n\r\n"
+				if _, err := io.WriteString(conn, req); err != nil {
+					t.Fatal(err)
+				}
+				br := bufio.NewReader(conn)
+				resp, err := http.ReadResponse(br, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				if resp.StatusCode != tt.wantStatus {
+					t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+				}
+
+				if err := conn.SetReadDeadline(time.Now().Add(clientPatience)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+					t.Errorf("reading after the %d returned %v after %v, want io.EOF at once",
+						tt.wantStatus, err, time.Since(start))
+				}
+			})
+		})
+	}
 }
 
 func TestUploadSlots(t *testing.T) {

@@ -75,11 +75,13 @@ func (s *Server) createAsset(c *gin.Context) {
 	c.JSON(http.StatusAccepted, apiv1.NewAsset(a))
 }
 
-// rejectUpload answers before the body has been read to its end. It closes the connection,
-// so that net/http doesn't wait to drain the rest of a body that may never arrive.
+// rejectUpload answers before the body has been read to its end. It closes the connection and expires
+// the read deadline: after the handler returns, net/http still reads up to 256 KiB of an unread body,
+// and would otherwise wait for one that may never arrive.
 func (s *Server) rejectUpload(c *gin.Context, err error) {
 	c.Header("Connection", "close")
 	s.writeError(c, err)
+	_ = http.NewResponseController(c.Writer).SetReadDeadline(time.Now())
 }
 
 type uploadForm struct {
