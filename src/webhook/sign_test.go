@@ -242,6 +242,12 @@ func TestVerifyToleranceBoundaries(t *testing.T) {
 	}
 }
 
+func TestVerifyMaximumToleranceRejectsTimestampAtInt64Limit(t *testing.T) {
+	header := headerWith(strconv.FormatInt(math.MaxInt64, 10), sigFor(string(testSecret), math.MaxInt64, testBody))
+	err := Verify(testSecret, header, testBody, signedAt, math.MaxInt64)
+	assertError(t, err, ErrTimestampOutOfTolerance)
+}
+
 func TestVerifyMalformedHeaders(t *testing.T) {
 	for _, tc := range malformedHeaders() {
 		t.Run(tc.name, func(t *testing.T) {
@@ -390,7 +396,7 @@ func malformedHeaders() []headerCase {
 		{"DEL byte", headerWith(ts, good) + "\x7f"},
 		{"non-ASCII in an unknown scheme", headerWith(ts, good) + ",v9=é"},
 		{"invalid UTF-8", headerWith(ts, good) + ",v9=\xff"},
-		{"non-breaking space", headerWith(ts, good) + " "},
+		{"non-breaking space", headerWith(ts, good) + "\u00a0"},
 		{"two headers joined", headerWith(ts, good) + "," + headerWith(ts, other)},
 		{"quoted values", `t="` + ts + `",v1="` + good + `"`},
 	}

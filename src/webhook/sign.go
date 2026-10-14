@@ -51,8 +51,9 @@ func Verify(key []byte, header string, body []byte, now time.Time, tolerance tim
 	if !slices.ContainsFunc(sigs, func(sig []byte) bool { return hmac.Equal(sig, want) }) {
 		return ErrSignatureMismatch
 	}
-	d := now.Sub(time.Unix(t, 0))
-	if tolerance < 0 || d > tolerance || d < -tolerance {
+	at := time.Unix(t, 0)
+	d := now.Sub(at)
+	if tolerance < 0 || at.Before(time.Unix(0, 0)) || d > tolerance || d < -tolerance {
 		return ErrTimestampOutOfTolerance
 	}
 	return nil
