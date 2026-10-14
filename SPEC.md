@@ -577,6 +577,7 @@ The webhook pool runs two loops: the relay, which turns asset events into delive
   so fixing an endpoint or rotating a secret applies to pending retries.
 - **Outcomes:** 2xx → delivered; **410 Gone → permanent**; anything else, including 3xx, → retry.
   Drain at most 64 KiB of the response for keep-alive.
+  After the body is closed, Go's transport may itself read up to 256 KiB more, for at most 50 ms.
 - **Retries:** 12 attempts, backoff from 30 s doubling to a 6 h cap, roughly 7–15 hours in total.
 - **Signature:** `t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`, in the style Stripe uses.
   Export `Verify(secret, header, body, now, tolerance)` for receivers: it accepts several `v1` values (for rotation),
@@ -620,7 +621,7 @@ Tenants supply URLs, so the client must not become a proxy into the private netw
   A network-specific NAT64 prefix, which each network's operator picks, can embed private IPv4 addresses,
   so no fixed list can cover it.
 - `Proxy: nil`, since environment proxies would bypass the check; redirects aren't followed (`http.ErrUseLastResponse`).
-- Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s.
+- Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s, `IdleConnTimeout` 90 s.
 - `ErrBlockedAddress` is permanent. `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE=true` is for local development and tests only.
   `egress.ErrUnresolvable` (the lookup failed, timed out or returned no addresses) is retryable for deliveries,
   since DNS failures are often transient.
