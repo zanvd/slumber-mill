@@ -432,28 +432,42 @@ func TestTrustedProxies(t *testing.T) {
 		{name: "from a configured proxy", proxies: []string{"10.0.0.0/8"},
 			remote: "10.0.0.5:4321", want: forwarded},
 	}
+	targets := []struct {
+		name, method, path string
+		wantStatus         int
+	}{
+		{name: "route", method: http.MethodGet, path: "/healthz", wantStatus: http.StatusOK},
+		{name: "trailing-slash redirect", method: http.MethodPost, path: "/v1/assets/",
+			wantStatus: http.StatusTemporaryRedirect},
+	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			f := newFixture(t, Config{TrustedProxies: tt.proxies})
-			r := unauthed("/healthz")
-			r.RemoteAddr = tt.remote
-			r.Header.Set("X-Forwarded-For", forwarded)
-			r.Header.Set("X-Real-IP", forwarded)
-			f.serve(r)
-			if got := f.logLine(t, "request")["client_ip"]; got != tt.want {
-				t.Errorf("client_ip = %v, want %s", got, tt.want)
-			}
-		})
+		for _, target := range targets {
+			t.Run(tt.name+", "+target.name, func(t *testing.T) {
+				f := newFixture(t, Config{TrustedProxies: tt.proxies})
+				r := httptest.NewRequest(target.method, target.path, nil)
+				r.RemoteAddr = tt.remote
+				r.Header.Set("X-Forwarded-For", forwarded)
+				r.Header.Set("X-Real-IP", forwarded)
+				if w := f.serve(r); w.Code != target.wantStatus {
+					t.Fatalf("status = %d, want %d", w.Code, target.wantStatus)
+				}
+				if got := f.logLine(t, "request")["client_ip"]; got != tt.want {
+					t.Errorf("client_ip = %v, want %s", got, tt.want)
+				}
+			})
+		}
 	}
 }
 
 func TestRequestLog(t *testing.T) {
 	id := uuid.NewV7().String()
+	uploadWithKey := authed("/v1/assets/")
+	uploadWithKey.Method = http.MethodPost
 	tests := []struct {
 		name       string
 		req        *http.Request
 		wantRoute  string
-		wantStatus float64
+		wantStatus int
 		wantTenant any
 	}{
 		{name: "authenticated", req: authed("/v1/assets/" + id), wantRoute: "/v1/assets/:id",
@@ -466,12 +480,19 @@ func TestRequestLog(t *testing.T) {
 			return r
 		}(), wantRoute: "/v1/assets", wantStatus: 401},
 		{name: "unknown route", req: unauthed("/nope"), wantRoute: "", wantStatus: 404},
+		{name: "trailing-slash redirect", req: httptest.NewRequest(http.MethodPost, "/v1/assets/", nil),
+			wantRoute: "", wantStatus: 307},
+		{name: "trailing-slash redirect with a key", req: uploadWithKey, wantRoute: "", wantStatus: 307},
+		{name: "trailing-slash redirect of a GET", req: authed("/v1/assets/"), wantRoute: "", wantStatus: 301},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(t, Config{})
 			tt.req.Header.Set("Cookie", "session=cookie_value")
-			f.serve(tt.req)
+			method := tt.req.Method
+			if w := f.serve(tt.req); w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body %s", w.Code, tt.wantStatus, w.Body)
+			}
 
 			lines := f.logLines(t)
 			if len(lines) != 1 {
@@ -479,8 +500,8 @@ func TestRequestLog(t *testing.T) {
 			}
 			line := lines[0]
 			want := map[string]any{
-				"msg": "request", "level": "INFO", "method": "GET", "route": tt.wantRoute,
-				"status": tt.wantStatus, "client_ip": "192.0.2.1",
+				"msg": "request", "level": "INFO", "method": method, "route": tt.wantRoute,
+				"status": float64(tt.wantStatus), "client_ip": "192.0.2.1",
 			}
 			for k, v := range want {
 				if line[k] != v {
@@ -549,22 +570,130 @@ func TestContexts(t *testing.T) {
 	}
 }
 
+// panicWriter panics with v the first time a response would go out with status.
+type panicWriter struct {
+	*httptest.ResponseRecorder
+	status int
+	v      any
+}
+
+func (w *panicWriter) WriteHeader(code int) {
+	if code == w.status {
+		w.status = 0
+		panic(w.v)
+	}
+	w.ResponseRecorder.WriteHeader(code)
+}
+
 func TestRecovery(t *testing.T) {
-	f := newFixture(t, Config{})
-	f.assets.panicOnce = "kaboom"
 	target := "/v1/assets/" + uuid.NewV7().String()
-
-	wantErrorBody(t, f.serve(authed(target)), http.StatusInternalServerError, internalError())
-	line := f.logLine(t, "panic serving request")
-	if line["level"] != "ERROR" || line["panic"] != "kaboom" || line["stack"] == "" {
-		t.Errorf("panic log line = %v", line)
+	tests := []struct {
+		name string
+		// panicOnce makes the asset service panic.
+		panicOnce bool
+		// panicOn makes the response writer panic when the response would go out with this status.
+		panicOn    int
+		req        *http.Request
+		wantStatus int
+		wantRoute  string
+		wantTenant any
+		wantBody   string
+	}{
+		{name: "handler", panicOnce: true, req: authed(target), wantStatus: http.StatusInternalServerError,
+			wantRoute: "/v1/assets/:id", wantTenant: "acme"},
+		{name: "trailing-slash redirect", panicOn: http.StatusTemporaryRedirect,
+			req: httptest.NewRequest(http.MethodPost, "/v1/assets/", nil), wantStatus: http.StatusInternalServerError},
+		{name: "after the response started", req: unauthed("/started"), wantStatus: http.StatusOK,
+			wantRoute: "/started", wantBody: "partial"},
 	}
-	if got := f.logLine(t, "request")["status"]; got != float64(500) {
-		t.Errorf("request line status = %v, want 500", got)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, Config{})
+			f.srv.engine.GET("/started", func(c *gin.Context) {
+				c.String(http.StatusOK, "partial")
+				panic("kaboom")
+			})
+			if tt.panicOnce {
+				f.assets.panicOnce = "kaboom"
+			}
+			w := &panicWriter{ResponseRecorder: httptest.NewRecorder(), status: tt.panicOn, v: "kaboom"}
+			f.srv.Handler().ServeHTTP(w, tt.req)
 
-	if w := f.serve(authed(target)); w.Code != http.StatusOK {
-		t.Errorf("request after the panic: status = %d, want 200", w.Code)
+			if tt.wantStatus == http.StatusInternalServerError {
+				wantErrorBody(t, w.ResponseRecorder, tt.wantStatus, internalError())
+			} else if w.Code != tt.wantStatus || w.Body.String() != tt.wantBody {
+				t.Errorf("response = %d %q, want %d %q", w.Code, w.Body, tt.wantStatus, tt.wantBody)
+			}
+			line := f.logLine(t, "panic serving request")
+			if line["level"] != "ERROR" || line["panic"] != "kaboom" ||
+				!strings.Contains(fmt.Sprint(line["stack"]), "panic") || line["route"] != tt.wantRoute {
+				t.Errorf("panic log line = %v", line)
+			}
+			req := f.logLine(t, "request")
+			if req["status"] != float64(tt.wantStatus) || req["route"] != tt.wantRoute || req["tenant"] != tt.wantTenant {
+				t.Errorf("request line = %v, want status %d, route %q and tenant %v",
+					req, tt.wantStatus, tt.wantRoute, tt.wantTenant)
+			}
+
+			if w := f.serve(authed(target)); w.Code != http.StatusOK {
+				t.Errorf("request after the panic: status = %d, want 200", w.Code)
+			}
+		})
+	}
+}
+
+// http.ErrAbortHandler reaches net/http, which cuts the connection, and the request is still logged once.
+func TestAbortHandler(t *testing.T) {
+	tests := []struct {
+		name      string
+		panicOn   int
+		req       *http.Request
+		wantRoute string
+	}{
+		{name: "handler", req: unauthed("/abort"), wantRoute: "/abort"},
+		{name: "trailing-slash redirect", panicOn: http.StatusTemporaryRedirect,
+			req: httptest.NewRequest(http.MethodPost, "/v1/assets/", nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, Config{})
+			f.srv.engine.GET("/abort", func(*gin.Context) { panic(http.ErrAbortHandler) })
+			w := &panicWriter{ResponseRecorder: httptest.NewRecorder(), status: tt.panicOn, v: http.ErrAbortHandler}
+
+			got := func() (v any) {
+				defer func() { v = recover() }()
+				f.srv.Handler().ServeHTTP(w, tt.req)
+				return nil
+			}()
+			if got != http.ErrAbortHandler {
+				t.Errorf("ServeHTTP panicked with %v, want http.ErrAbortHandler", got)
+			}
+			if w.Code != http.StatusOK || w.Body.Len() != 0 || w.Flushed {
+				t.Errorf("wrote %d %q (flushed %v), want nothing", w.Code, w.Body, w.Flushed)
+			}
+			lines := f.logLines(t)
+			if len(lines) != 1 {
+				t.Fatalf("got %d log lines, want 1:\n%s", len(lines), f.logs)
+			}
+			if l := lines[0]; l["msg"] != "request" || l["route"] != tt.wantRoute || l["status"] != float64(0) {
+				t.Errorf("log line = %v, want the request line with route %q and status 0", l, tt.wantRoute)
+			}
+		})
+	}
+}
+
+func TestFlush(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.srv.engine.GET("/stream", func(c *gin.Context) {
+		c.Status(http.StatusAccepted)
+		c.Writer.Flush()
+	})
+	w := f.serve(unauthed("/stream"))
+	if !w.Flushed || w.Code != http.StatusAccepted {
+		t.Errorf("status %d, flushed %v; want 202 flushed", w.Code, w.Flushed)
+	}
+	if got := f.logLine(t, "request")["status"]; got != float64(http.StatusAccepted) {
+		t.Errorf("request line status = %v, want 202", got)
 	}
 }
 
@@ -806,6 +935,76 @@ func TestAbortedHandlerReleasesConnection(t *testing.T) {
 				if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
 					t.Errorf("reading after the abort returned %v after %v, want io.EOF at once",
 						err, time.Since(start))
+				}
+			})
+		})
+	}
+}
+
+// A handler that panics before the declared body arrives gets the 500 and loses the connection at once.
+func TestPanicReleasesConnection(t *testing.T) {
+	for _, framing := range []string{"Content-Length: 1000\r\n", "Transfer-Encoding: chunked\r\n"} {
+		t.Run(framing[:strings.Index(framing, ":")], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.srv.engine.POST("/boom", func(*gin.Context) { panic("kaboom") })
+				conn, br := f.rawConn(t)
+
+				start := time.Now()
+				send(t, conn, "POST /boom HTTP/1.1\r\nHost: api.test\r\n"+framing+"\r\n")
+				resp, body := readResponse(t, br)
+				if resp.StatusCode != http.StatusInternalServerError || !resp.Close || time.Since(start) != 0 {
+					t.Fatalf("status %d with connection closed = %v after %v, want 500 closing at once; body %s",
+						resp.StatusCode, resp.Close, time.Since(start), body)
+				}
+				var got apiv1.ErrorResponse
+				if err := json.Unmarshal(body, &got); err != nil || !reflect.DeepEqual(got, internalError()) {
+					t.Errorf("body %s (%v), want %+v", body, err, internalError())
+				}
+				if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+					t.Errorf("reading after the 500 returned %v after %v, want io.EOF at once",
+						err, time.Since(start))
+				}
+				f.logLine(t, "panic serving request")
+			})
+		})
+	}
+}
+
+// What Gin's writer offers handlers still reaches net/http's through the request logging.
+func TestWriterInterfaces(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler gin.HandlerFunc
+	}{
+		{name: "hijack", handler: func(c *gin.Context) {
+			conn, rw, err := c.Writer.Hijack()
+			if err != nil {
+				c.String(http.StatusInternalServerError, err.Error())
+				return
+			}
+			defer conn.Close()
+			_, _ = rw.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
+			_ = rw.Flush()
+		}},
+		{name: "stream", handler: func(c *gin.Context) {
+			c.Stream(func(w io.Writer) bool {
+				_, _ = io.WriteString(w, "done")
+				return false
+			})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.srv.engine.GET("/writer", tt.handler)
+				conn, br := f.rawConn(t)
+
+				send(t, conn, "GET /writer HTTP/1.1\r\nHost: api.test\r\n\r\n")
+				resp, body := readResponse(t, br)
+				if resp.StatusCode != http.StatusOK || string(body) != "done" {
+					t.Errorf("response = %d %q, want 200 %q", resp.StatusCode, body, "done")
 				}
 			})
 		})
