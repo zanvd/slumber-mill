@@ -94,7 +94,6 @@ func (p *Processor) Extend(ctx context.Context, l worker.Lease) error {
 	return toWorker(p.repo.extend(ctx, lease(l), p.cfg.Lease))
 }
 
-// Process renders the asset's renditions, promotes them, and marks the asset ready.
 func (p *Processor) Process(ctx context.Context, l worker.Lease) error {
 	held := lease(l)
 	work, cancel := context.WithTimeout(ctx, processTimeout)
