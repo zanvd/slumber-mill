@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -992,6 +993,156 @@ func TestEventMethodsWrapRepositoryErrors(t *testing.T) {
 	err = f.svc.MarkRelayed(t.Context(), []uuid.UUID{f.repo.events[0].ID})
 	if !errors.Is(err, errBoom) || !strings.HasPrefix(err.Error(), "error marking events relayed: ") {
 		t.Errorf("MarkRelayed() error = %v, want %v wrapped", err, errBoom)
+	}
+}
+
+const retention = 30 * 24 * time.Hour
+
+// retentionLog is a retention summary as logged.
+type retentionLog struct {
+	Level, Msg, Age string
+	Deleted         int
+	Batches         int
+}
+
+func retentionLogs(t *testing.T, logs *bytes.Buffer) []retentionLog {
+	t.Helper()
+	var out []retentionLog
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry retentionLog
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("error decoding log entry %s: %v", line, err)
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// TestDeleteRelayedEvents deletes in batches until one comes back short, each batch starting where the last stopped.
+func TestDeleteRelayedEvents(t *testing.T) {
+	tests := []struct {
+		name        string
+		expired     int
+		batch       int
+		wantBatches int
+	}{
+		{"nothing expired", 0, 3, 1},
+		{"less than a batch", 2, 3, 1},
+		{"exactly a batch", 3, 3, 2},
+		{"several batches", 7, 3, 3},
+		{"several full batches", 9, 3, 4},
+		{"batches of one", 4, 1, 5},
+		{"the default batch", 1001, defaultRetentionBatch, 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			if tc.batch != defaultRetentionBatch {
+				f.svc.retentionBatch = tc.batch
+			}
+			f.repo.expired = tc.expired
+			var logs bytes.Buffer
+			ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil)))
+
+			deleted, err := f.svc.DeleteRelayedEvents(ctx, retention)
+
+			if err != nil || deleted != tc.expired {
+				t.Errorf("DeleteRelayedEvents() = %d, %v; want %d", deleted, err, tc.expired)
+			}
+			if len(f.repo.purges) != tc.wantBatches {
+				t.Fatalf("ran %d batches, want %d", len(f.repo.purges), tc.wantBatches)
+			}
+			var after eventCursor
+			for i, p := range f.repo.purges {
+				if want := (purgeArgs{retention, after, tc.batch}); p != want {
+					t.Errorf("batch %d got %+v, want %+v", i+1, p, want)
+				}
+				after = eventCursor{RelayedAt: fakeNow, ID: uint64(min((i+1)*tc.batch, tc.expired))}
+			}
+			var want []retentionLog
+			if tc.expired > 0 {
+				want = []retentionLog{{Level: "INFO", Msg: "deleted relayed asset events past retention",
+					Age: "720h0m0s", Deleted: tc.expired, Batches: tc.wantBatches}}
+			}
+			if got := retentionLogs(t, &logs); !slices.Equal(got, want) {
+				t.Errorf("logs = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// TestDeleteRelayedEventsStops stops the loop on a done context, a failed batch or an age that isn't positive,
+// and reports and logs what the batches before deleted.
+func TestDeleteRelayedEventsStops(t *testing.T) {
+	// stopAt runs stop after batch n.
+	stopAt := func(n int, stop func(f *fixture, cancel context.CancelFunc)) func(*fixture, context.CancelFunc, int) {
+		return func(f *fixture, cancel context.CancelFunc, batch int) {
+			if batch == n {
+				stop(f, cancel)
+			}
+		}
+	}
+	cancelNow := func(_ *fixture, cancel context.CancelFunc) { cancel() }
+	failNext := func(f *fixture, _ context.CancelFunc) { f.repo.errs["deleteRelayedEvents"] = errBoom }
+	tests := []struct {
+		name string
+		age  time.Duration
+		// stop runs after each batch, numbered from 1, and with 0 before the first.
+		stop        func(f *fixture, cancel context.CancelFunc, batch int)
+		wantDeleted int
+		wantBatches int
+		wantErr     error
+	}{
+		{name: "cancelled before the first batch", age: retention, stop: stopAt(0, cancelNow), wantErr: context.Canceled},
+		{
+			name: "cancelled after the second batch", age: retention, stop: stopAt(2, cancelNow),
+			wantDeleted: 6, wantBatches: 2, wantErr: context.Canceled,
+		},
+		{name: "the first batch fails", age: retention, stop: stopAt(0, failNext), wantBatches: 1, wantErr: errBoom},
+		{
+			name: "the third batch fails", age: retention, stop: stopAt(2, failNext),
+			wantDeleted: 6, wantBatches: 3, wantErr: errBoom,
+		},
+		{name: "zero age", age: 0},
+		{name: "negative age", age: -time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.svc.retentionBatch = 3
+			f.repo.expired = 10
+			var logs bytes.Buffer
+			ctx, cancel := context.WithCancel(logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil))))
+			defer cancel()
+			if tc.stop != nil {
+				tc.stop(f, cancel, 0)
+				f.repo.afterPurge = func(batch int) { tc.stop(f, cancel, batch) }
+			}
+
+			deleted, err := f.svc.DeleteRelayedEvents(ctx, tc.age)
+
+			if deleted != tc.wantDeleted || err == nil || tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("DeleteRelayedEvents() = %d, %v; want %d and an error matching %v",
+					deleted, err, tc.wantDeleted, tc.wantErr)
+			}
+			if err != nil && !strings.HasPrefix(err.Error(), "error deleting relayed events: ") {
+				t.Errorf("error = %q, want it prefixed", err)
+			}
+			if len(f.repo.purges) != tc.wantBatches {
+				t.Errorf("ran %d batches, want %d", len(f.repo.purges), tc.wantBatches)
+			}
+			var want []retentionLog
+			if tc.wantDeleted > 0 {
+				want = []retentionLog{{Level: "INFO", Msg: "deleted relayed asset events past retention",
+					Age: "720h0m0s", Deleted: tc.wantDeleted, Batches: tc.wantBatches}}
+			}
+			if got := retentionLogs(t, &logs); !slices.Equal(got, want) {
+				t.Errorf("logs = %+v, want %+v", got, want)
+			}
+		})
 	}
 }
 

@@ -288,6 +288,44 @@ func (r *Repository) markRelayed(ctx context.Context, ids []uuid.UUID) error {
 	return nil
 }
 
+// eventCursor is where a retention batch of events stopped: the relay time and ID of the last event it read.
+// The zero value starts from the oldest.
+type eventCursor struct {
+	RelayedAt time.Time
+	ID        uint64
+}
+
+// deleteRelayedEvents deletes a batch of events relayed more than age ago: up to limit of them, oldest first,
+// after the cursor. It returns how many it deleted, where the next batch starts, and whether the batch was full,
+// so more may be left.
+func (r *Repository) deleteRelayedEvents(ctx context.Context, age time.Duration, after eventCursor, limit int) (
+	deleted int, next eventCursor, full bool, err error) {
+	q := r.db.WithContext(ctx).Table("asset_events").
+		Select("id", "relayed_at").
+		Where("relayed_at < NOW(6) - INTERVAL ? MICROSECOND", age.Microseconds())
+	if after.ID != 0 {
+		q = q.Where("(relayed_at > ? OR relayed_at = ? AND id > ?)", after.RelayedAt, after.RelayedAt, after.ID)
+	}
+	var keys []eventCursor
+	if err := q.Order("relayed_at, id").Limit(limit).Find(&keys).Error; err != nil {
+		return 0, after, false, translate("error reading relayed asset events", err)
+	}
+	if len(keys) == 0 {
+		return 0, after, false, nil
+	}
+	ids := make([]uint64, len(keys))
+	for i, k := range keys {
+		ids[i] = k.ID
+	}
+	res := r.db.WithContext(ctx).
+		Where("id IN ? AND relayed_at < NOW(6) - INTERVAL ? MICROSECOND", ids, age.Microseconds()).
+		Delete(&eventRow{})
+	if res.Error != nil {
+		return 0, after, false, translate("error deleting relayed asset events", res.Error)
+	}
+	return int(res.RowsAffected), keys[len(keys)-1], len(keys) == limit, nil
+}
+
 // claim leases the asset that has been due longest to workerID for d. It returns false when nothing is due.
 func (r *Repository) claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error) {
 	l, ok, err := r.leases.Claim(ctx, workerID, d)

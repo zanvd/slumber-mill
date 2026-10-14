@@ -33,6 +33,10 @@ const (
 	// defaultInsertTimeout bounds the upload's insert, which doesn't stop when the request's context does:
 	// a client hanging up mid-insert mustn't make a committed row look failed and lose its source.
 	defaultInsertTimeout = 15 * time.Second
+	// defaultRetentionBatch is how many events one retention batch deletes. Each batch is a read of the index
+	// and a delete by primary key, so it holds its row locks and undo for milliseconds, while a day of events
+	// still takes only a few hundred batches.
+	defaultRetentionBatch = 500
 )
 
 type repo interface {
@@ -43,6 +47,8 @@ type repo interface {
 	rendition(ctx context.Context, tenantID uint64, assetID uuid.UUID, profile Profile) (Rendition, error)
 	unrelayedEvents(ctx context.Context, limit int) ([]Event, error)
 	markRelayed(ctx context.Context, ids []uuid.UUID) error
+	deleteRelayedEvents(ctx context.Context, age time.Duration, after eventCursor, limit int) (
+		deleted int, next eventCursor, full bool, err error)
 }
 
 type fileStore interface {
@@ -59,10 +65,12 @@ type Service struct {
 	files fileStore
 	// insertTimeout is defaultInsertTimeout outside tests.
 	insertTimeout time.Duration
+	// retentionBatch is defaultRetentionBatch outside tests.
+	retentionBatch int
 }
 
 func NewService(r repo, files fileStore) *Service {
-	return &Service{repo: r, files: files, insertTimeout: defaultInsertTimeout}
+	return &Service{repo: r, files: files, insertTimeout: defaultInsertTimeout, retentionBatch: defaultRetentionBatch}
 }
 
 // Upload is a file staged by Stage. Pass it to Create, which takes it over, or to Discard.
@@ -332,6 +340,38 @@ func (s *Service) MarkRelayed(ctx context.Context, ids []uuid.UUID) error {
 		return fmt.Errorf("error marking events relayed: %w", err)
 	}
 	return nil
+}
+
+// DeleteRelayedEvents deletes the events relayed more than age ago, in batches, until a batch comes back short
+// or ctx is done, and returns how many it deleted. Unrelayed events are kept however old they are.
+// It covers every tenant: retention is maintenance of the whole outbox.
+func (s *Service) DeleteRelayedEvents(ctx context.Context, age time.Duration) (deleted int, err error) {
+	if age <= 0 {
+		return 0, fmt.Errorf("error deleting relayed events: age %v is not positive", age)
+	}
+	batches := 0
+	defer func() {
+		if deleted > 0 {
+			logging.LoggerFromContext(ctx).InfoContext(ctx, "deleted relayed asset events past retention",
+				"deleted", deleted, "batches", batches, "age", age.String())
+		}
+	}()
+	var after eventCursor
+	for {
+		if err := ctx.Err(); err != nil {
+			return deleted, fmt.Errorf("error deleting relayed events: %w", err)
+		}
+		n, next, full, err := s.repo.deleteRelayedEvents(ctx, age, after, s.retentionBatch)
+		deleted += n
+		batches++
+		if err != nil {
+			return deleted, fmt.Errorf("error deleting relayed events: %w", err)
+		}
+		if !full {
+			return deleted, nil
+		}
+		after = next
+	}
 }
 
 // remove deletes a file the service is done with. A failure is only logged: the temp sweep or
