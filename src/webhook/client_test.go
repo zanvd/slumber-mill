@@ -674,6 +674,144 @@ func TestPostOtherFailures(t *testing.T) {
 	}
 }
 
+func TestRedactURL(t *testing.T) {
+	tests := []struct{ raw, want string }{
+		{"https://hooks.slack.test/services/T0SECRET/B0SECRET?token=SECRET#frag", "https://hooks.slack.test"},
+		{"http://hooks.test:8080/a/b", "http://hooks.test:8080"},
+		{"http://user:SECRET@hooks.test/a", "http://hooks.test"},
+		{"http://[2001:db8::1]:8080/a", "http://[2001:db8::1]:8080"},
+		{"http://hooks.test", "http://hooks.test"},
+		{"http://hooks.test:8080/a%zz?token=SECRET", "http://hooks.test:8080"},
+		{"http://user:SECRET@hooks.test/a%zz", "http://hooks.test"},
+		{"http://[::1/a?token=SECRET", "http://[::1"},
+		{"/hooks/SECRET", redactedURL},
+		{"hooks.test/SECRET", redactedURL},
+		{"mailto:SECRET", redactedURL},
+		{"ftp:///SECRET", redactedURL},
+		{"/SECRET?next=http://hooks.test", redactedURL},
+		{"", redactedURL},
+	}
+	for _, tc := range tests {
+		t.Run(tc.raw, func(t *testing.T) {
+			if got := redactURL(tc.raw); got != tc.want {
+				t.Errorf("redactURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPostErrorsHideTheURLPath(t *testing.T) {
+	const secrets = "/hooks/T0SECRETPATH?token=SECRETQUERY#SECRETFRAG"
+	leaks := []string{"T0SECRETPATH", "SECRETQUERY", "SECRETFRAG", "SECRETUSER", "SECRETPASS", "%zz"}
+	type target struct {
+		client *Client
+		ctx    context.Context
+		url    string
+		origin string // the only part of the URL an error may show
+	}
+	refused := func(t *testing.T) string {
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = l.Close()
+		return l.Addr().String()
+	}
+	tests := []struct {
+		name        string
+		bubble      bool // runs in a synctest bubble
+		setup       func(t *testing.T) target
+		wantIs      error
+		wantTimeout bool
+	}{
+		{"blocked address", false, func(t *testing.T) target {
+			rcv := newReceiver(t, "tcp4", respondStatus(http.StatusAccepted))
+			host := rcv.srv.Listener.Addr().String()
+			return target{NewClient(false), t.Context(), "http://" + host + secrets, "http://" + host}
+		}, egress.ErrBlockedAddress, false},
+		{"blocked address, userinfo", false, func(t *testing.T) target {
+			rcv := newReceiver(t, "tcp4", respondStatus(http.StatusAccepted))
+			host := rcv.srv.Listener.Addr().String()
+			return target{NewClient(false), t.Context(), "http://SECRETUSER:SECRETPASS@" + host + secrets, "http://" + host}
+		}, egress.ErrBlockedAddress, false},
+		{"unresolvable host", false, func(t *testing.T) target {
+			c := NewClient(false)
+			(&fakeDNS{rcode: rcodeNameError}).use(c)
+			return target{c, t.Context(), "http://" + testHost + ":8080" + secrets, "http://" + testHost + ":8080"}
+		}, egress.ErrUnresolvable, false},
+		{"response header timeout", true, func(t *testing.T) target {
+			c := NewClient(false)
+			inMemory(t, c, httptest.NewTestServer(t, http.HandlerFunc(stall)))
+			return target{c, t.Context(), "http://" + testHost + secrets, "http://" + testHost}
+		}, nil, true},
+		{"cancelled context", false, func(t *testing.T) target {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			return target{NewClient(false), ctx, "http://" + testHost + secrets, "http://" + testHost}
+		}, context.Canceled, false},
+		{"expired deadline", false, func(t *testing.T) target {
+			ctx, cancel := context.WithTimeout(t.Context(), -time.Second)
+			t.Cleanup(cancel)
+			return target{NewClient(false), ctx, "http://" + testHost + secrets, "http://" + testHost}
+		}, context.DeadlineExceeded, true},
+		{"connection refused", false, func(t *testing.T) target {
+			host := refused(t)
+			return target{NewClient(true), t.Context(), "http://" + host + secrets, "http://" + host}
+		}, syscall.ECONNREFUSED, false},
+		{"unsupported scheme", false, func(t *testing.T) target {
+			return target{NewClient(true), t.Context(), "ftp://" + testHost + secrets, "ftp://" + testHost}
+		}, nil, false},
+		{"malformed escape in the path", false, func(t *testing.T) target {
+			rawURL := "http://SECRETUSER:SECRETPASS@" + testHost + ":8080/hooks/T0SECRETPATH%zz?token=SECRETQUERY"
+			return target{NewClient(true), t.Context(), rawURL, "http://" + testHost + ":8080"}
+		}, nil, false},
+		{"malformed host", false, func(t *testing.T) target {
+			return target{NewClient(true), t.Context(), "http://[::1" + secrets, "http://[::1"}
+		}, nil, false},
+		{"no scheme", false, func(t *testing.T) target {
+			return target{NewClient(true), t.Context(), testHost + secrets, redactedURL}
+		}, nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			run := func(t *testing.T) {
+				tg := tc.setup(t)
+				status, err := tg.client.Post(tg.ctx, tg.url, testEventID, testSignature, testBody)
+				checkErr(t, err, tc.wantIs)
+				if status != 0 {
+					t.Errorf("Post() status = %d, want 0", status)
+				}
+				msg := err.Error()
+				for _, leak := range leaks {
+					if strings.Contains(msg, leak) {
+						t.Errorf("Post() error = %q, which contains %q", msg, leak)
+					}
+				}
+				_, hostPart, found := strings.Cut(tg.origin, "://")
+				if !found {
+					hostPart = tg.origin
+				}
+				if !strings.Contains(msg, hostPart) {
+					t.Errorf("Post() error = %q, want it to name %s", msg, tg.origin)
+				}
+				urlErr, ok := errors.AsType[*url.Error](err)
+				if !ok || urlErr.URL != tg.origin {
+					t.Errorf("Post() error = %#v, want a *url.Error with the URL %q", err, tg.origin)
+				}
+				netErr, ok := errors.AsType[net.Error](err)
+				if !ok || netErr.Timeout() != tc.wantTimeout {
+					t.Errorf("Post() error = %v, want a net.Error with Timeout() = %t", err, tc.wantTimeout)
+				}
+			}
+			if tc.bubble {
+				synctest.Test(t, run)
+				return
+			}
+			run(t)
+		})
+	}
+}
+
 // inMemory sends every connection c makes to srv over httptest's in-memory network,
 // so a synctest bubble's clock drives every timeout.
 func inMemory(t *testing.T, c *Client, srv *httptest.Server) {

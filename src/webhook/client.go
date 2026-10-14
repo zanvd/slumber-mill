@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +18,8 @@ import (
 )
 
 const EventIDHeader = "SlumberMill-Event-Id"
+
+const redactedURL = "[redacted URL]"
 
 const (
 	userAgent             = "slumber-mill-webhooks/1"
@@ -65,7 +69,7 @@ func NewClient(allowPrivate bool) *Client {
 func (c *Client) Post(ctx context.Context, url, eventID, signature string, body []byte) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, fmt.Errorf("error building webhook request: %w", err)
+		return 0, fmt.Errorf("error building webhook request: %w", redactURLError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
@@ -74,12 +78,48 @@ func (c *Client) Post(ctx context.Context, url, eventID, signature string, body 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("error posting webhook: %w", err)
+		return 0, fmt.Errorf("error posting webhook: %w", redactURLError(err))
 	}
 	// Draining a short body keeps the connection alive; a longer one isn't worth reading.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
 	_ = resp.Body.Close()
 	return resp.StatusCode, nil
+}
+
+// redactURLError returns a copy of err with the URL cut to scheme://host[:port], since webhook URLs carry credentials.
+// The copy keeps the wrapped error, so errors.Is, errors.As and Timeout see what they saw before.
+func redactURLError(err error) error {
+	urlErr, ok := err.(*url.Error)
+	if !ok {
+		return err
+	}
+	redacted := *urlErr
+	redacted.URL = redactURL(urlErr.URL)
+	if _, ok := redacted.Err.(url.EscapeError); ok {
+		redacted.Err = errors.New("invalid URL escape") // the error quotes three characters of the path
+	}
+	return &redacted
+}
+
+func redactURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		if u.Host == "" {
+			return redactedURL
+		}
+		return u.Scheme + "://" + u.Host
+	}
+	// A URL that doesn't parse still has its scheme and authority in front, if it has any.
+	scheme, rest, ok := strings.Cut(raw, "://")
+	if !ok || scheme == "" || strings.Trim(scheme, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.") != "" {
+		return redactedURL
+	}
+	authority, _, _ := strings.Cut(rest, "/")
+	authority, _, _ = strings.Cut(authority, "?")
+	authority, _, _ = strings.Cut(authority, "#")
+	if i := strings.LastIndex(authority, "@"); i >= 0 {
+		authority = authority[i+1:]
+	}
+	return scheme + "://" + authority
 }
 
 func (c *Client) control(_, address string, _ syscall.RawConn) error {
