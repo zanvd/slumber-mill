@@ -294,6 +294,41 @@ func TestNewAssetList(t *testing.T) {
 	}
 }
 
+func TestNewEvent(t *testing.T) {
+	const eventID = "0192b7a0-4c3e-7d5a-9b1f-2e8c6d4a1f06"
+	tests := []struct {
+		name  string
+		event asset.Event
+		want  string
+	}{
+		{"ready", asset.Event{
+			ID:        mustParseUUID(t, eventID),
+			TenantID:  42,
+			Type:      asset.EventReady,
+			CreatedAt: time.Date(2026, 3, 1, 12, 5, 30, 500000000, time.UTC),
+			Asset:     readyAsset(t),
+		}, `{"id":"` + eventID + `","type":"asset.ready","created_at":"2026-03-01T12:05:30.5Z","data":` + readyJSON + `}`},
+		{"failed, created in another zone", asset.Event{
+			ID:        mustParseUUID(t, "0192B7A0-4C3E-7D5A-9B1F-2E8C6D4A1F06"),
+			TenantID:  42,
+			Type:      asset.EventFailed,
+			CreatedAt: updated.In(time.FixedZone("CEST", 2*60*60)),
+			Asset:     failedAsset(t),
+		}, `{"id":"` + eventID + `","type":"asset.failed","created_at":"2026-03-01T12:05:30Z","data":` + failedJSON + `}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := marshal(t, NewEvent(tt.event))
+			if doc != tt.want {
+				t.Errorf("JSON mismatch\n got: %s\nwant: %s", doc, tt.want)
+			}
+			if got, want := keysOf(t, doc), []string{"created_at", "data", "id", "type"}; !slices.Equal(got, want) {
+				t.Errorf("keys = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestErrorEnvelope(t *testing.T) {
 	var v validation.Collector
 	v.Add("title", "is required")

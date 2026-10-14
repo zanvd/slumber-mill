@@ -48,6 +48,14 @@ type AssetList struct {
 	NextCursor *string `json:"next_cursor"`
 }
 
+// Event is the body of a webhook.
+type Event struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	CreatedAt time.Time `json:"created_at"`
+	Data      Asset     `json:"data"`
+}
+
 type ErrorResponse struct {
 	Error ErrorBody `json:"error"`
 }
@@ -116,6 +124,15 @@ func NewAssetList(p asset.Page) AssetList {
 		data[i] = NewAsset(a)
 	}
 	return AssetList{Data: data, NextCursor: nonEmpty(p.NextCursor)}
+}
+
+func NewEvent(e asset.Event) Event {
+	return Event{
+		ID:        e.ID.String(),
+		Type:      string(e.Type),
+		CreatedAt: e.CreatedAt.UTC(),
+		Data:      NewAsset(e.Asset),
+	}
 }
 
 func NewError(code, message string) ErrorResponse {
