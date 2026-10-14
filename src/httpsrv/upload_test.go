@@ -700,6 +700,28 @@ func TestRejectedUploadReleasesConnection(t *testing.T) {
 	}
 }
 
+// A writer that can't take read deadlines must fail the upload, not run it without stall protection.
+func TestCreateAssetWithoutReadDeadline(t *testing.T) {
+	f := newFixture(t, Config{})
+	body := multipartBody(t, titlePart("Rain"), filePart("RIFF-audio"))
+	r := httptest.NewRequest(http.MethodPost, "/v1/assets", bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+validKey)
+	r.Header.Set("Content-Type", formContentType)
+	w := f.serve(r)
+
+	wantErrorBody(t, w, http.StatusInternalServerError, internalError())
+	if calls := f.assets.recorded(); len(calls) != 0 {
+		t.Errorf("service calls = %q, want none", methods(calls))
+	}
+	if n := f.uploadsInProgress(); n != 0 {
+		t.Errorf("%d tenants still hold upload slots", n)
+	}
+	line := f.logLine(t, "request failed")
+	if got, _ := line["error"].(string); line["level"] != "ERROR" || !strings.Contains(got, "read deadline") {
+		t.Errorf("log line = %v, want the read deadline error at ERROR", line)
+	}
+}
+
 func TestUploadSlots(t *testing.T) {
 	u := newUploadSlots(2)
 	steps := []struct {
