@@ -40,6 +40,41 @@ type fakeRepo struct {
 	errAfterInsert error
 	insertCtx      context.Context
 	listArgs       []listArgs
+	// events is the outbox, oldest first; relayed holds the IDs markRelayed has marked.
+	events      []Event
+	relayed     map[uuid.UUID]bool
+	eventLimits []int
+	markedIDs   [][]uuid.UUID
+}
+
+func (f *fakeRepo) unrelayedEvents(ctx context.Context, limit int) ([]Event, error) {
+	f.calls.add("unrelayedEvents")
+	f.eventLimits = append(f.eventLimits, limit)
+	if err := f.err(ctx, "unrelayedEvents"); err != nil {
+		return nil, err
+	}
+	var events []Event
+	for _, e := range f.events {
+		if !f.relayed[e.ID] && len(events) < limit {
+			events = append(events, e)
+		}
+	}
+	return events, nil
+}
+
+func (f *fakeRepo) markRelayed(ctx context.Context, ids []uuid.UUID) error {
+	f.calls.add("markRelayed")
+	f.markedIDs = append(f.markedIDs, slices.Clone(ids))
+	if err := f.err(ctx, "markRelayed"); err != nil {
+		return err
+	}
+	if f.relayed == nil {
+		f.relayed = make(map[uuid.UUID]bool)
+	}
+	for _, id := range ids {
+		f.relayed[id] = true
+	}
+	return nil
 }
 
 func (f *fakeRepo) err(ctx context.Context, method string) error {

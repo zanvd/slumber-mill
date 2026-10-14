@@ -24,6 +24,8 @@ const (
 	// DefaultListLimit is the page size the API uses when a request doesn't give one.
 	DefaultListLimit = 20
 	MaxListLimit     = 100
+	// MaxEventBatch is the most events UnrelayedEvents returns, and MarkRelayed takes, in one call.
+	MaxEventBatch = 100
 
 	maxTitleChars          = 255
 	maxIdempotencyKeyBytes = 255
@@ -39,6 +41,8 @@ type repo interface {
 	assetByIdempotencyKey(ctx context.Context, tenantID uint64, key string) (Asset, error)
 	listAssets(ctx context.Context, tenantID, before uint64, limit int) ([]Asset, uint64, error)
 	rendition(ctx context.Context, tenantID uint64, assetID uuid.UUID, profile Profile) (Rendition, error)
+	unrelayedEvents(ctx context.Context, limit int) ([]Event, error)
+	markRelayed(ctx context.Context, ids []uuid.UUID) error
 }
 
 type fileStore interface {
@@ -300,6 +304,34 @@ func (s *Service) OpenRendition(ctx context.Context, tenantID uint64, id, profil
 		return Rendition{}, nil, fmt.Errorf("error opening rendition: %w", err)
 	}
 	return r, f, nil
+}
+
+// UnrelayedEvents returns up to limit events that MarkRelayed hasn't marked, oldest first,
+// each with its asset as it is now. limit must be 1 to MaxEventBatch.
+func (s *Service) UnrelayedEvents(ctx context.Context, limit int) ([]Event, error) {
+	if limit < 1 || limit > MaxEventBatch {
+		return nil, fmt.Errorf("error reading unrelayed events: limit %d is not between 1 and %d", limit, MaxEventBatch)
+	}
+	events, err := s.repo.unrelayedEvents(ctx, limit)
+	if err != nil {
+		return nil, fmt.Errorf("error reading unrelayed events: %w", err)
+	}
+	return events, nil
+}
+
+// MarkRelayed marks up to MaxEventBatch events relayed, so UnrelayedEvents no longer returns them.
+// Marking an event again changes nothing.
+func (s *Service) MarkRelayed(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) > MaxEventBatch {
+		return fmt.Errorf("error marking events relayed: %d events is more than %d", len(ids), MaxEventBatch)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := s.repo.markRelayed(ctx, ids); err != nil {
+		return fmt.Errorf("error marking events relayed: %w", err)
+	}
+	return nil
 }
 
 // remove deletes a file the service is done with. A failure is only logged: the temp sweep or

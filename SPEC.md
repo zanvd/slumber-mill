@@ -429,6 +429,9 @@ func Permanent(err error) error // wrap errors that retrying can't fix
   Work that fails while the pool is draining is also released, not failed (pitfall 24).
 - **Outcome order:** lease lost → discard; success → done; cancelled or draining → release; otherwise → fail.
   Outcomes are written on a fresh 15 s context.
+  `Process` runs its completion on `context.WithoutCancel(ctx)` with the same 15 s timeout: a heartbeat that finds
+  the row already finished cancels the work's context, and the driver could then report a committed autocommit
+  completion as cancelled.
 - **Panics** become a failed attempt, not a dead worker.
 - **On startup, sweep `tmp/`** of files older than the lease (pitfall 25).
 - The pool puts a logger carrying `worker`, `pool`, `id`, `tenant_id`, `attempt` and `took` into the work's context.
