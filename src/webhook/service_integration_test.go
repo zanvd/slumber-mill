@@ -301,3 +301,16 @@ func TestRelayLockFailover(t *testing.T) {
 		t.Errorf("%d deliveries, want 3", len(ds))
 	}
 }
+
+// TestRelaysOnDifferentDatabasesDontContend runs a relay on each of two databases of the same server: both relay.
+func TestRelaysOnDifferentDatabasesDontContend(t *testing.T) {
+	a, b := newRelayStack(t, testutil.NewDatabase(t)), newRelayStack(t, testutil.NewDatabase(t))
+	for _, s := range []*relayStack{a, b} {
+		hooked, _ := s.createTenant(t, "hooked", "https://hooks.example.com/slumber")
+		s.addEvent(t, hooked.ID, "Rain")
+		s.once(t, true, 1)
+		if ds := s.deliveries(t); len(ds) != 1 {
+			t.Errorf("%d deliveries, want 1", len(ds))
+		}
+	}
+}

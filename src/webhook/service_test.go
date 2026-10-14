@@ -104,7 +104,7 @@ type relayFixture struct {
 	relay   *Relay
 	repo    *fakeRelayRepo
 	events  *fakeEvents
-	tenants *fakeTenants
+	tenants *fakeWebhookTenants
 	logs    *logBuffer
 }
 
@@ -112,13 +112,10 @@ func newRelayFixture(t *testing.T, events ...asset.Event) *relayFixture {
 	t.Helper()
 	start := time.Now()
 	f := &relayFixture{
-		repo:   &fakeRelayRepo{start: start},
-		events: &fakeEvents{start: start, events: events},
-		tenants: &fakeTenants{
-			targets: map[uint64]tenant.Webhook{hookTenant: {URL: hookURL, Secret: secret.NewValue(hookSecret)}},
-			errs:    map[uint64]error{goneTenant: tenant.ErrNotFound},
-		},
-		logs: &logBuffer{},
+		repo:    &fakeRelayRepo{start: start},
+		events:  &fakeEvents{start: start, events: events},
+		tenants: &fakeWebhookTenants{has: map[uint64]bool{hookTenant: true}},
+		logs:    &logBuffer{},
 	}
 	r, err := NewRelay(f.repo, f.events, f.tenants)
 	if err != nil {
@@ -161,12 +158,12 @@ func (f *relayFixture) checkDeliveries(t *testing.T) {
 }
 
 func TestNewRelay(t *testing.T) {
-	repo, events, tenants := &fakeRelayRepo{}, &fakeEvents{}, &fakeTenants{}
+	repo, events, tenants := &fakeRelayRepo{}, &fakeEvents{}, &fakeWebhookTenants{}
 	tests := []struct {
 		name    string
 		repo    relayRepo
 		events  eventSource
-		tenants webhookTargets
+		tenants webhookTenants
 	}{
 		{"no repository", nil, events, tenants},
 		{"no event source", repo, nil, tenants},
@@ -185,7 +182,7 @@ func TestRelayOnce(t *testing.T) {
 	hook1, plain, hook2, gone := testEvent(hookTenant, 1), testEvent(plainTenant, 2), testEvent(hookTenant, 3),
 		testEvent(goneTenant, 4)
 	all := []asset.Event{hook1, plain, hook2, gone}
-	everyTenant := []uint64{hookTenant, plainTenant, goneTenant}
+	everyTenant := [][]uint64{{hookTenant, plainTenant, goneTenant}}
 	tests := []struct {
 		name         string
 		setup        func(f *relayFixture)
@@ -193,8 +190,7 @@ func TestRelayOnce(t *testing.T) {
 		wantErr      error
 		wantInserted []uuid.UUID
 		wantMarked   []uuid.UUID
-		wantLookups  []uint64
-		wantLogs     []string
+		wantLookups  [][]uint64
 	}{
 		{
 			name:         "only tenants with a webhook get deliveries",
@@ -202,35 +198,32 @@ func TestRelayOnce(t *testing.T) {
 			wantInserted: eventIDs(hook1, hook2),
 			wantMarked:   eventIDs(all...),
 			wantLookups:  everyTenant,
-			wantLogs:     []string{"INFO took the relay lock", "WARN relaying events of an unknown tenant without delivering them"},
 		},
 		{
-			name:         "a lookup failing for another reason queues the delivery",
-			setup:        func(f *relayFixture) { f.tenants.errs[plainTenant] = errBoom },
+			name:        "events of tenants without a webhook are only marked relayed",
+			setup:       func(f *relayFixture) { delete(f.tenants.has, hookTenant) },
+			wantRelayed: 4,
+			wantMarked:  eventIDs(all...),
+			wantLookups: everyTenant,
+		},
+		{
+			name:         "every tenant has a webhook",
+			setup:        func(f *relayFixture) { f.tenants.has[plainTenant], f.tenants.has[goneTenant] = true, true },
 			wantRelayed:  4,
-			wantInserted: eventIDs(hook1, plain, hook2),
+			wantInserted: eventIDs(all...),
 			wantMarked:   eventIDs(all...),
 			wantLookups:  everyTenant,
-			wantLogs: []string{
-				"INFO took the relay lock",
-				"WARN error looking up a tenant's webhook, queueing its deliveries anyway",
-				"WARN relaying events of an unknown tenant without delivering them",
-			},
 		},
 		{
-			name: "no key ring",
-			setup: func(f *relayFixture) {
-				f.tenants.errs[plainTenant] = fmt.Errorf("error reading webhook target: %w", tenant.ErrNoKeyRing)
-			},
-			wantErr:     tenant.ErrNoKeyRing,
-			wantLookups: []uint64{hookTenant, plainTenant},
-			wantLogs:    []string{"INFO took the relay lock"},
+			name:        "a failed lookup aborts the batch",
+			setup:       func(f *relayFixture) { f.tenants.err = errBoom },
+			wantErr:     errBoom,
+			wantLookups: everyTenant,
 		},
 		{
-			name:     "reading events fails",
-			setup:    func(f *relayFixture) { f.events.readErr = errBoom },
-			wantErr:  errBoom,
-			wantLogs: []string{"INFO took the relay lock"},
+			name:    "reading events fails",
+			setup:   func(f *relayFixture) { f.events.readErr = errBoom },
+			wantErr: errBoom,
 		},
 		{
 			name:        "inserting fails",
@@ -264,13 +257,8 @@ func TestRelayOnce(t *testing.T) {
 			if got := f.events.relayedIDs(); !slices.Equal(got, tc.wantMarked) {
 				t.Errorf("relayed %v, want %v", got, tc.wantMarked)
 			}
-			if !slices.Equal(f.tenants.lookups, tc.wantLookups) {
+			if !slices.EqualFunc(f.tenants.lookups, tc.wantLookups, slices.Equal) {
 				t.Errorf("looked up tenants %v, want %v", f.tenants.lookups, tc.wantLookups)
-			}
-			if tc.wantLogs != nil {
-				if got := f.logs.messages(t); !slices.Equal(got, tc.wantLogs) {
-					t.Errorf("logs = %q, want %q", got, tc.wantLogs)
-				}
 			}
 			f.checkDeliveries(t)
 		})
@@ -313,6 +301,52 @@ func TestRelayDrainsUntilShort(t *testing.T) {
 			}
 			f.checkDeliveries(t)
 		})
+	}
+}
+
+// TestRelayLooksTenantsUpOncePerBatch gives each batch of a drain its own lookup, of the batch's distinct tenants only.
+func TestRelayLooksTenantsUpOncePerBatch(t *testing.T) {
+	var events []asset.Event
+	for i := range 2 * asset.MaxEventBatch {
+		events = append(events, testEvent([]uint64{hookTenant, plainTenant, goneTenant}[i%3], i))
+	}
+	events = append(events, testEvents(plainTenant, 5)...)
+	f := newRelayFixture(t, events...)
+
+	relayed, err := f.once(t, true)
+
+	if err != nil || relayed != len(events) {
+		t.Errorf("Once() = %d relayed, %v; want %d", relayed, err, len(events))
+	}
+	want := [][]uint64{{hookTenant, plainTenant, goneTenant}, {plainTenant, goneTenant, hookTenant}, {plainTenant}}
+	if !slices.EqualFunc(f.tenants.lookups, want, slices.Equal) {
+		t.Errorf("looked up tenants %v, want %v", f.tenants.lookups, want)
+	}
+	for _, d := range f.repo.inserted() {
+		if i := slices.IndexFunc(events, func(e asset.Event) bool { return e.ID == d }); events[i].TenantID != hookTenant {
+			t.Errorf("delivery for an event of tenant %d, which has no webhook", events[i].TenantID)
+		}
+	}
+	f.checkDeliveries(t)
+}
+
+// TestRelayLookupFailureInLaterBatch fails the lookup of the second batch: the first stays relayed,
+// and the second is neither delivered nor marked.
+func TestRelayLookupFailureInLaterBatch(t *testing.T) {
+	events := testEvents(hookTenant, asset.MaxEventBatch+10)
+	f := newRelayFixture(t, events...)
+	f.tenants.errFrom = 2
+
+	relayed, err := f.once(t, true)
+
+	if relayed != asset.MaxEventBatch || !errors.Is(err, errBoom) {
+		t.Errorf("Once() = %d relayed, %v; want %d, %v", relayed, err, asset.MaxEventBatch, errBoom)
+	}
+	if got, want := f.events.relayedIDs(), eventIDs(events[:asset.MaxEventBatch]...); !slices.Equal(got, want) {
+		t.Errorf("relayed %d events, want the first batch of %d", len(got), len(want))
+	}
+	if got, want := f.repo.inserted(), eventIDs(events[:asset.MaxEventBatch]...); !slices.Equal(got, want) {
+		t.Errorf("deliveries for %d events, want the first batch of %d", len(got), len(want))
 	}
 }
 

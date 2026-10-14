@@ -554,8 +554,9 @@ The webhook pool runs two loops: the relay, which turns asset events into delive
 
 ### Relay
 
-- **One relay at a time** (pitfall 33). Every webhook worker tries `GET_LOCK('slumber-mill.relay', 0)`
-  on a dedicated connection once a second, and only the holder relays. A crash ends its session, which frees the lock;
+- **One relay at a time** (pitfall 33). Every webhook worker tries `GET_LOCK` on `slumber-mill.relay.` followed
+  by a hash of the database name, with timeout 0, on a dedicated connection once a second, and only the holder
+  relays. A crash ends its session, which frees the lock;
   on shutdown it calls `RELEASE_LOCK` before closing the connection (pitfall 13).
   Measured: another worker took over within 0.7 s.
 - **Drain, then wait** (pitfall 32). Read unrelayed events through `asset.Service` in batches of 100, oldest first,

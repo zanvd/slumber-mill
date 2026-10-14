@@ -39,11 +39,21 @@ func newStack(t *testing.T, dsn string) *stack {
 	return &stack{gdb: gdb, repo: NewRepository(gdb), pool: pool}
 }
 
+// lockName returns the name of the relay lock of the stack's database.
+func (s *stack) lockName(t *testing.T) string {
+	t.Helper()
+	var database string
+	if err := s.pool.QueryRowContext(t.Context(), "SELECT DATABASE()").Scan(&database); err != nil {
+		t.Fatalf("error reading the database's name: %v", err)
+	}
+	return relayLockName(database)
+}
+
 // holder returns the connection ID of the session holding the relay lock, or false if it's free.
 func (s *stack) holder(t *testing.T) (int64, bool) {
 	t.Helper()
 	var id sql.NullInt64
-	if err := s.pool.QueryRowContext(t.Context(), "SELECT IS_USED_LOCK(?)", relayLockName).Scan(&id); err != nil {
+	if err := s.pool.QueryRowContext(t.Context(), "SELECT IS_USED_LOCK(?)", s.lockName(t)).Scan(&id); err != nil {
 		t.Fatalf("error reading the relay lock's holder: %v", err)
 	}
 	return id.Int64, id.Valid
@@ -68,12 +78,13 @@ func (s *stack) waitUntilFree(t *testing.T) {
 		t.Fatalf("error getting a connection: %v", err)
 	}
 	defer conn.Close()
+	name := s.lockName(t)
 	var got, released sql.NullInt64
-	if err := conn.QueryRowContext(t.Context(), "SELECT GET_LOCK(?, 10)", relayLockName).Scan(&got); err != nil ||
+	if err := conn.QueryRowContext(t.Context(), "SELECT GET_LOCK(?, 10)", name).Scan(&got); err != nil ||
 		got.Int64 != 1 {
 		t.Fatalf("GET_LOCK() = %v, %v; want the lock within 10s", got, err)
 	}
-	if err := conn.QueryRowContext(t.Context(), "SELECT RELEASE_LOCK(?)", relayLockName).Scan(&released); err != nil ||
+	if err := conn.QueryRowContext(t.Context(), "SELECT RELEASE_LOCK(?)", name).Scan(&released); err != nil ||
 		released.Int64 != 1 {
 		t.Fatalf("RELEASE_LOCK() = %v, %v; want 1", released, err)
 	}
@@ -227,6 +238,54 @@ func TestRelayLockSession(t *testing.T) {
 		}
 		s.waitUntilFree(t)
 	})
+}
+
+// TestRelayLockIsPerDatabase takes the relay lock on two databases of the same server: each gets it, one holder
+// per database, and a second relay on either database is turned away.
+func TestRelayLockIsPerDatabase(t *testing.T) {
+	dsnA, dsnB := testutil.NewDatabase(t), testutil.NewDatabase(t)
+	a, a2, b := newStack(t, dsnA), newStack(t, dsnA), newStack(t, dsnB)
+	if a.lockName(t) == b.lockName(t) {
+		t.Fatalf("both databases use the lock %q", a.lockName(t))
+	}
+
+	lockA, ok, err := a.repo.lockRelay(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("lockRelay() on database A = %t, %v; want the lock", ok, err)
+	}
+	lockB, ok, err := b.repo.lockRelay(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("lockRelay() on database B, while A's relay holds its lock = %t, %v; want the lock", ok, err)
+	}
+
+	for name, s := range map[string]*stack{"A": a2, "B": b} {
+		if _, ok, err := s.repo.lockRelay(t.Context()); ok || err != nil {
+			t.Errorf("second lockRelay() on database %s = %t, %v; want false, nil", name, ok, err)
+		}
+	}
+	idA, heldA := a.holder(t)
+	idB, heldB := b.holder(t)
+	if !heldA || !heldB || idA == idB {
+		t.Errorf("holders = %d (%t) and %d (%t), want a session each", idA, heldA, idB, heldB)
+	}
+	for name, l := range map[string]relayLock{"A": lockA, "B": lockB} {
+		if err := l.check(t.Context()); err != nil {
+			t.Errorf("check() of database %s's lock: error = %v", name, err)
+		}
+	}
+
+	if err := lockA.release(t.Context()); err != nil {
+		t.Fatalf("release() on database A error = %v", err)
+	}
+	if _, held := a.holder(t); held {
+		t.Error("database A's lock is still held after release")
+	}
+	if _, held := b.holder(t); !held {
+		t.Error("releasing database A's lock freed database B's")
+	}
+	if err := lockB.release(t.Context()); err != nil {
+		t.Fatalf("release() on database B error = %v", err)
+	}
 }
 
 func TestInsertDeliveriesErrors(t *testing.T) {

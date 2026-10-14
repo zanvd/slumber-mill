@@ -2,8 +2,10 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -18,8 +20,8 @@ import (
 const (
 	// maxAttempts is how many claims a delivery gets, whether its attempts fail or its leases expire.
 	maxAttempts = 12
-	// relayLockName elects the one relay. Like every GET_LOCK name, it is shared by the whole MySQL server.
-	relayLockName = "slumber-mill.relay"
+	// relayLockPrefix starts the name of the lock that elects the one relay.
+	relayLockPrefix = "slumber-mill.relay."
 	// lockQueryTimeout bounds each query on the relay lock's session.
 	lockQueryTimeout = 5 * time.Second
 )
@@ -135,7 +137,14 @@ func (r *Repository) reap(ctx context.Context) (requeued, failed int, err error)
 	return requeued, failed, nil
 }
 
-// lockRelay tries once, without waiting, to take the relay lock on a session of its own,
+// relayLockName names the relay lock of a database. GET_LOCK names are shared by the whole MySQL server,
+// so the database's name is part of it, hashed to keep the name within MySQL's limit of 64 characters.
+func relayLockName(database string) string {
+	sum := sha256.Sum256([]byte(database))
+	return relayLockPrefix + hex.EncodeToString(sum[:16])
+}
+
+// lockRelay tries once, without waiting, to take the relay lock of the connected database on a session of its own,
 // which holds the lock until it is released or the session ends. It returns false when another session holds it.
 func (r *Repository) lockRelay(ctx context.Context) (relayLock, bool, error) {
 	pool, err := r.db.DB()
@@ -146,8 +155,18 @@ func (r *Repository) lockRelay(ctx context.Context) (relayLock, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("error taking the relay lock: %w: %v", errDatabase, err)
 	}
+	var database sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&database); err != nil {
+		discard(conn)
+		return nil, false, fmt.Errorf("error taking the relay lock: %w: %v", errDatabase, err)
+	}
+	if !database.Valid {
+		discard(conn)
+		return nil, false, fmt.Errorf("error taking the relay lock: %w: no database selected", errDatabase)
+	}
+	name := relayLockName(database.String)
 	var got sql.NullInt64
-	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", relayLockName).Scan(&got)
+	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", name).Scan(&got)
 	switch {
 	case err != nil:
 		// MySQL may have granted the lock before the call failed, so the session can't go back to the pool.
@@ -160,12 +179,13 @@ func (r *Repository) lockRelay(ctx context.Context) (relayLock, bool, error) {
 		_ = conn.Close()
 		return nil, false, nil
 	}
-	return &sessionLock{conn: conn}, true, nil
+	return &sessionLock{conn: conn, name: name}, true, nil
 }
 
-// sessionLock is the relay lock, held by the session of conn.
+// sessionLock is the relay lock called name, held by the session of conn.
 type sessionLock struct {
 	conn *sql.Conn
+	name string
 }
 
 // check returns errLockLost unless the session is alive and still holds the lock. A lost lock's session is ended.
@@ -173,7 +193,7 @@ func (l *sessionLock) check(ctx context.Context) error {
 	ctx, cancel := lockContext(ctx)
 	defer cancel()
 	var mine sql.NullInt64
-	err := l.conn.QueryRowContext(ctx, "SELECT IS_USED_LOCK(?) = CONNECTION_ID()", relayLockName).Scan(&mine)
+	err := l.conn.QueryRowContext(ctx, "SELECT IS_USED_LOCK(?) = CONNECTION_ID()", l.name).Scan(&mine)
 	if err != nil {
 		discard(l.conn)
 		return fmt.Errorf("error checking the relay lock: %w: %v", errLockLost, err)
@@ -191,7 +211,7 @@ func (l *sessionLock) release(ctx context.Context) error {
 	ctx, cancel := lockContext(ctx)
 	defer cancel()
 	var released sql.NullInt64
-	err := l.conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", relayLockName).Scan(&released)
+	err := l.conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", l.name).Scan(&released)
 	if err != nil {
 		discard(l.conn)
 		return fmt.Errorf("error releasing the relay lock: %w: %v", errDatabase, err)

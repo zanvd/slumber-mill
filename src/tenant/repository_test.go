@@ -131,6 +131,23 @@ func TestInsertTenantSQL(t *testing.T) {
 	}
 }
 
+func TestWebhookTenantIDsSQL(t *testing.T) {
+	const want = "SELECT `id` FROM `tenants` WHERE id IN (?,?,?) AND webhook_url IS NOT NULL"
+	r, rec := dryRun(t)
+
+	if _, err := r.webhookTenantIDs(t.Context(), []uint64{3, 1, 2}); err != nil {
+		t.Fatalf("webhookTenantIDs() error = %v", err)
+	}
+
+	if len(rec.statements) != 1 {
+		t.Fatalf("got %d statements, want 1: %v", len(rec.statements), rec.statements)
+	}
+	got := rec.statements[0]
+	if got.sql != want || !slices.Equal(got.vars, []any{uint64(3), uint64(1), uint64(2)}) {
+		t.Errorf("SQL = %s with %v\nwant  %s with [3 1 2]", got.sql, got.vars, want)
+	}
+}
+
 func TestTenantReadsLeaveOutSecrets(t *testing.T) {
 	tests := []struct {
 		name  string

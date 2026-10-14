@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -665,6 +666,56 @@ func TestWebhookTargetErrors(t *testing.T) {
 	if _, err := f.svc.WebhookTarget(testCtx(t), moved.ID); err == nil || !slices.Equal(f.box.openAADs,
 		[]string{"tenants/globex/webhook_secret"}) {
 		t.Errorf("moved secret: error = %v, Open AADs = %q, want an error under globex's AAD", err, f.box.openAADs)
+	}
+}
+
+func TestWebhookTenants(t *testing.T) {
+	f := newFixture()
+	acme, _ := f.create(t, validParams())
+	plain, _ := f.create(t, CreateParams{Slug: "plain", TargetLUFS: -16})
+	globex, _ := f.create(t, CreateParams{Slug: "globex", WebhookURL: testURL, TargetLUFS: -16})
+	const missing = 99
+
+	tests := []struct {
+		name        string
+		ids         []uint64
+		want        map[uint64]bool
+		wantQueries [][]uint64
+	}{
+		{"mixed", []uint64{acme.ID, plain.ID, globex.ID, missing},
+			map[uint64]bool{acme.ID: true, globex.ID: true}, [][]uint64{{acme.ID, plain.ID, globex.ID, missing}}},
+		{"duplicates", []uint64{acme.ID, acme.ID}, map[uint64]bool{acme.ID: true}, [][]uint64{{acme.ID, acme.ID}}},
+		{"none has a webhook", []uint64{plain.ID, missing}, map[uint64]bool{}, [][]uint64{{plain.ID, missing}}},
+		{"empty list", []uint64{}, map[uint64]bool{}, nil},
+		{"nil list", nil, map[uint64]bool{}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f.repo.idQueries = nil
+			// No box: telling who has a webhook needs no key ring.
+			svc := NewService(f.repo, nil, nil)
+			got, err := svc.WebhookTenants(testCtx(t), tc.ids)
+			if err != nil {
+				t.Fatalf("WebhookTenants() error = %v", err)
+			}
+			if got == nil || !maps.Equal(got, tc.want) {
+				t.Errorf("WebhookTenants() = %v, want %v", got, tc.want)
+			}
+			if !slices.EqualFunc(f.repo.idQueries, tc.wantQueries, slices.Equal) {
+				t.Errorf("queried %v, want %v", f.repo.idQueries, tc.wantQueries)
+			}
+		})
+	}
+}
+
+func TestWebhookTenantsDatabaseError(t *testing.T) {
+	f := newFixture()
+	f.repo.errs = map[string]error{"webhookTenantIDs": fmt.Errorf("error querying tenants: %w: boom", errDatabase)}
+
+	got, err := f.svc.WebhookTenants(testCtx(t), []uint64{1})
+
+	if !errors.Is(err, errDatabase) || got != nil {
+		t.Errorf("WebhookTenants() = %v, %v; want nil and a database error", got, err)
 	}
 }
 

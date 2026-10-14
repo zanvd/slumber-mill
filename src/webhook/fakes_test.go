@@ -307,16 +307,45 @@ func (f *fakePoster) Post(ctx context.Context, url, eventID, signature string, b
 	return f.status, f.err
 }
 
+// fakeWebhookTenants is the relay's tenant lookup. Like a database driver, it fails once its context is done.
+type fakeWebhookTenants struct {
+	// has holds the tenants that have a webhook.
+	has map[uint64]bool
+	err error
+	// errFrom, if set, makes the lookups from that one on (counting from 1) fail with errBoom.
+	errFrom int
+
+	// lookups holds the tenant IDs each lookup got.
+	lookups [][]uint64
+}
+
+func (f *fakeWebhookTenants) WebhookTenants(ctx context.Context, ids []uint64) (map[uint64]bool, error) {
+	f.lookups = append(f.lookups, slices.Clone(ids))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.errFrom > 0 && len(f.lookups) >= f.errFrom {
+		return nil, errBoom
+	}
+	found := make(map[uint64]bool)
+	for _, id := range ids {
+		if f.has[id] {
+			found[id] = true
+		}
+	}
+	return found, nil
+}
+
 // fakeTenants answers WebhookTarget with errs or targets, and a tenant in neither has no webhook.
 type fakeTenants struct {
 	targets map[uint64]tenant.Webhook
 	errs    map[uint64]error
-
-	lookups []uint64
 }
 
 func (f *fakeTenants) WebhookTarget(ctx context.Context, tenantID uint64) (tenant.Webhook, error) {
-	f.lookups = append(f.lookups, tenantID)
 	if err := ctx.Err(); err != nil {
 		return tenant.Webhook{}, err
 	}

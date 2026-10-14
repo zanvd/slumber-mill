@@ -77,6 +77,10 @@ type eventSource interface {
 	MarkRelayed(ctx context.Context, ids []uuid.UUID) error
 }
 
+type webhookTenants interface {
+	WebhookTenants(ctx context.Context, ids []uint64) (map[uint64]bool, error)
+}
+
 type webhookTargets interface {
 	WebhookTarget(ctx context.Context, tenantID uint64) (tenant.Webhook, error)
 }
@@ -86,12 +90,12 @@ type webhookTargets interface {
 type Relay struct {
 	repo    relayRepo
 	events  eventSource
-	tenants webhookTargets
+	tenants webhookTenants
 	// lock is nil unless this relay holds the relay lock.
 	lock relayLock
 }
 
-func NewRelay(r relayRepo, events eventSource, tenants webhookTargets) (*Relay, error) {
+func NewRelay(r relayRepo, events eventSource, tenants webhookTenants) (*Relay, error) {
 	switch {
 	case r == nil:
 		return nil, errors.New("a repository is required")
@@ -191,20 +195,23 @@ func (r *Relay) relayBatch(ctx context.Context) (int, error) {
 	return len(events), nil
 }
 
-// deliveries builds a delivery for each event whose tenant has a webhook, looking each tenant up once.
+// deliveries builds a delivery for each event whose tenant has a webhook, finding the tenants that do in one lookup.
 func (r *Relay) deliveries(ctx context.Context, events []asset.Event) ([]delivery, error) {
-	hasWebhook := make(map[uint64]bool)
+	var tenantIDs []uint64
+	seen := make(map[uint64]bool)
+	for _, e := range events {
+		if !seen[e.TenantID] {
+			seen[e.TenantID] = true
+			tenantIDs = append(tenantIDs, e.TenantID)
+		}
+	}
+	hasWebhook, err := r.tenants.WebhookTenants(ctx, tenantIDs)
+	if err != nil {
+		return nil, fmt.Errorf("error looking up the tenants with a webhook: %w", err)
+	}
 	var out []delivery
 	for _, e := range events {
-		has, seen := hasWebhook[e.TenantID]
-		if !seen {
-			var err error
-			if has, err = r.hasWebhook(ctx, e.TenantID); err != nil {
-				return nil, err
-			}
-			hasWebhook[e.TenantID] = has
-		}
-		if !has {
+		if !hasWebhook[e.TenantID] {
 			continue
 		}
 		body, err := json.Marshal(apiv1.NewEvent(e))
@@ -214,29 +221,6 @@ func (r *Relay) deliveries(ctx context.Context, events []asset.Event) ([]deliver
 		out = append(out, delivery{EventID: e.ID, TenantID: e.TenantID, Body: body})
 	}
 	return out, nil
-}
-
-// hasWebhook reports whether the tenant has a webhook URL. Delivery reads the tenant's target again when it sends,
-// so a lookup that fails for a reason other than the tenant counts as yes and leaves the outcome to delivery:
-// a secret that can't be opened then fails that tenant's deliveries rather than holding up every other tenant's.
-func (r *Relay) hasWebhook(ctx context.Context, tenantID uint64) (bool, error) {
-	_, err := r.tenants.WebhookTarget(ctx, tenantID)
-	log := logging.LoggerFromContext(ctx)
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, tenant.ErrNoWebhook):
-		return false, nil
-	case errors.Is(err, tenant.ErrNotFound):
-		log.WarnContext(ctx, "relaying events of an unknown tenant without delivering them", "tenant_id", tenantID)
-		return false, nil
-	case ctx.Err() != nil, errors.Is(err, tenant.ErrNoKeyRing):
-		return false, fmt.Errorf("error looking up the webhook of tenant %d: %w", tenantID, err)
-	default:
-		log.WarnContext(ctx, "error looking up a tenant's webhook, queueing its deliveries anyway",
-			"tenant_id", tenantID, "error", err)
-		return true, nil
-	}
 }
 
 type deliveryRepo interface {
