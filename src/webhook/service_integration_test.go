@@ -3,13 +3,21 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 	"uuid"
 
 	"github.com/zanvd/slumber-mill/src/apiv1"
@@ -21,6 +29,7 @@ import (
 	"github.com/zanvd/slumber-mill/src/storage"
 	"github.com/zanvd/slumber-mill/src/tenant"
 	"github.com/zanvd/slumber-mill/src/testutil"
+	"github.com/zanvd/slumber-mill/src/worker"
 )
 
 // testKeyRing seals webhook secrets with a test-only key of fixed bytes.
@@ -138,6 +147,124 @@ func TestRelayingTwiceYieldsOneDelivery(t *testing.T) {
 		t.Errorf("%d events unrelayed, want 0", n)
 	}
 }
+
+// received is a webhook as the test receiver got it, with what checking its signature found.
+type received struct {
+	header    http.Header
+	body      []byte
+	verifyErr error
+}
+
+// TestDeliveryThroughThePool relays an event and drives its delivery through a webhook pool to a receiver that
+// answers with one status and verifies every signature as a tenant would. Each delivery is posted once:
+// a 2xx delivers it, a 410 fails it for good, and a 500 requeues it with a backoff, so it isn't due yet.
+func TestDeliveryThroughThePool(t *testing.T) {
+	tests := []struct {
+		status        int
+		wantState     string
+		wantLastError string
+		wantRetry     bool
+	}{
+		{http.StatusOK, "delivered", "", false},
+		{http.StatusGone, "failed", "webhook endpoint answered 410", false},
+		{http.StatusInternalServerError, "queued", "webhook endpoint answered 500", true},
+	}
+	for _, tc := range tests {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			s := newRelayStack(t, testutil.NewDatabase(t))
+			var mu sync.Mutex
+			var got []received
+			var key []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("error reading the webhook: %v", err)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				got = append(got, received{
+					header:    r.Header.Clone(),
+					body:      body,
+					verifyErr: Verify(key, r.Header.Get(SignatureHeader), body, time.Now(), 5*time.Minute),
+				})
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+			hooked, creds := s.createTenant(t, "hooked", srv.URL+"/hooks?tenant=hooked")
+			mu.Lock()
+			key = creds.WebhookSecret.Bytes()
+			mu.Unlock()
+			eventID, assetID := s.addEvent(t, hooked.ID, "Rain")
+			s.once(t, true, 1)
+
+			d, err := NewDeliverer(s.repo, s.tenants, NewClient(true), DelivererConfig{WorkerID: "webhook-1", Lease: time.Minute})
+			if err != nil {
+				t.Fatalf("NewDeliverer() error = %v", err)
+			}
+			pool, err := worker.NewPool(d, worker.Config{
+				WorkerID: "webhook-1", Pool: "webhook", Concurrency: 2, Lease: time.Minute, PollInterval: time.Second,
+				Grace: time.Second, Log: testutil.Logger(t),
+			})
+			if err != nil {
+				t.Fatalf("NewPool() error = %v", err)
+			}
+			for range 2 {
+				if err := pool.RunUntilIdle(t.Context()); err != nil {
+					t.Fatalf("RunUntilIdle() error = %v", err)
+				}
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(got) != 1 {
+				t.Fatalf("the receiver got %d webhooks, want 1", len(got))
+			}
+			h := got[0]
+			if h.verifyErr != nil {
+				t.Errorf("the signature doesn't verify: %v", h.verifyErr)
+			}
+			if h.header.Get(EventIDHeader) != eventID.String() || h.header.Get("Content-Type") != "application/json" ||
+				h.header.Get("User-Agent") != "slumber-mill-webhooks/1" {
+				t.Errorf("headers = %v, want event %s as JSON from slumber-mill-webhooks/1", h.header, eventID)
+			}
+			ds := s.deliveries(t)
+			if len(ds) != 1 || !bytes.Equal(h.body, ds[0].Body) {
+				t.Fatalf("the receiver got %s, want the stored body of %+v", h.body, ds)
+			}
+			var body apiv1.Event
+			if err := json.Unmarshal(h.body, &body); err != nil || body.ID != eventID.String() ||
+				body.Data.ID != assetID.String() {
+				t.Errorf("body = %s (%v), want event %s of asset %s", h.body, err, eventID, assetID)
+			}
+
+			var st struct {
+				state               string
+				attempts            int
+				lockedBy, lastError sql.NullString
+				leaseExpiresAt      sql.NullTime
+				dueInMicroseconds   int64
+			}
+			err = s.pool.QueryRowContext(t.Context(), "SELECT state, attempts, locked_by, lease_expires_at, last_error, "+
+				"TIMESTAMPDIFF(MICROSECOND, NOW(6), run_after) FROM webhook_deliveries").
+				Scan(&st.state, &st.attempts, &st.lockedBy, &st.leaseExpiresAt, &st.lastError, &st.dueInMicroseconds)
+			if err != nil {
+				t.Fatalf("error reading the delivery: %v", err)
+			}
+			if st.state != tc.wantState || st.attempts != 1 || st.lockedBy.Valid || st.leaseExpiresAt.Valid ||
+				st.lastError.String != tc.wantLastError || st.lastError.Valid != (tc.wantLastError != "") {
+				t.Errorf("delivery = %+v, want %s after 1 attempt, unleased, with last error %q",
+					st, tc.wantState, tc.wantLastError)
+			}
+			due := time.Duration(st.dueInMicroseconds) * time.Microsecond
+			if tc.wantRetry && (due <= 15*time.Second-slack || due > 30*time.Second) {
+				t.Errorf("retry due in %v, want 15s to 30s", due)
+			}
+		})
+	}
+}
+
+// slack is how long a test may take between a write and reading back a time it set from NOW(6).
+const slack = 5 * time.Second
 
 // TestRelayLockFailover runs two relays on pools of their own: only one relays at a time,
 // and the other takes over once the holder releases the lock or its session ends.

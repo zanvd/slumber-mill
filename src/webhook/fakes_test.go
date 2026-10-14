@@ -3,11 +3,14 @@ package webhook
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
+	"sync"
 	"time"
 	"uuid"
 
 	"github.com/zanvd/slumber-mill/src/asset"
+	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/tenant"
 )
 
@@ -171,6 +174,137 @@ func (f *fakeEvents) relayedIDs() []uuid.UUID {
 		}
 	}
 	return ids
+}
+
+// fakeDeliveryRepo is the deliverer's repository. It records what each call got, and like a database driver,
+// every method fails once its context is done. A pool's heartbeats call it alongside Process, hence the lock.
+type fakeDeliveryRepo struct {
+	mu   sync.Mutex
+	errs map[string]error
+	// due is the lease the next claim hands out, once; nil means nothing is due.
+	due *lease
+	// pending is what leasedDelivery returns.
+	pending delivery
+	// requeued and failed are what reap returns.
+	requeued, failed int
+
+	workerIDs []string
+	// durations are the lease durations claim and extend got.
+	durations []time.Duration
+	// leases are the leases every other method got.
+	leases   []lease
+	failures []failure
+	// completed counts calls to complete; completeAt is when the last one happened, and completeDeadline,
+	// completeErr and completeLog are what its context carried.
+	completed        int
+	completeAt       time.Time
+	completeDeadline time.Time
+	completeErr      error
+	completeLog      *slog.Logger
+}
+
+func (f *fakeDeliveryRepo) err(ctx context.Context, method string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.errs[method]
+}
+
+func (f *fakeDeliveryRepo) claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.workerIDs = append(f.workerIDs, workerID)
+	f.durations = append(f.durations, d)
+	if err := f.err(ctx, "claim"); err != nil {
+		return lease{}, false, err
+	}
+	if f.due == nil {
+		return lease{}, false, nil
+	}
+	l := *f.due
+	f.due = nil
+	return l, true, nil
+}
+
+func (f *fakeDeliveryRepo) extend(ctx context.Context, l lease, d time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases = append(f.leases, l)
+	f.durations = append(f.durations, d)
+	return f.err(ctx, "extend")
+}
+
+func (f *fakeDeliveryRepo) leasedDelivery(ctx context.Context, l lease) (delivery, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases = append(f.leases, l)
+	if err := f.err(ctx, "leasedDelivery"); err != nil {
+		return delivery{}, err
+	}
+	return f.pending, nil
+}
+
+func (f *fakeDeliveryRepo) complete(ctx context.Context, l lease) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases = append(f.leases, l)
+	f.completed++
+	f.completeAt = time.Now()
+	f.completeDeadline, _ = ctx.Deadline()
+	f.completeErr = ctx.Err()
+	f.completeLog = logging.LoggerFromContext(ctx)
+	return f.err(ctx, "complete")
+}
+
+func (f *fakeDeliveryRepo) fail(ctx context.Context, l lease, fl failure) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases = append(f.leases, l)
+	f.failures = append(f.failures, fl)
+	if err := f.err(ctx, "fail"); err != nil {
+		return false, err
+	}
+	return fl.Permanent || l.Attempt >= maxAttempts, nil
+}
+
+func (f *fakeDeliveryRepo) release(ctx context.Context, l lease) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases = append(f.leases, l)
+	return f.err(ctx, "release")
+}
+
+func (f *fakeDeliveryRepo) reap(ctx context.Context) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.err(ctx, "reap"); err != nil {
+		return 0, 0, err
+	}
+	return f.requeued, f.failed, nil
+}
+
+// post is a request the fake client was asked to send.
+type post struct {
+	url, eventID, signature string
+	body                    []byte
+	at                      time.Time
+}
+
+// fakePoster answers every post with status and err, or with respond if it is set.
+type fakePoster struct {
+	status  int
+	err     error
+	respond func(ctx context.Context) (int, error)
+
+	posts []post
+}
+
+func (f *fakePoster) Post(ctx context.Context, url, eventID, signature string, body []byte) (int, error) {
+	f.posts = append(f.posts, post{url, eventID, signature, slices.Clone(body), time.Now()})
+	if f.respond != nil {
+		return f.respond(ctx)
+	}
+	return f.status, f.err
 }
 
 // fakeTenants answers WebhookTarget with errs or targets, and a tenant in neither has no webhook.

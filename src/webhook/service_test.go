@@ -8,7 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -16,9 +20,11 @@ import (
 
 	"github.com/zanvd/slumber-mill/src/apiv1"
 	"github.com/zanvd/slumber-mill/src/asset"
+	"github.com/zanvd/slumber-mill/src/egress"
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/tenant"
+	"github.com/zanvd/slumber-mill/src/worker"
 )
 
 // hookTenant has a webhook, plainTenant has none, and goneTenant doesn't exist.
@@ -515,4 +521,462 @@ func TestRelayRunLogsFailures(t *testing.T) {
 			t.Errorf("logs = %q, want %q", got, want)
 		}
 	})
+}
+
+// claimed is the lease the pool hands the deliverer in these tests.
+var claimed = worker.Lease{ID: 11, TenantID: hookTenant, Attempt: 2}
+
+type deliveryFixture struct {
+	d       *Deliverer
+	repo    *fakeDeliveryRepo
+	tenants *fakeTenants
+	client  *fakePoster
+}
+
+func newDeliveryFixture(t *testing.T) *deliveryFixture {
+	t.Helper()
+	f := &deliveryFixture{
+		repo: &fakeDeliveryRepo{
+			errs: map[string]error{},
+			pending: delivery{
+				EventID:  uuid.NewV7(),
+				TenantID: hookTenant,
+				Body:     []byte(`{"id":"event","type":"asset.ready","data":{"title":"Rain"}}`),
+			},
+		},
+		tenants: &fakeTenants{
+			targets: map[uint64]tenant.Webhook{hookTenant: {URL: hookURL, Secret: secret.NewValue(hookSecret)}},
+			errs:    map[uint64]error{},
+		},
+		client: &fakePoster{status: http.StatusOK},
+	}
+	d, err := NewDeliverer(f.repo, f.tenants, f.client, DelivererConfig{WorkerID: "webhook-1", Lease: time.Minute})
+	if err != nil {
+		t.Fatalf("NewDeliverer() error = %v", err)
+	}
+	f.d = d
+	return f
+}
+
+func TestNewDeliverer(t *testing.T) {
+	repo, tenants, client := &fakeDeliveryRepo{}, &fakeTenants{}, &fakePoster{}
+	valid := DelivererConfig{WorkerID: "webhook-1", Lease: time.Minute}
+	tests := []struct {
+		name    string
+		repo    deliveryRepo
+		tenants webhookTargets
+		client  poster
+		cfg     DelivererConfig
+	}{
+		{"no repository", nil, tenants, client, valid},
+		{"no tenant service", repo, nil, client, valid},
+		{"no client", repo, tenants, nil, valid},
+		{"no worker ID", repo, tenants, client, DelivererConfig{Lease: time.Minute}},
+		{"no lease", repo, tenants, client, DelivererConfig{WorkerID: "webhook-1"}},
+		{"negative lease", repo, tenants, client, DelivererConfig{WorkerID: "webhook-1", Lease: -time.Second}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if d, err := NewDeliverer(tc.repo, tc.tenants, tc.client, tc.cfg); err == nil {
+				t.Errorf("NewDeliverer() = %+v, want an error", d)
+			}
+		})
+	}
+}
+
+func TestDelivererClaim(t *testing.T) {
+	due := lease(claimed)
+	dbErr := fmt.Errorf("error claiming delivery: %w: %v", errDatabase, errBoom)
+	tests := []struct {
+		name    string
+		due     *lease
+		err     error
+		want    worker.Lease
+		wantOK  bool
+		wantErr error
+	}{
+		{"due", &due, nil, claimed, true, nil},
+		{"nothing due", nil, nil, worker.Lease{}, false, nil},
+		{"database error", &due, dbErr, worker.Lease{}, false, errDatabase},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			f.repo.due = tc.due
+			f.repo.errs["claim"] = tc.err
+
+			got, ok, err := f.d.Claim(t.Context())
+
+			if got != tc.want || ok != tc.wantOK || !errors.Is(err, tc.wantErr) {
+				t.Errorf("Claim() = %+v, %t, %v; want %+v, %t, %v", got, ok, err, tc.want, tc.wantOK, tc.wantErr)
+			}
+			if !slices.Equal(f.repo.workerIDs, []string{"webhook-1"}) ||
+				!slices.Equal(f.repo.durations, []time.Duration{time.Minute}) {
+				t.Errorf("claim() got worker IDs %v and leases %v, want webhook-1 for 1m",
+					f.repo.workerIDs, f.repo.durations)
+			}
+		})
+	}
+}
+
+func TestDelivererExtendAndRelease(t *testing.T) {
+	f := newDeliveryFixture(t)
+
+	if err := f.d.Extend(t.Context(), claimed); err != nil {
+		t.Errorf("Extend() error = %v", err)
+	}
+	if err := f.d.Release(t.Context(), claimed); err != nil {
+		t.Errorf("Release() error = %v", err)
+	}
+
+	if want := []lease{lease(claimed), lease(claimed)}; !slices.Equal(f.repo.leases, want) {
+		t.Errorf("leases = %+v, want %+v", f.repo.leases, want)
+	}
+	if want := []time.Duration{time.Minute}; !slices.Equal(f.repo.durations, want) {
+		t.Errorf("extend() got %v, want %v", f.repo.durations, want)
+	}
+}
+
+// TestDelivererProcess covers every outcome: which ones complete the delivery, which are permanent,
+// and which never reach the tenant's endpoint.
+func TestDelivererProcess(t *testing.T) {
+	dial := func(err error) error {
+		return fmt.Errorf("error posting webhook: %w",
+			&url.Error{Op: "Post", URL: hookURL, Err: &net.OpError{Op: "dial", Net: "tcp", Err: err}})
+	}
+	type want struct {
+		delivered, permanent, posted, completed bool
+		// is must match the error, and msg must be its text, when either is set.
+		is  error
+		msg string
+	}
+	type testCase struct {
+		name  string
+		setup func(f *deliveryFixture)
+		want  want
+	}
+	status := func(code int) func(f *deliveryFixture) {
+		return func(f *deliveryFixture) { f.client.status = code }
+	}
+	postErr := func(err error) func(f *deliveryFixture) {
+		return func(f *deliveryFixture) { f.client.err = err }
+	}
+	var tests []testCase
+	for _, code := range []int{200, 201, 202, 204, 299} {
+		tests = append(tests, testCase{fmt.Sprintf("%d delivers", code), status(code),
+			want{delivered: true, posted: true, completed: true}})
+	}
+	for _, code := range []int{100, 300, 301, 302, 303, 304, 307, 308, 400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504} {
+		tests = append(tests, testCase{fmt.Sprintf("%d retries", code), status(code),
+			want{posted: true, msg: fmt.Sprintf("webhook endpoint answered %d", code)}})
+	}
+	tests = append(tests, []testCase{
+		{"410 is permanent", status(http.StatusGone),
+			want{permanent: true, posted: true, msg: "webhook endpoint answered 410"}},
+		{"a blocked address is permanent", postErr(dial(egress.ErrBlockedAddress)),
+			want{permanent: true, posted: true, is: egress.ErrBlockedAddress}},
+		{"an unresolvable host retries", postErr(dial(fmt.Errorf("lookup hooks.example.com: %w", egress.ErrUnresolvable))),
+			want{posted: true, is: egress.ErrUnresolvable}},
+		{"a timeout retries",
+			postErr(fmt.Errorf("error posting webhook: %w", &url.Error{Op: "Post", URL: hookURL, Err: context.DeadlineExceeded})),
+			want{posted: true, is: context.DeadlineExceeded}},
+		{"another post error retries", postErr(fmt.Errorf("error posting webhook: %w", errBoom)),
+			want{posted: true, is: errBoom}},
+		{"a tenant that removed its webhook is permanent", func(f *deliveryFixture) { delete(f.tenants.targets, hookTenant) },
+			want{permanent: true, is: tenant.ErrNoWebhook}},
+		{"a tenant that is gone is permanent", func(f *deliveryFixture) {
+			f.tenants.errs[hookTenant] = fmt.Errorf("error reading webhook target: %w", tenant.ErrNotFound)
+		}, want{permanent: true, is: tenant.ErrNotFound}},
+		{"an unreadable target retries", func(f *deliveryFixture) {
+			f.tenants.errs[hookTenant] = fmt.Errorf("error opening webhook secret of tenant 7: %w", errBoom)
+		}, want{is: errBoom}},
+		{"an empty secret is permanent", func(f *deliveryFixture) { f.tenants.targets[hookTenant] = tenant.Webhook{URL: hookURL} },
+			want{permanent: true, is: ErrEmptySecret}},
+		{"an unreadable delivery retries", func(f *deliveryFixture) { f.repo.errs["leasedDelivery"] = errBoom },
+			want{is: errBoom}},
+		{"a failed completion is returned", func(f *deliveryFixture) {
+			f.repo.errs["complete"] = fmt.Errorf("error completing delivery: %w: %v", errDatabase, errBoom)
+		}, want{posted: true, completed: true, is: errDatabase}},
+	}...)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			tc.setup(f)
+
+			err := f.d.Process(t.Context(), claimed)
+
+			w := tc.want
+			if (err == nil) != w.delivered || worker.IsPermanent(err) != w.permanent || errors.Is(err, worker.ErrLeaseLost) {
+				t.Errorf("Process() error = %v; want delivered %t, permanent %t", err, w.delivered, w.permanent)
+			}
+			if w.is != nil && !errors.Is(err, w.is) {
+				t.Errorf("Process() error = %v, want it to match %v", err, w.is)
+			}
+			if w.msg != "" && (err == nil || err.Error() != w.msg) {
+				t.Errorf("Process() error = %v, want %q", err, w.msg)
+			}
+			if (f.repo.completed == 1) != w.completed || f.repo.completed > 1 {
+				t.Errorf("completed %d times, want completed: %t", f.repo.completed, w.completed)
+			}
+			for i, l := range f.repo.leases {
+				if l != lease(claimed) {
+					t.Errorf("repository call %d got lease %+v, want %+v", i, l, claimed)
+				}
+			}
+			if !w.posted {
+				if len(f.client.posts) > 0 {
+					t.Errorf("posted %d times, want no post", len(f.client.posts))
+				}
+				return
+			}
+			if len(f.client.posts) != 1 {
+				t.Fatalf("posted %d times, want once", len(f.client.posts))
+			}
+			checkPost(t, f.client.posts[0], f.repo.pending)
+		})
+	}
+}
+
+// checkPost checks that the delivery went to the tenant's URL under its event ID, with its body exactly as stored,
+// signed with the tenant's secret.
+func checkPost(t *testing.T, p post, d delivery) {
+	t.Helper()
+	if p.url != hookURL || p.eventID != d.EventID.String() || !bytes.Equal(p.body, d.Body) {
+		t.Errorf("posted %s to %s as event %s, want %s to %s as event %s", p.body, p.url, p.eventID,
+			d.Body, hookURL, d.EventID)
+	}
+	if err := Verify(hookSecret, p.signature, d.Body, p.at, time.Second); err != nil {
+		t.Errorf("signature %q doesn't verify at the time of posting: %v", p.signature, err)
+	}
+}
+
+// TestDelivererContexts cancels the work's context as the endpoint answers, as a lost heartbeat or the end of
+// the shutdown grace would: the completion still runs, on its own 15 s deadline and with the work's logger.
+// The signature carries the time of sending.
+func TestDelivererContexts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newDeliveryFixture(t)
+		log := slog.New(slog.DiscardHandler)
+		work, cancel := context.WithCancel(logging.CtxWithLogger(t.Context(), log))
+		defer cancel()
+		f.client.respond = func(context.Context) (int, error) {
+			time.Sleep(time.Minute)
+			cancel()
+			return http.StatusNoContent, nil
+		}
+		start := time.Now()
+
+		if err := f.d.Process(work, claimed); err != nil {
+			t.Fatalf("Process() error = %v", err)
+		}
+
+		if f.repo.completed != 1 || f.repo.completeErr != nil {
+			t.Fatalf("completed %d times on a context with error %v, want once on a live one",
+				f.repo.completed, f.repo.completeErr)
+		}
+		if want := start.Add(time.Minute); !f.repo.completeAt.Equal(want) {
+			t.Errorf("completed at %v, want %v", f.repo.completeAt, want)
+		}
+		if want := f.repo.completeAt.Add(15 * time.Second); !f.repo.completeDeadline.Equal(want) {
+			t.Errorf("completion deadline = %v, want %v", f.repo.completeDeadline, want)
+		}
+		if f.repo.completeLog != log {
+			t.Error("the completion's context lost the work's logger")
+		}
+		if want := fmt.Sprintf("t=%d,", start.Unix()); !strings.HasPrefix(f.client.posts[0].signature, want) {
+			t.Errorf("signature %q, want one made at %v", f.client.posts[0].signature, start)
+		}
+	})
+}
+
+func TestDelivererFail(t *testing.T) {
+	wrapped := fmt.Errorf("error posting webhook: %w", worker.Permanent(egress.ErrBlockedAddress))
+	tests := []struct {
+		name  string
+		cause error
+		want  failure
+	}{
+		{"permanent", worker.Permanent(errBoom), failure{Permanent: true, Detail: "boom"}},
+		{"wrapped permanent", wrapped, failure{Permanent: true, Detail: wrapped.Error()}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+
+			if err := f.d.Fail(t.Context(), claimed, tc.cause); err != nil {
+				t.Fatalf("Fail() error = %v", err)
+			}
+
+			if want := []failure{tc.want}; !slices.Equal(f.repo.failures, want) {
+				t.Errorf("failures = %+v, want %+v", f.repo.failures, want)
+			}
+			if want := []lease{lease(claimed)}; !slices.Equal(f.repo.leases, want) {
+				t.Errorf("leases = %+v, want %+v", f.repo.leases, want)
+			}
+		})
+	}
+}
+
+// TestDelivererFailRetries fails retryable errors many times on each attempt: every delay falls in [d/2, d],
+// where d doubles from 30 s up to 6 h.
+func TestDelivererFailRetries(t *testing.T) {
+	cause := errors.New("webhook endpoint answered 503")
+	tests := []struct {
+		attempt int
+		d       time.Duration
+	}{
+		{1, 30 * time.Second},
+		{2, time.Minute},
+		{3, 2 * time.Minute},
+		{5, 8 * time.Minute},
+		{9, 128 * time.Minute},
+		{10, 256 * time.Minute},
+		{11, 6 * time.Hour},
+		{maxAttempts, 6 * time.Hour},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("attempt %d", tc.attempt), func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			l := worker.Lease{ID: 11, TenantID: hookTenant, Attempt: tc.attempt}
+
+			for range 100 {
+				if err := f.d.Fail(t.Context(), l, cause); err != nil {
+					t.Fatalf("Fail() error = %v", err)
+				}
+			}
+
+			for _, got := range f.repo.failures {
+				if got.Permanent || got.Detail != cause.Error() || got.Delay < tc.d/2 || got.Delay > tc.d {
+					t.Fatalf("failure = %+v, want a retry after %v to %v with detail %q",
+						got, tc.d/2, tc.d, cause.Error())
+				}
+			}
+		})
+	}
+}
+
+func TestDelivererLostLease(t *testing.T) {
+	ops := []struct {
+		method string
+		run    func(ctx context.Context, d *Deliverer) error
+	}{
+		{"extend", func(ctx context.Context, d *Deliverer) error { return d.Extend(ctx, claimed) }},
+		{"complete", func(ctx context.Context, d *Deliverer) error { return d.Process(ctx, claimed) }},
+		{"fail", func(ctx context.Context, d *Deliverer) error { return d.Fail(ctx, claimed, errBoom) }},
+		{"release", func(ctx context.Context, d *Deliverer) error { return d.Release(ctx, claimed) }},
+	}
+	errs := []struct {
+		name     string
+		err      error
+		wantLost bool
+	}{
+		{"lease lost", fmt.Errorf("error writing delivery: %w", errLeaseLost), true},
+		{"database error", fmt.Errorf("error writing delivery: %w: %v", errDatabase, errBoom), false},
+	}
+	for _, op := range ops {
+		for _, e := range errs {
+			t.Run(op.method+"/"+e.name, func(t *testing.T) {
+				f := newDeliveryFixture(t)
+				f.repo.errs[op.method] = e.err
+
+				err := op.run(t.Context(), f.d)
+
+				if err == nil || errors.Is(err, worker.ErrLeaseLost) != e.wantLost {
+					t.Errorf("error = %v; matches worker.ErrLeaseLost: %t, want %t",
+						err, errors.Is(err, worker.ErrLeaseLost), e.wantLost)
+				}
+				if err != nil && err.Error() != e.err.Error() {
+					t.Errorf("error = %q, want the repository's %q", err, e.err)
+				}
+			})
+		}
+	}
+}
+
+func TestDelivererReap(t *testing.T) {
+	tests := []struct {
+		name             string
+		requeued, failed int
+		err              error
+		wantLogs         []string
+	}{
+		{"nothing expired", 0, 0, nil, nil},
+		{"requeued", 2, 0, nil, []string{"WARN reaped deliveries whose lease expired"}},
+		{"failed", 0, 1, nil, []string{"WARN reaped deliveries whose lease expired"}},
+		{"database error", 0, 0, fmt.Errorf("error reaping deliveries: %w: %v", errDatabase, errBoom), nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			f.repo.requeued, f.repo.failed, f.repo.errs["reap"] = tc.requeued, tc.failed, tc.err
+			var logs logBuffer
+
+			if err := f.d.Reap(logs.ctx(t.Context())); !errors.Is(err, tc.err) {
+				t.Errorf("Reap() error = %v, want %v", err, tc.err)
+			}
+
+			if got := logs.messages(t); !slices.Equal(got, tc.wantLogs) {
+				t.Errorf("logs = %q, want %q", got, tc.wantLogs)
+			}
+		})
+	}
+}
+
+// TestDeliveryKeepsTheSecretOut drives deliveries through a worker pool, and checks that neither the tenant's secret
+// nor the signature made with it shows up in the logs or in what is stored as last_error.
+func TestDeliveryKeepsTheSecretOut(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(f *deliveryFixture)
+	}{
+		{"delivered", func(f *deliveryFixture) {}},
+		{"500", func(f *deliveryFixture) { f.client.status = http.StatusInternalServerError }},
+		{"410", func(f *deliveryFixture) { f.client.status = http.StatusGone }},
+		{"post fails", func(f *deliveryFixture) {
+			f.client.err = fmt.Errorf("error posting webhook: %w", &url.Error{Op: "Post", URL: hookURL, Err: errBoom})
+		}},
+		{"blocked address", func(f *deliveryFixture) {
+			f.client.err = fmt.Errorf("error posting webhook: %w", egress.ErrBlockedAddress)
+		}},
+		{"completion fails", func(f *deliveryFixture) {
+			f.repo.errs["complete"] = fmt.Errorf("error completing delivery: %w: %v", errDatabase, errBoom)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			tc.setup(f)
+			f.repo.due = &lease{ID: 11, TenantID: hookTenant, Attempt: 1}
+			var logs bytes.Buffer
+			pool, err := worker.NewPool(f.d, worker.Config{
+				WorkerID: "webhook-1", Pool: "webhook", Concurrency: 1, Lease: time.Minute, PollInterval: time.Second,
+				Log: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			})
+			if err != nil {
+				t.Fatalf("NewPool() error = %v", err)
+			}
+
+			if err := pool.RunUntilIdle(t.Context()); err != nil {
+				t.Fatalf("RunUntilIdle() error = %v", err)
+			}
+
+			if len(f.client.posts) != 1 || !strings.Contains(logs.String(), "work finished") {
+				t.Fatalf("posted %d times with logs %s, want one post and its outcome logged", len(f.client.posts), logs.String())
+			}
+			signature := f.client.posts[0].signature
+			_, digest, _ := strings.Cut(signature, "v1=")
+			texts := []string{logs.String()}
+			for _, fl := range f.repo.failures {
+				texts = append(texts, fl.Detail)
+			}
+			for _, text := range texts {
+				for _, leak := range []string{string(hookSecret), signature, digest} {
+					if strings.Contains(text, leak) {
+						t.Errorf("%q leaks %q", text, leak)
+					}
+				}
+			}
+		})
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"uuid"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -15,6 +16,8 @@ import (
 )
 
 const (
+	// maxAttempts is how many claims a delivery gets, whether its attempts fail or its leases expire.
+	maxAttempts = 12
 	// relayLockName elects the one relay. Like every GET_LOCK name, it is shared by the whole MySQL server.
 	relayLockName = "slumber-mill.relay"
 	// lockQueryTimeout bounds each query on the relay lock's session.
@@ -24,11 +27,12 @@ const (
 // Repository holds the webhook_deliveries table and the relay lock. Its methods are unexported,
 // so other packages go through Relay and Deliverer.
 type Repository struct {
-	db *gorm.DB
+	db     *gorm.DB
+	leases *db.Leases
 }
 
 func NewRepository(gdb *gorm.DB) *Repository {
-	return &Repository{db: gdb}
+	return &Repository{db: gdb, leases: db.NewWebhookDeliveryLeases(gdb)}
 }
 
 type deliveryRow struct {
@@ -58,6 +62,77 @@ func (r *Repository) insertDeliveries(ctx context.Context, ds []delivery) error 
 		return translate("error inserting deliveries", err)
 	}
 	return nil
+}
+
+// claim leases the delivery that has been due longest to workerID for d. It returns false when nothing is due.
+func (r *Repository) claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error) {
+	l, ok, err := r.leases.Claim(ctx, workerID, d)
+	if err != nil {
+		return lease{}, false, translateLease("error claiming delivery", err)
+	}
+	return lease(l), ok, nil
+}
+
+// extend renews the lease to expire d from now.
+func (r *Repository) extend(ctx context.Context, l lease, d time.Duration) error {
+	if err := r.leases.Extend(ctx, db.Lease(l), d); err != nil {
+		return translateLease("error extending delivery lease", err)
+	}
+	return nil
+}
+
+// leasedDelivery returns the leased delivery's event ID and body.
+func (r *Repository) leasedDelivery(ctx context.Context, l lease) (delivery, error) {
+	var row deliveryRow
+	err := r.db.WithContext(ctx).
+		Select("event_id", "tenant_id", "body").
+		Where("id = ? AND tenant_id = ?", l.ID, l.TenantID).
+		Take(&row).Error
+	if err != nil {
+		return delivery{}, translate("error reading leased delivery", err)
+	}
+	return delivery{EventID: uuid.UUID(row.EventID), TenantID: row.TenantID, Body: row.Body}, nil
+}
+
+// complete marks the delivery delivered.
+func (r *Repository) complete(ctx context.Context, l lease) error {
+	if err := r.leases.Complete(ctx, db.Lease(l), nil); err != nil {
+		return translateLease("error completing delivery", err)
+	}
+	return nil
+}
+
+// fail fails the delivery if f is permanent or this is its last attempt, and otherwise requeues it to be due
+// after f.Delay. It reports whether the delivery failed.
+func (r *Repository) fail(ctx context.Context, l lease, f failure) (final bool, err error) {
+	final, err = r.leases.Fail(ctx, db.Lease(l), db.Failure{
+		Permanent:   f.Permanent,
+		MaxAttempts: maxAttempts,
+		Delay:       f.Delay,
+		Message:     f.Detail,
+	})
+	if err != nil {
+		return false, translateLease("error failing delivery", err)
+	}
+	return final, nil
+}
+
+// release requeues the delivery and gives back its attempt.
+func (r *Repository) release(ctx context.Context, l lease) error {
+	if err := r.leases.Release(ctx, db.Lease(l)); err != nil {
+		return translateLease("error releasing delivery", err)
+	}
+	return nil
+}
+
+// reap takes back up to 100 deliveries whose lease expired. Those with attempts to spare are requeued after
+// a short delay, and the rest fail.
+func (r *Repository) reap(ctx context.Context) (requeued, failed int, err error) {
+	requeued, failed, err = r.leases.Reap(ctx, maxAttempts, nil)
+	if err != nil {
+		return 0, 0, translateLease("error reaping deliveries", err)
+	}
+	return requeued, failed, nil
 }
 
 // lockRelay tries once, without waiting, to take the relay lock on a session of its own,
@@ -142,6 +217,14 @@ func lockContext(ctx context.Context) (context.Context, context.CancelFunc) {
 func discard(conn *sql.Conn) {
 	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 	_ = conn.Close()
+}
+
+// translateLease turns db's lost lease into errLeaseLost, without wrapping it, and wraps any other error.
+func translateLease(msg string, err error) error {
+	if errors.Is(err, db.ErrLeaseLost) {
+		return fmt.Errorf("%s: %w", msg, errLeaseLost)
+	}
+	return fmt.Errorf("%s: %w: %v", msg, errDatabase, err)
 }
 
 func translate(msg string, err error) error {

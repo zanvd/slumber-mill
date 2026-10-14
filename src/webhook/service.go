@@ -5,24 +5,34 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 	"uuid"
 
 	"github.com/zanvd/slumber-mill/src/apiv1"
 	"github.com/zanvd/slumber-mill/src/asset"
+	"github.com/zanvd/slumber-mill/src/egress"
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/tenant"
+	"github.com/zanvd/slumber-mill/src/worker"
 )
 
 const (
 	relayInterval = time.Second
 	// releaseTimeout bounds giving up the relay lock once Run's context is done.
 	releaseTimeout = 15 * time.Second
+
+	completeTimeout = 15 * time.Second
+	retryBase       = 30 * time.Second
+	retryMax        = 6 * time.Hour
 )
 
 var (
 	errDatabase = errors.New("database error")
 	errNotFound = errors.New("delivery not found")
+	// errLeaseLost means a fenced write matched no row: the lease expired and was reaped,
+	// or the delivery has been claimed again or finished since.
+	errLeaseLost = errors.New("lease lost")
 	// errLockLost means the relay lock's session has ended or no longer holds the lock.
 	errLockLost = errors.New("relay lock lost")
 )
@@ -32,6 +42,22 @@ type delivery struct {
 	EventID  uuid.UUID
 	TenantID uint64
 	Body     []byte
+}
+
+// lease is a claimed delivery. Its fields are those of worker.Lease and db.Lease, so it converts to and from either.
+type lease struct {
+	ID, TenantID uint64
+	Attempt      int
+}
+
+// failure is why an attempt failed.
+type failure struct {
+	// Permanent fails the delivery whatever its attempts. Otherwise it is retried after Delay,
+	// unless this was its last attempt.
+	Permanent bool
+	// Detail is the internal cause, kept in last_error.
+	Detail string
+	Delay  time.Duration
 }
 
 type relayRepo interface {
@@ -77,7 +103,7 @@ func NewRelay(r relayRepo, events eventSource, tenants webhookTargets) (*Relay, 
 	return &Relay{repo: r, events: events, tenants: tenants}, nil
 }
 
-// Run calls Once every second until ctx is cancelled, then gives up the relay lock.
+// Run calls Once, waiting a second after each call, until ctx is cancelled. Then it gives up the relay lock.
 func (r *Relay) Run(ctx context.Context) {
 	log := logging.LoggerFromContext(ctx)
 	defer func() {
@@ -212,6 +238,146 @@ func (r *Relay) hasWebhook(ctx context.Context, tenantID uint64) (bool, error) {
 		return true, nil
 	}
 }
+
+type deliveryRepo interface {
+	claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error)
+	extend(ctx context.Context, l lease, d time.Duration) error
+	leasedDelivery(ctx context.Context, l lease) (delivery, error)
+	complete(ctx context.Context, l lease) error
+	fail(ctx context.Context, l lease, f failure) (bool, error)
+	release(ctx context.Context, l lease) error
+	reap(ctx context.Context) (requeued, failed int, err error)
+}
+
+type poster interface {
+	Post(ctx context.Context, url, eventID, signature string, body []byte) (int, error)
+}
+
+type DelivererConfig struct {
+	WorkerID string
+	// Lease is how long a claim or a heartbeat holds a delivery: the webhook pool's Lease.
+	Lease time.Duration
+}
+
+// Deliverer is the webhook pool's source of work. It signs a claimed delivery, posts it to the tenant's webhook,
+// and completes or fails the delivery fenced on its lease.
+type Deliverer struct {
+	repo    deliveryRepo
+	tenants webhookTargets
+	client  poster
+	cfg     DelivererConfig
+}
+
+func NewDeliverer(r deliveryRepo, tenants webhookTargets, client poster, cfg DelivererConfig) (*Deliverer, error) {
+	switch {
+	case r == nil:
+		return nil, errors.New("a repository is required")
+	case tenants == nil:
+		return nil, errors.New("a tenant service is required")
+	case client == nil:
+		return nil, errors.New("a client is required")
+	case cfg.WorkerID == "":
+		return nil, errors.New("a worker ID is required")
+	case cfg.Lease <= 0:
+		return nil, fmt.Errorf("lease %v is not positive", cfg.Lease)
+	}
+	return &Deliverer{repo: r, tenants: tenants, client: client, cfg: cfg}, nil
+}
+
+func (d *Deliverer) Claim(ctx context.Context) (worker.Lease, bool, error) {
+	l, ok, err := d.repo.claim(ctx, d.cfg.WorkerID, d.cfg.Lease)
+	if err != nil {
+		return worker.Lease{}, false, err
+	}
+	return worker.Lease(l), ok, nil
+}
+
+func (d *Deliverer) Extend(ctx context.Context, l worker.Lease) error {
+	return toWorker(d.repo.extend(ctx, lease(l), d.cfg.Lease))
+}
+
+// Process posts the delivery to the tenant's webhook URL, signed now with the tenant's secret, both as they are now,
+// and marks it delivered on a 2xx answer. A 410, a blocked address, an empty secret and a tenant without a webhook
+// are permanent failures; any other answer or error is worth a retry.
+func (d *Deliverer) Process(ctx context.Context, l worker.Lease) error {
+	held := lease(l)
+	p, err := d.repo.leasedDelivery(ctx, held)
+	if err != nil {
+		return fmt.Errorf("error loading the leased delivery: %w", err)
+	}
+	target, err := d.tenants.WebhookTarget(ctx, l.TenantID)
+	switch {
+	case errors.Is(err, tenant.ErrNoWebhook), errors.Is(err, tenant.ErrNotFound):
+		return worker.Permanent(fmt.Errorf("error reading the webhook target: %w", err))
+	case err != nil:
+		return fmt.Errorf("error reading the webhook target: %w", err)
+	}
+	signature, err := Sign(target.Secret, time.Now(), p.Body)
+	switch {
+	case errors.Is(err, ErrEmptySecret):
+		return worker.Permanent(fmt.Errorf("error signing the delivery: %w", err))
+	case err != nil:
+		return fmt.Errorf("error signing the delivery: %w", err)
+	}
+
+	status, err := d.client.Post(ctx, target.URL, p.EventID.String(), signature, p.Body)
+	switch {
+	case errors.Is(err, egress.ErrBlockedAddress):
+		return worker.Permanent(err)
+	case err != nil:
+		return err
+	case status == http.StatusGone:
+		return worker.Permanent(fmt.Errorf("webhook endpoint answered %d", status))
+	case status < 200 || status > 299:
+		return fmt.Errorf("webhook endpoint answered %d", status)
+	}
+
+	// A heartbeat that finds the delivery already finished cancels ctx, which could make the driver
+	// report a committed completion as cancelled.
+	completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), completeTimeout)
+	defer cancel()
+	return toWorker(d.repo.complete(completeCtx, held))
+}
+
+// Fail fails the delivery for good if cause is worker.Permanent, and otherwise retries it after a backoff
+// while attempts remain.
+func (d *Deliverer) Fail(ctx context.Context, l worker.Lease, cause error) error {
+	f := failure{Permanent: worker.IsPermanent(cause), Detail: cause.Error()}
+	if !f.Permanent {
+		f.Delay = worker.Backoff(l.Attempt, retryBase, retryMax)
+	}
+	_, err := d.repo.fail(ctx, lease(l), f)
+	return toWorker(err)
+}
+
+func (d *Deliverer) Release(ctx context.Context, l worker.Lease) error {
+	return toWorker(d.repo.release(ctx, lease(l)))
+}
+
+func (d *Deliverer) Reap(ctx context.Context) error {
+	requeued, failed, err := d.repo.reap(ctx)
+	if err != nil {
+		return err
+	}
+	if requeued > 0 || failed > 0 {
+		logging.LoggerFromContext(ctx).WarnContext(ctx, "reaped deliveries whose lease expired",
+			"requeued", requeued, "failed", failed)
+	}
+	return nil
+}
+
+// toWorker passes on a repository error, matching worker.ErrLeaseLost if the lease was lost.
+func toWorker(err error) error {
+	if errors.Is(err, errLeaseLost) {
+		return &leaseLostError{err: err}
+	}
+	return err
+}
+
+type leaseLostError struct{ err error }
+
+func (e *leaseLostError) Error() string { return e.err.Error() }
+func (e *leaseLostError) Unwrap() error { return worker.ErrLeaseLost }
 
 func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)

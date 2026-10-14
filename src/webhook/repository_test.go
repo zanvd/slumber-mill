@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/zanvd/slumber-mill/src/db"
+	"github.com/zanvd/slumber-mill/src/worker"
 )
 
 var errNoDatabase = errors.New("dry run reached the connection pool")
@@ -155,6 +157,77 @@ func TestInsertNoDeliveries(t *testing.T) {
 		t.Errorf("insertDeliveries(nil) = %v after %v, want nil without a statement", err, rec.statements)
 	}
 }
+
+func TestLeasedDeliverySQL(t *testing.T) {
+	r, rec := dryRun(t)
+	eventID := uuid.NewV7()
+	rec.row = deliveryRow{EventID: db.ID(eventID), TenantID: 42, Body: []byte(`{"id":"x"}`)}
+
+	got, err := r.leasedDelivery(t.Context(), lease{ID: 11, TenantID: 42, Attempt: 3})
+
+	if err != nil {
+		t.Fatalf("leasedDelivery() error = %v", err)
+	}
+	if want := (delivery{EventID: eventID, TenantID: 42, Body: []byte(`{"id":"x"}`)}); !reflect.DeepEqual(got, want) {
+		t.Errorf("leasedDelivery() = %+v, want %+v", got, want)
+	}
+	if len(rec.statements) != 1 {
+		t.Fatalf("ran %d statements, want 1: %v", len(rec.statements), rec.statements)
+	}
+	s := rec.statements[0]
+	const want = "SELECT `event_id`,`tenant_id`,`body` FROM `webhook_deliveries` WHERE id = ? AND tenant_id = ? LIMIT ?"
+	if s.sql != want || !reflect.DeepEqual(s.vars, []any{uint64(11), uint64(42), 1}) {
+		t.Errorf("statement = %s %v\nwant        %s [11 42 1]", s.sql, s.vars, want)
+	}
+}
+
+// TestFailGivesUpAfterTwelveAttempts fails a delivery on several attempts: a retryable failure requeues it until
+// the twelfth attempt, and a permanent one fails it at once.
+func TestFailGivesUpAfterTwelveAttempts(t *testing.T) {
+	tests := []struct {
+		attempt   int
+		permanent bool
+		wantFinal bool
+	}{
+		{1, false, false},
+		{11, false, false},
+		{12, false, true},
+		{1, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("attempt %d, permanent %t", tc.attempt, tc.permanent), func(t *testing.T) {
+			r, rec := dryRun(t)
+
+			final, err := r.fail(t.Context(), lease{ID: 11, TenantID: 42, Attempt: tc.attempt},
+				failure{Permanent: tc.permanent, Detail: "webhook endpoint answered 503", Delay: time.Minute})
+
+			if err != nil || final != tc.wantFinal {
+				t.Fatalf("fail() = %t, %v; want %t", final, err, tc.wantFinal)
+			}
+			if len(rec.statements) != 1 {
+				t.Fatalf("ran %d statements, want 1: %v", len(rec.statements), rec.statements)
+			}
+			s := rec.statements[0]
+			state, retried := "queued", true
+			if tc.wantFinal {
+				state, retried = "failed", false
+			}
+			if !strings.HasPrefix(s.sql, "UPDATE `webhook_deliveries` SET ") ||
+				!strings.HasSuffix(s.sql, "WHERE id = ? AND state = ? AND attempts = ?") ||
+				strings.Contains(s.sql, "`run_after`=") != retried || !slices.Contains(s.vars, any(state)) ||
+				!slices.Contains(s.vars, any("webhook endpoint answered 503")) {
+				t.Errorf("statement = %s %v, want the delivery %s with its last error", s.sql, s.vars, state)
+			}
+			checkStatement(t, s)
+		})
+	}
+}
+
+// The deliverer converts between worker.Lease and the repository's lease.
+var (
+	_ = worker.Lease(lease{})
+	_ = lease(worker.Lease{})
+)
 
 // checkStatement checks that a statement leaves timestamps to MySQL and binds a value to every placeholder.
 func checkStatement(t *testing.T, got statement) {
