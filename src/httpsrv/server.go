@@ -93,7 +93,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.engine
+	return releaseUnreadBody(s.engine)
 }
 
 // BeginShutdown makes /readyz fail while every other route keeps serving, so a load balancer

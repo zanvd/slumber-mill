@@ -1,17 +1,21 @@
 package httpsrv
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 	"uuid"
 
@@ -561,5 +565,166 @@ func TestRecovery(t *testing.T) {
 
 	if w := f.serve(authed(target)); w.Code != http.StatusOK {
 		t.Errorf("request after the panic: status = %d, want 200", w.Code)
+	}
+}
+
+// rawConn dials f's in-memory server for requests written by hand. Call it inside a synctest bubble.
+// Reads on the connection fail after clientPatience, so a server that never answers fails the test.
+func (f *fixture) rawConn(t *testing.T) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	client := f.uploadClient(t)
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport is %T, want *http.Transport", client.Transport)
+	}
+	conn, err := tr.DialContext(t.Context(), "tcp", "api.test:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetReadDeadline(time.Now().Add(clientPatience)); err != nil {
+		t.Fatal(err)
+	}
+	return conn, bufio.NewReader(conn)
+}
+
+// roundTrip writes req to conn and reads the whole response from br.
+func roundTrip(t *testing.T, conn net.Conn, br *bufio.Reader, req string) (*http.Response, []byte) {
+	t.Helper()
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp, body
+}
+
+// A client that declares a request body and never sends it must not keep the connection
+// once it has its response, whichever route answers.
+func TestUnreadBodyReleasesConnection(t *testing.T) {
+	id := uuid.NewV7().String()
+	rendition := bytes.Repeat([]byte("a"), 64<<10)
+	const auth = "Authorization: Bearer " + validKey + "\r\n"
+	tests := []struct {
+		name string
+		// target is the request line's method and path.
+		target string
+		// header holds extra header lines, each ending in CRLF.
+		header     string
+		assetErr   error
+		wantStatus int
+		wantBody   []byte
+	}{
+		{name: "upload without a key", target: "POST /v1/assets",
+			header: "Content-Type: " + formContentType + "\r\n", wantStatus: http.StatusUnauthorized},
+		{name: "upload without a key expecting 100-continue", target: "POST /v1/assets",
+			header:     "Content-Type: " + formContentType + "\r\nExpect: 100-continue\r\n",
+			wantStatus: http.StatusUnauthorized},
+		{name: "healthz", target: "GET /healthz", wantStatus: http.StatusOK},
+		{name: "unknown route", target: "POST /nope", wantStatus: http.StatusNotFound},
+		{name: "missing asset", target: "GET /v1/assets/" + id, header: auth, assetErr: asset.ErrNotFound,
+			wantStatus: http.StatusNotFound},
+		{name: "trailing-slash redirect", target: "POST /v1/assets/", wantStatus: http.StatusTemporaryRedirect},
+		// The rendition outgrows net/http's response buffer, so the response starts while the handler runs.
+		{name: "rendition", target: "GET /v1/assets/" + id + "/renditions/aac_128k", header: auth,
+			wantStatus: http.StatusOK, wantBody: rendition},
+	}
+	framings := []struct{ name, header string }{
+		{name: "declared length", header: "Content-Length: 1000\r\n"},
+		{name: "chunked", header: "Transfer-Encoding: chunked\r\n"},
+	}
+	for _, tt := range tests {
+		for _, fr := range framings {
+			t.Run(tt.name+", "+fr.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					f := newFixture(t, Config{})
+					f.assets.err = tt.assetErr
+					f.assets.content = rendition
+					var ctx context.Context
+					f.assets.onCall = func(c assetCall) { ctx = c.ctx }
+					ctxErr := make(chan error, 1)
+					f.assets.fileClosed = func() { ctxErr <- ctx.Err() }
+					conn, br := f.rawConn(t)
+
+					start := time.Now()
+					resp, body := roundTrip(t, conn, br,
+						tt.target+" HTTP/1.1\r\nHost: api.test\r\n"+tt.header+fr.header+"\r\n")
+					if resp.StatusCode != tt.wantStatus {
+						t.Fatalf("status = %d, want %d; body %s", resp.StatusCode, tt.wantStatus, body)
+					}
+					if tt.wantBody != nil && !bytes.Equal(body, tt.wantBody) {
+						t.Errorf("got a %d-byte body, want %d bytes", len(body), len(tt.wantBody))
+					}
+					if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+						t.Errorf("reading after the %d returned %v after %v, want io.EOF at once",
+							tt.wantStatus, err, time.Since(start))
+					}
+					select {
+					case err := <-ctxErr:
+						if err != nil {
+							t.Errorf("the handler's context ended while it wrote the rendition: %v", err)
+						}
+					default:
+						if tt.wantBody != nil {
+							t.Error("the handler never closed the rendition")
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
+// Requests without a body, or whose body was read or arrived in full, keep their connection.
+func TestConnectionReuse(t *testing.T) {
+	upload := string(multipartBody(t, titlePart("Rain"), filePart("RIFF-audio")))
+	const uploadHeader = "POST /v1/assets HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer " + validKey +
+		"\r\nContent-Type: " + formContentType + "\r\n"
+	const healthz = "GET /healthz HTTP/1.1\r\nHost: api.test\r\n\r\n"
+	type step struct {
+		req        string
+		wantStatus int
+	}
+	tests := []struct {
+		name  string
+		steps []step
+	}{
+		{name: "no bodies", steps: []step{{healthz, http.StatusOK}, {healthz, http.StatusOK}}},
+		{name: "upload with a declared length", steps: []step{
+			{fmt.Sprintf("%sContent-Length: %d\r\n\r\n%s", uploadHeader, len(upload), upload), http.StatusAccepted},
+			{healthz, http.StatusOK},
+		}},
+		{name: "chunked upload", steps: []step{
+			{fmt.Sprintf("%sTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", uploadHeader, len(upload), upload),
+				http.StatusAccepted},
+			{healthz, http.StatusOK},
+		}},
+		{name: "unread body sent in full", steps: []step{
+			{"GET /healthz HTTP/1.1\r\nHost: api.test\r\nContent-Length: 5\r\n\r\nhello", http.StatusOK},
+			{healthz, http.StatusOK},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.assets.asset = queuedAsset()
+				conn, br := f.rawConn(t)
+				for i, s := range tt.steps {
+					resp, body := roundTrip(t, conn, br, s.req)
+					if resp.StatusCode != s.wantStatus || resp.Close {
+						t.Fatalf("request %d: status %d with connection closed = %v, want %d and kept open; body %s",
+							i, resp.StatusCode, resp.Close, s.wantStatus, body)
+					}
+				}
+			})
+		})
 	}
 }
