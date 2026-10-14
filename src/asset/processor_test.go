@@ -437,9 +437,17 @@ func TestProcessorStopsRefreshing(t *testing.T) {
 					return res, err
 				}
 
+				start := time.Now()
 				err := f.p.Process(t.Context(), claimed)
 				touched := f.files.touches()
 				synctest.Sleep(3 * processorLease)
+
+				for _, o := range f.tc.outputs {
+					want := []time.Time{start.Add(processorLease / 3), start.Add(2 * processorLease / 3)}
+					if got := f.files.touchTimes(o.Path); len(got) < 2 || !slices.EqualFunc(got[:2], want, time.Time.Equal) {
+						t.Errorf("%s touched at %v, want its first two at %v", filepath.Base(o.Path), got, want)
+					}
+				}
 
 				if wantErr := tc.transcodeErr != nil || tc.promoteErr != nil; (err != nil) != wantErr {
 					t.Errorf("Process() error = %v, want an error: %t", err, wantErr)

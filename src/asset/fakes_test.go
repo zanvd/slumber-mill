@@ -191,6 +191,8 @@ type fakeFiles struct {
 	mu      sync.Mutex
 	made    map[string]int
 	touched []string
+	// touchedAt holds when each path was touched, by the clock Touch runs on.
+	touchedAt map[string][]time.Time
 }
 
 // fail counts a call to method and returns the error it fails with, if any.
@@ -255,11 +257,21 @@ func (f *fakeFiles) Open(path string) (io.ReadSeekCloser, error) {
 func (f *fakeFiles) Touch(path string) error {
 	f.mu.Lock()
 	f.touched = append(f.touched, path)
+	if f.touchedAt == nil {
+		f.touchedAt = make(map[string][]time.Time)
+	}
+	f.touchedAt[path] = append(f.touchedAt[path], time.Now())
 	f.mu.Unlock()
 	if err := f.fail("Touch"); err != nil {
 		return err
 	}
 	return os.Chtimes(path, time.Time{}, time.Now())
+}
+
+func (f *fakeFiles) touchTimes(path string) []time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.touchedAt[path])
 }
 
 func (f *fakeFiles) touches() []string {

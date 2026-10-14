@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -240,6 +241,10 @@ func TestTouch(t *testing.T) {
 		}
 		if !info.ModTime().Equal(time.Now()) {
 			t.Errorf("modification time = %v, want now, %v", info.ModTime(), time.Now())
+		}
+		backdated := time.Now().Add(-2*time.Hour - time.Minute)
+		if atime := time.Unix(info.Sys().(*syscall.Stat_t).Atim.Unix()); !atime.Equal(backdated) {
+			t.Errorf("access time = %v, want it left at %v", atime, backdated)
 		}
 		if got := readFile(t, path); got != "rendition" {
 			t.Errorf("touched file holds %q, want %q", got, "rendition")
