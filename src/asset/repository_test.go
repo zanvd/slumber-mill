@@ -238,6 +238,14 @@ func TestReadsFilterOnTenant(t *testing.T) {
 			},
 			want: [][]string{{"assets.tenant_id = ?", "renditions.tenant_id = ?"}},
 		},
+		{
+			name: "leasedAsset",
+			read: func(ctx context.Context, r *Repository) error {
+				_, _, err := r.leasedAsset(ctx, lease{ID: 11, TenantID: tenant, Attempt: 1})
+				return err
+			},
+			want: [][]string{{"SELECT `public_id`,`target_lufs` FROM `assets` WHERE id = ? AND tenant_id = ?"}},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

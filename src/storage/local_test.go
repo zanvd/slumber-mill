@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -222,6 +223,38 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+// TestTouch backdates a temp file past the sweep's age: once touched, it is fresh again and the sweep spares it.
+func TestTouch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := NewLocal(t.TempDir())
+		path := writeTemp(t, l, "rendition")
+		chtimes(t, path, time.Now().Add(-2*time.Hour))
+		time.Sleep(time.Minute)
+
+		if err := l.Touch(path); err != nil {
+			t.Fatalf("Touch() error = %v", err)
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.ModTime().Equal(time.Now()) {
+			t.Errorf("modification time = %v, want now, %v", info.ModTime(), time.Now())
+		}
+		backdated := time.Now().Add(-2*time.Hour - time.Minute)
+		if atime := time.Unix(info.Sys().(*syscall.Stat_t).Atim.Unix()); !atime.Equal(backdated) {
+			t.Errorf("access time = %v, want it left at %v", atime, backdated)
+		}
+		if got := readFile(t, path); got != "rendition" {
+			t.Errorf("touched file holds %q, want %q", got, "rendition")
+		}
+		if removed, err := l.SweepTemp(time.Hour); err != nil || removed != 0 || !exists(t, path) {
+			t.Errorf("SweepTemp() = %d, %v; want the touched file kept", removed, err)
+		}
+	})
+}
+
 func TestMissingFile(t *testing.T) {
 	l := NewLocal(t.TempDir())
 	asset := uuid.MustParse(testAssetID)
@@ -243,6 +276,7 @@ func TestMissingFile(t *testing.T) {
 			return err
 		}},
 		{"remove", func() error { return l.Remove(source) }},
+		{"touch", func() error { return l.Touch(source) }},
 		{"promote", func() error { return l.Promote(filepath.Join(filepath.Dir(source), "part-missing"), source) }},
 	}
 	for _, tc := range tests {
