@@ -687,9 +687,14 @@ func TestUnreadBodyReleasesConnection(t *testing.T) {
 	}
 }
 
-// A request without a body, or whose body the handler read to its end, keeps its connection for the next request.
-// One whose body the handler left unread closes it, even when the client sent the body in full.
+// A request without a body, or whose body the handler read to its end, keeps its connection for the next request,
+// which starts with a live context. One whose body the handler left unread closes it,
+// even when the client sent the body in full.
 func TestConnectionReuse(t *testing.T) {
+	// A connection whose context was cancelled stays cancelled. A deadline expiring under net/http's
+	// background read cancels it only when it wins a race with net/http's cleanup, so the request is
+	// repeated until a cancel would be all but certain.
+	const rounds = 10
 	id := uuid.NewV7().String()
 	upload := string(multipartBody(t, titlePart("Rain"), filePart("RIFF-audio")))
 	const uploadHeader = "POST /v1/assets HTTP/1.1\r\nHost: api.test\r\nContent-Type: " + formContentType + "\r\n"
@@ -731,8 +736,13 @@ func TestConnectionReuse(t *testing.T) {
 				f := newFixture(t, Config{})
 				f.assets.asset = queuedAsset()
 				held := make(chan struct{})
-				if tt.late != "" {
-					f.assets.onCall = func(assetCall) { <-held }
+				getErr := make(chan error, 1)
+				f.assets.onCall = func(c assetCall) {
+					if tt.late != "" {
+						<-held
+					} else if c.method == "Get" {
+						getErr <- c.ctx.Err()
+					}
 				}
 				conn, br := f.rawConn(t)
 
@@ -757,10 +767,25 @@ func TestConnectionReuse(t *testing.T) {
 					}
 					return
 				}
-				send(t, conn, healthz)
+				for i := 1; i < rounds; i++ {
+					send(t, conn, tt.req)
+					if resp, body := readResponse(t, br); resp.StatusCode != tt.wantStatus || resp.Close {
+						t.Fatalf("round %d: status %d with connection closed = %v, want %d and kept open; body %s",
+							i, resp.StatusCode, resp.Close, tt.wantStatus, body)
+					}
+				}
+				send(t, conn, "GET /v1/assets/"+id+" HTTP/1.1\r\nHost: api.test\r\n"+auth+"\r\n")
 				if resp, body := readResponse(t, br); resp.StatusCode != http.StatusOK || resp.Close {
-					t.Errorf("next request: status %d with connection closed = %v, want 200 and kept open; body %s",
+					t.Fatalf("next request: status %d with connection closed = %v, want 200 and kept open; body %s",
 						resp.StatusCode, resp.Close, body)
+				}
+				select {
+				case err := <-getErr:
+					if err != nil {
+						t.Errorf("the next request's context was done when its handler ran: %v", err)
+					}
+				default:
+					t.Error("the next request never reached the asset service")
 				}
 			})
 		})
