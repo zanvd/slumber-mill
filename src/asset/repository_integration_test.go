@@ -711,3 +711,669 @@ func assertFiles(t *testing.T, root string, tenantID uint64, n int) []string {
 	}
 	return names
 }
+
+const (
+	testLease = time.Minute
+	slack     = 5 * time.Second
+)
+
+// newLeaseStack returns a stack whose test ends by checking the outbox: every finished asset has exactly one event,
+// of the type its status calls for, and no other asset has any.
+func newLeaseStack(t *testing.T) *stack {
+	t.Helper()
+	s := newStack(t)
+	t.Cleanup(func() { s.checkOutbox(t) })
+	return s
+}
+
+func (s *stack) checkOutbox(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := s.pool.QueryContext(ctx,
+		"SELECT a.id, a.status, COALESCE(GROUP_CONCAT(e.type ORDER BY e.id), '') "+
+			"FROM assets a LEFT JOIN asset_events e ON e.asset_id = a.id GROUP BY a.id, a.status")
+	if err != nil {
+		t.Fatalf("error reading the outbox: %v", err)
+	}
+	defer rows.Close()
+	want := map[string]string{"ready": "asset.ready", "failed": "asset.failed"}
+	for rows.Next() {
+		var id uint64
+		var status, types string
+		if err := rows.Scan(&id, &status, &types); err != nil {
+			t.Fatalf("error reading the outbox: %v", err)
+		}
+		if types != want[status] {
+			t.Errorf("asset %d is %s with events [%s], want [%s]", id, status, types, want[status])
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("error reading the outbox: %v", err)
+	}
+}
+
+// queue uploads an asset, and returns its public and internal IDs.
+func (s *stack) queue(t *testing.T, tenantID uint64) (uuid.UUID, uint64) {
+	t.Helper()
+	a, _ := s.create(t, tenantID, "Rain", "audio", "")
+	var id uint64
+	err := s.pool.QueryRowContext(t.Context(), "SELECT id FROM assets WHERE public_id = ?", db.ID(a.ID)).Scan(&id)
+	if err != nil {
+		t.Fatalf("error reading the asset's ID: %v", err)
+	}
+	return a.ID, id
+}
+
+func (s *stack) exec(t *testing.T, query string, args ...any) {
+	t.Helper()
+	if _, err := s.pool.ExecContext(t.Context(), query, args...); err != nil {
+		t.Fatalf("error running %q: %v", query, err)
+	}
+}
+
+func (s *stack) claimNext(t *testing.T) lease {
+	t.Helper()
+	l, ok, err := s.repo.claim(t.Context(), "worker", testLease)
+	if err != nil || !ok {
+		t.Fatalf("claim() = %+v, %t, %v; want a lease", l, ok, err)
+	}
+	return l
+}
+
+func (s *stack) wantNothingDue(t *testing.T) {
+	t.Helper()
+	if l, ok, err := s.repo.claim(t.Context(), "idle", testLease); ok || err != nil || l != (lease{}) {
+		t.Errorf("claim() = %+v, %t, %v; want nothing due", l, ok, err)
+	}
+}
+
+func (s *stack) expire(t *testing.T, id uint64) {
+	t.Helper()
+	s.exec(t, "UPDATE assets SET lease_expires_at = NOW(6) - INTERVAL 1 SECOND WHERE id = ?", id)
+}
+
+// leaseState is an asset's lease and outcome columns.
+type leaseState struct {
+	Status         string
+	Attempts       int
+	LockedBy       sql.NullString
+	LeaseExpiresAt sql.NullTime
+	Error          sql.NullString
+	LastError      sql.NullString
+}
+
+func (s *stack) state(t *testing.T, id uint64) leaseState {
+	t.Helper()
+	var st leaseState
+	err := s.pool.QueryRowContext(t.Context(),
+		"SELECT status, attempts, locked_by, lease_expires_at, error, last_error FROM assets WHERE id = ?", id).
+		Scan(&st.Status, &st.Attempts, &st.LockedBy, &st.LeaseExpiresAt, &st.Error, &st.LastError)
+	if err != nil {
+		t.Fatalf("error reading asset %d: %v", id, err)
+	}
+	return st
+}
+
+// wantUnleased checks that the asset is in status on attempt attempts, with its lease columns cleared.
+func (s *stack) wantUnleased(t *testing.T, id uint64, status Status, attempts int) leaseState {
+	t.Helper()
+	st := s.state(t, id)
+	if st.Status != string(status) || st.Attempts != attempts || st.LockedBy.Valid || st.LeaseExpiresAt.Valid {
+		t.Errorf("asset %d = %+v, want %s on attempt %d without locked_by or lease_expires_at",
+			id, st, status, attempts)
+	}
+	return st
+}
+
+// until returns how far column, a DATETIME(6) of asset id, lies after NOW(6).
+func (s *stack) until(t *testing.T, id uint64, column string) time.Duration {
+	t.Helper()
+	var us sql.NullInt64
+	err := s.pool.QueryRowContext(t.Context(),
+		"SELECT TIMESTAMPDIFF(MICROSECOND, NOW(6), "+column+") FROM assets WHERE id = ?", id).Scan(&us)
+	if err != nil || !us.Valid {
+		t.Fatalf("error reading %s of asset %d: %v (valid %t)", column, id, err, us.Valid)
+	}
+	return time.Duration(us.Int64) * time.Microsecond
+}
+
+// snapshot returns every column of every row the asset owns, to tell whether a write changed any of them.
+func (s *stack) snapshot(t *testing.T, id uint64) map[string][]map[string]any {
+	t.Helper()
+	return map[string][]map[string]any{
+		"assets":          s.rows(t, "SELECT * FROM assets WHERE id = ?", id),
+		"renditions":      s.rows(t, "SELECT * FROM renditions WHERE asset_id = ? ORDER BY id", id),
+		"asset_events":    s.rows(t, "SELECT * FROM asset_events WHERE asset_id = ? ORDER BY id", id),
+		"every event":     s.rows(t, "SELECT id FROM asset_events ORDER BY id"),
+		"every rendition": s.rows(t, "SELECT id FROM renditions ORDER BY id"),
+	}
+}
+
+func (s *stack) rows(t *testing.T, query string, args ...any) []map[string]any {
+	t.Helper()
+	rows, err := s.pool.QueryContext(t.Context(), query, args...)
+	if err != nil {
+		t.Fatalf("error running %q: %v", query, err)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("error reading the columns of %q: %v", query, err)
+	}
+	var all []map[string]any
+	for rows.Next() {
+		values := make([]any, len(columns))
+		ptrs := make([]any, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("error reading %q: %v", query, err)
+		}
+		row := make(map[string]any, len(columns))
+		for i, c := range columns {
+			row[c] = values[i]
+		}
+		all = append(all, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("error reading %q: %v", query, err)
+	}
+	return all
+}
+
+type storedEvent struct {
+	EventID   db.ID
+	TenantID  uint64
+	AssetID   uint64
+	Type      EventType
+	CreatedAt time.Time
+	RelayedAt sql.NullTime
+}
+
+func (s *stack) events(t *testing.T) []storedEvent {
+	t.Helper()
+	rows, err := s.pool.QueryContext(t.Context(),
+		"SELECT event_id, tenant_id, asset_id, type, created_at, relayed_at FROM asset_events ORDER BY id")
+	if err != nil {
+		t.Fatalf("error reading events: %v", err)
+	}
+	defer rows.Close()
+	var events []storedEvent
+	for rows.Next() {
+		var e storedEvent
+		if err := rows.Scan(&e.EventID, &e.TenantID, &e.AssetID, &e.Type, &e.CreatedAt, &e.RelayedAt); err != nil {
+			t.Fatalf("error reading events: %v", err)
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("error reading events: %v", err)
+	}
+	return events
+}
+
+// wantEvents checks that the outbox holds one unrelayed event of type typ for each asset in assetIDs, in order,
+// each with the tenant tenantIDs gives at the same index.
+func (s *stack) wantEvents(t *testing.T, typ EventType, assetIDs, tenantIDs []uint64) []storedEvent {
+	t.Helper()
+	events := s.events(t)
+	if len(events) != len(assetIDs) {
+		t.Fatalf("events = %+v, want %d", events, len(assetIDs))
+	}
+	for i, e := range events {
+		if e.Type != typ || e.AssetID != assetIDs[i] || e.TenantID != tenantIDs[i] {
+			t.Errorf("event %d = %+v, want %s of asset %d and tenant %d", i, e, typ, assetIDs[i], tenantIDs[i])
+		}
+		if e.EventID[6]>>4 != 7 || e.CreatedAt.IsZero() || e.RelayedAt.Valid {
+			t.Errorf("event %d = %+v, want a UUIDv7, a creation time and no relay time", i, e)
+		}
+	}
+	return events
+}
+
+func (s *stack) wantNoEvents(t *testing.T) {
+	t.Helper()
+	if events := s.events(t); len(events) > 0 {
+		t.Errorf("events = %+v, want none", events)
+	}
+}
+
+func testProcessed() processed {
+	return processed{
+		SourceCodec:       "flac",
+		DurationMS:        600_000,
+		InputLUFS:         -23.45,
+		InputTruePeakDBTP: 0,
+		InputLRALU:        7.5,
+		InputMaxMomentary: -1,
+		Warnings:          []Warning{WarningSourceMayClip, WarningSuddenLoudEvent},
+		Renditions:        []Rendition{testRendition(ProfileAAC128k), testRendition(ProfileAAC64k)},
+	}
+}
+
+// withoutCreatedAt returns renditions with their creation times zeroed, after checking that each has one.
+func withoutCreatedAt(t *testing.T, renditions []Rendition) []Rendition {
+	t.Helper()
+	out := slices.Clone(renditions)
+	for i := range out {
+		if out[i].CreatedAt.IsZero() {
+			t.Errorf("rendition %s has no creation time", out[i].Profile)
+		}
+		out[i].CreatedAt = time.Time{}
+	}
+	return out
+}
+
+func TestClaim(t *testing.T) {
+	t.Run("oldest due first", func(t *testing.T) {
+		s := newLeaseStack(t)
+		owner := s.tenant(t, "owner")
+		other := s.tenant(t, "other")
+		_, later := s.queue(t, owner)
+		_, oldest := s.queue(t, other)
+		_, future := s.queue(t, owner)
+		s.exec(t, "UPDATE assets SET run_after = '2020-01-01 00:00:02' WHERE id = ?", later)
+		s.exec(t, "UPDATE assets SET run_after = '2020-01-01 00:00:01', attempts = 1 WHERE id = ?", oldest)
+		s.exec(t, "UPDATE assets SET run_after = NOW(6) + INTERVAL 1 HOUR WHERE id = ?", future)
+
+		l, ok, err := s.repo.claim(t.Context(), "worker-1", testLease)
+
+		if err != nil || !ok {
+			t.Fatalf("claim() = %+v, %t, %v; want a lease", l, ok, err)
+		}
+		if want := (lease{ID: oldest, TenantID: other, Attempt: 2}); l != want {
+			t.Errorf("claim() = %+v, want %+v", l, want)
+		}
+		st := s.state(t, oldest)
+		if st.Status != "processing" || st.Attempts != 2 || st.LockedBy.String != "worker-1" {
+			t.Errorf("claimed asset = %+v, want processing on attempt 2, locked by worker-1", st)
+		}
+		if d := s.until(t, oldest, "lease_expires_at"); d <= testLease-slack || d > testLease {
+			t.Errorf("lease expires in %v, want about %v", d, testLease)
+		}
+		if next := s.claimNext(t); next != (lease{ID: later, TenantID: owner, Attempt: 1}) {
+			t.Errorf("second claim() = %+v, want asset %d of tenant %d on attempt 1", next, later, owner)
+		}
+		s.wantNothingDue(t)
+	})
+	t.Run("nothing due", func(t *testing.T) {
+		s := newLeaseStack(t)
+		tenant := s.tenant(t, "owner")
+		s.wantNothingDue(t)
+		_, future := s.queue(t, tenant)
+		s.exec(t, "UPDATE assets SET run_after = NOW(6) + INTERVAL 1 HOUR WHERE id = ?", future)
+		s.wantNothingDue(t)
+	})
+}
+
+func TestExtend(t *testing.T) {
+	s := newLeaseStack(t)
+	tenant := s.tenant(t, "owner")
+	_, id := s.queue(t, tenant)
+	l := s.claimNext(t)
+
+	if err := s.repo.extend(t.Context(), l, 2*time.Hour); err != nil {
+		t.Fatalf("extend() error = %v", err)
+	}
+
+	if st := s.state(t, id); st.Status != "processing" || st.Attempts != 1 {
+		t.Errorf("extended asset = %+v, want processing on attempt 1", st)
+	}
+	if d := s.until(t, id, "lease_expires_at"); d <= 2*time.Hour-slack || d > 2*time.Hour {
+		t.Errorf("lease expires in %v, want about 2h", d)
+	}
+}
+
+func TestFinish(t *testing.T) {
+	s := newLeaseStack(t)
+	tenant := s.tenant(t, "owner")
+	publicID, id := s.queue(t, tenant)
+	l := s.claimNext(t)
+
+	if err := s.repo.finish(t.Context(), l, testProcessed()); err != nil {
+		t.Fatalf("finish() error = %v", err)
+	}
+
+	if st := s.wantUnleased(t, id, StatusReady, 1); st.Error.Valid {
+		t.Errorf("error = %q, want NULL", st.Error.String)
+	}
+	got, err := s.repo.assetByID(t.Context(), tenant, publicID)
+	if err != nil {
+		t.Fatalf("assetByID() error = %v", err)
+	}
+	want := Asset{
+		ID: publicID, TenantID: tenant, Title: "Rain", Status: StatusReady,
+		SourceSHA256: sha256.Sum256([]byte("audio")), SourceBytes: 5, SourceCodec: "flac",
+		DurationMS: new(uint64(600_000)), TargetLUFS: -16, InputLUFS: new(-23.45), InputTruePeakDBTP: new(0.0),
+		InputLRALU: new(7.5), InputMaxMomentary: new(-1.0),
+		Warnings:   []Warning{WarningSuddenLoudEvent, WarningSourceMayClip},
+		Renditions: testProcessed().Renditions,
+		CreatedAt:  got.CreatedAt, UpdatedAt: got.UpdatedAt,
+	}
+	got.Renditions = withoutCreatedAt(t, got.Renditions)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("finished asset = %+v\nwant  %+v", got, want)
+	}
+	s.wantEvents(t, EventReady, []uint64{id}, []uint64{tenant})
+}
+
+func TestFinishUpsertsRenditions(t *testing.T) {
+	s := newLeaseStack(t)
+	tenant := s.tenant(t, "owner")
+	publicID, id := s.queue(t, tenant)
+	stale := testRendition(ProfileAAC128k)
+	stale.Bytes, stale.LUFS, stale.SHA256 = 1, -30, sha256.Sum256([]byte("stale"))
+	s.addRendition(t, tenant, publicID, stale)
+	before := s.rows(t, "SELECT id, created_at FROM renditions WHERE asset_id = ?", id)
+	l := s.claimNext(t)
+
+	if err := s.repo.finish(t.Context(), l, testProcessed()); err != nil {
+		t.Fatalf("finish() error = %v", err)
+	}
+
+	after := s.rows(t, "SELECT id, created_at FROM renditions WHERE asset_id = ? AND profile = 'aac_128k'", id)
+	if !reflect.DeepEqual(after, before) {
+		t.Errorf("aac_128k row = %v, want %v updated in place", after, before)
+	}
+	if n := len(s.rows(t, "SELECT id FROM renditions WHERE asset_id = ?", id)); n != 2 {
+		t.Errorf("%d renditions, want 2", n)
+	}
+	got, err := s.repo.assetByID(t.Context(), tenant, publicID)
+	if err != nil {
+		t.Fatalf("assetByID() error = %v", err)
+	}
+	if got := withoutCreatedAt(t, got.Renditions); !reflect.DeepEqual(got, testProcessed().Renditions) {
+		t.Errorf("renditions = %+v\nwant  %+v", got, testProcessed().Renditions)
+	}
+}
+
+// TestFinishRollsBack has a write inside the transaction fail: the asset keeps its lease and nothing is written.
+func TestFinishRollsBack(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*processed)
+		// wantDatabase means MySQL rejected a write, rather than finish refusing it.
+		wantDatabase bool
+	}{
+		{"rendition rejected", func(p *processed) { p.Renditions[1].Profile = "aac_320k" }, true},
+		{"measurement rejected", func(p *processed) { p.InputLUFS = 1000 }, true},
+		{"no renditions", func(p *processed) { p.Renditions = nil }, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newLeaseStack(t)
+			tenant := s.tenant(t, "owner")
+			_, id := s.queue(t, tenant)
+			l := s.claimNext(t)
+			before := s.snapshot(t, id)
+			p := testProcessed()
+			tc.edit(&p)
+
+			err := s.repo.finish(t.Context(), l, p)
+
+			if err == nil || errors.Is(err, errLeaseLost) || errors.Is(err, errDatabase) != tc.wantDatabase {
+				t.Fatalf("finish() error = %v; want an error, a database error: %t", err, tc.wantDatabase)
+			}
+			if _, ok := errors.AsType[*mysql.MySQLError](err); ok {
+				t.Errorf("the driver's error is reachable through %v", err)
+			}
+			if after := s.snapshot(t, id); !reflect.DeepEqual(after, before) {
+				t.Errorf("rows changed from %v\nto %v", before, after)
+			}
+			if st := s.state(t, id); st.Status != "processing" || st.Attempts != 1 {
+				t.Errorf("asset = %+v, want it still processing on attempt 1", st)
+			}
+		})
+	}
+}
+
+func TestFail(t *testing.T) {
+	// Both are longer than their columns, and the byte at each column's size is inside a character.
+	long := "x" + strings.Repeat("é", 600)
+	longDetail := "\xff" + strings.Repeat("ö", 1100)
+	tests := []struct {
+		name string
+		// attempts is the asset's count before the claim.
+		attempts      int
+		failure       failure
+		wantFinal     bool
+		wantError     string
+		wantLastError string
+	}{
+		{
+			name:          "retryable with attempts left",
+			failure:       failure{Detail: "ffmpeg exited 1: /data/tmp/part-1", Delay: 30 * time.Second},
+			wantLastError: "ffmpeg exited 1: /data/tmp/part-1",
+		},
+		{
+			name:          "retryable on the attempt before the last",
+			attempts:      maxAttempts - 2,
+			failure:       failure{Reason: "only for rejections", Detail: "timeout", Delay: time.Minute},
+			wantLastError: "timeout",
+		},
+		{
+			name:          "permanent",
+			failure:       failure{Permanent: true, Reason: "not audio", Detail: "ffprobe: /data/sources/7/x: invalid data"},
+			wantFinal:     true,
+			wantError:     "not audio",
+			wantLastError: "ffprobe: /data/sources/7/x: invalid data",
+		},
+		{
+			name:          "permanent without a reason",
+			failure:       failure{Permanent: true, Detail: "panic: boom"},
+			wantFinal:     true,
+			wantError:     failedMessage,
+			wantLastError: "panic: boom",
+		},
+		{
+			name:          "last attempt",
+			attempts:      maxAttempts - 1,
+			failure:       failure{Reason: "only for rejections", Detail: "ffmpeg exited 255: /data/tmp/part-2", Delay: time.Hour},
+			wantFinal:     true,
+			wantError:     failedMessage,
+			wantLastError: "ffmpeg exited 255: /data/tmp/part-2",
+		},
+		{
+			name:          "long and multi-byte messages are clipped",
+			failure:       failure{Permanent: true, Reason: long, Detail: longDetail},
+			wantFinal:     true,
+			wantError:     db.Clip(long, 1024),
+			wantLastError: db.Clip(longDetail, 2048),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newLeaseStack(t)
+			tenant := s.tenant(t, "owner")
+			_, id := s.queue(t, tenant)
+			s.exec(t, "UPDATE assets SET attempts = ? WHERE id = ?", tc.attempts, id)
+			l := s.claimNext(t)
+
+			final, err := s.repo.fail(t.Context(), l, tc.failure)
+
+			if err != nil || final != tc.wantFinal {
+				t.Fatalf("fail() = %t, %v; want %t", final, err, tc.wantFinal)
+			}
+			status := StatusQueued
+			if tc.wantFinal {
+				status = StatusFailed
+			}
+			st := s.wantUnleased(t, id, status, tc.attempts+1)
+			if st.Error.Valid != tc.wantFinal || st.Error.String != tc.wantError {
+				t.Errorf("error = %+v, want %q (set: %t)", st.Error, tc.wantError, tc.wantFinal)
+			}
+			if st.LastError.String != tc.wantLastError {
+				t.Errorf("last_error = %q, want %q", st.LastError.String, tc.wantLastError)
+			}
+			if !tc.wantFinal {
+				if d := s.until(t, id, "run_after"); d <= tc.failure.Delay-slack || d > tc.failure.Delay {
+					t.Errorf("due in %v, want about %v", d, tc.failure.Delay)
+				}
+				s.wantNothingDue(t)
+				s.wantNoEvents(t)
+				return
+			}
+			s.wantEvents(t, EventFailed, []uint64{id}, []uint64{tenant})
+		})
+	}
+}
+
+func TestRelease(t *testing.T) {
+	s := newLeaseStack(t)
+	tenant := s.tenant(t, "owner")
+	_, id := s.queue(t, tenant)
+	l := s.claimNext(t)
+
+	if err := s.repo.release(t.Context(), l); err != nil {
+		t.Fatalf("release() error = %v", err)
+	}
+
+	if st := s.wantUnleased(t, id, StatusQueued, 0); st.Error.Valid || st.LastError.Valid {
+		t.Errorf("released asset = %+v, want no error or last_error", st)
+	}
+	s.wantNoEvents(t)
+	if again := s.claimNext(t); again != l {
+		t.Errorf("claim after the release = %+v, want %+v", again, l)
+	}
+}
+
+// TestLostLeaseWritesNothing has another worker take over, or the asset finish, before the holder writes.
+func TestLostLeaseWritesNothing(t *testing.T) {
+	stale := processed{SourceCodec: "mp3", DurationMS: 1, Renditions: []Rendition{testRendition(ProfileAAC64k)}}
+	losses := []struct {
+		name string
+		lose func(t *testing.T, s *stack, id uint64, l lease)
+	}{
+		{"reaped", func(t *testing.T, s *stack, id uint64, _ lease) {
+			s.expire(t, id)
+			if requeued, failed, err := s.repo.reap(t.Context()); requeued != 1 || failed != 0 || err != nil {
+				t.Fatalf("reap() = %d, %d, %v; want 1 requeued", requeued, failed, err)
+			}
+		}},
+		{"claimed again", func(t *testing.T, s *stack, id uint64, _ lease) {
+			s.exec(t, "UPDATE assets SET attempts = attempts + 1, locked_by = 'successor' WHERE id = ?", id)
+		}},
+		{"finished", func(t *testing.T, s *stack, _ uint64, l lease) {
+			if err := s.repo.finish(t.Context(), l, testProcessed()); err != nil {
+				t.Fatalf("finish() error = %v", err)
+			}
+		}},
+	}
+	ops := []struct {
+		name string
+		run  func(ctx context.Context, r *Repository, l lease) error
+	}{
+		{"extend", func(ctx context.Context, r *Repository, l lease) error { return r.extend(ctx, l, testLease) }},
+		{"finish", func(ctx context.Context, r *Repository, l lease) error { return r.finish(ctx, l, stale) }},
+		{"retry", func(ctx context.Context, r *Repository, l lease) error {
+			_, err := r.fail(ctx, l, failure{Detail: "timeout", Delay: time.Second})
+			return err
+		}},
+		{"fail", func(ctx context.Context, r *Repository, l lease) error {
+			_, err := r.fail(ctx, l, failure{Permanent: true, Reason: "not audio", Detail: "stale"})
+			return err
+		}},
+		{"release", func(ctx context.Context, r *Repository, l lease) error { return r.release(ctx, l) }},
+	}
+	for _, loss := range losses {
+		for _, op := range ops {
+			t.Run(op.name+" after it was "+loss.name, func(t *testing.T) {
+				s := newLeaseStack(t)
+				tenant := s.tenant(t, "owner")
+				_, id := s.queue(t, tenant)
+				l := s.claimNext(t)
+				loss.lose(t, s, id, l)
+				before := s.snapshot(t, id)
+
+				err := op.run(t.Context(), s.repo, l)
+
+				if !errors.Is(err, errLeaseLost) {
+					t.Errorf("error = %v, want %v", err, errLeaseLost)
+				}
+				if errors.Is(err, db.ErrLeaseLost) || errors.Is(err, errDatabase) {
+					t.Errorf("db's lost lease or a database error is reachable through %v", err)
+				}
+				if after := s.snapshot(t, id); !reflect.DeepEqual(after, before) {
+					t.Errorf("rows changed from %v\nto %v", before, after)
+				}
+			})
+		}
+	}
+}
+
+func TestReap(t *testing.T) {
+	t.Run("requeues an expired lease with attempts left", func(t *testing.T) {
+		s := newLeaseStack(t)
+		tenant := s.tenant(t, "owner")
+		_, id := s.queue(t, tenant)
+		s.claimNext(t)
+		s.expire(t, id)
+
+		requeued, failed, err := s.repo.reap(t.Context())
+
+		if err != nil || requeued != 1 || failed != 0 {
+			t.Fatalf("reap() = %d requeued, %d failed, %v; want 1, 0", requeued, failed, err)
+		}
+		st := s.wantUnleased(t, id, StatusQueued, 1)
+		if st.Error.Valid || st.LastError.String != "lease expired" {
+			t.Errorf("reaped asset = %+v, want no error and last_error %q", st, "lease expired")
+		}
+		if d := s.until(t, id, "run_after"); d <= 5*time.Second-slack || d > 5*time.Second {
+			t.Errorf("due in %v, want about 5s", d)
+		}
+		s.wantNoEvents(t)
+	})
+	t.Run("fails an expired lease at the maximum attempts", func(t *testing.T) {
+		s := newLeaseStack(t)
+		tenant := s.tenant(t, "owner")
+		_, id := s.queue(t, tenant)
+		s.exec(t, "UPDATE assets SET attempts = ? WHERE id = ?", maxAttempts-1, id)
+		s.claimNext(t)
+		s.expire(t, id)
+
+		requeued, failed, err := s.repo.reap(t.Context())
+
+		if err != nil || requeued != 0 || failed != 1 {
+			t.Fatalf("reap() = %d requeued, %d failed, %v; want 0, 1", requeued, failed, err)
+		}
+		st := s.wantUnleased(t, id, StatusFailed, maxAttempts)
+		if st.Error.String != failedMessage || st.LastError.String != "lease expired" {
+			t.Errorf("reaped asset = %+v, want error %q and last_error %q", st, failedMessage, "lease expired")
+		}
+		s.wantEvents(t, EventFailed, []uint64{id}, []uint64{tenant})
+	})
+	t.Run("both kinds in one batch", func(t *testing.T) {
+		s := newLeaseStack(t)
+		owner := s.tenant(t, "owner")
+		other := s.tenant(t, "other")
+		_, spare := s.queue(t, owner)
+		_, dead := s.queue(t, other)
+		_, live := s.queue(t, owner)
+		s.exec(t, "UPDATE assets SET attempts = ? WHERE id = ?", maxAttempts-1, dead)
+		for _, want := range []uint64{spare, dead, live} {
+			if l := s.claimNext(t); l.ID != want {
+				t.Fatalf("claimed asset %d, want %d", l.ID, want)
+			}
+		}
+		s.expire(t, spare)
+		s.expire(t, dead)
+
+		requeued, failed, err := s.repo.reap(t.Context())
+
+		if err != nil || requeued != 1 || failed != 1 {
+			t.Fatalf("reap() = %d requeued, %d failed, %v; want 1, 1", requeued, failed, err)
+		}
+		if st := s.wantUnleased(t, spare, StatusQueued, 1); st.Error.Valid {
+			t.Errorf("requeued asset has error %q", st.Error.String)
+		}
+		if st := s.wantUnleased(t, dead, StatusFailed, maxAttempts); st.Error.String != failedMessage {
+			t.Errorf("failed asset has error %q, want %q", st.Error.String, failedMessage)
+		}
+		if st := s.state(t, live); st.Status != "processing" || !st.LeaseExpiresAt.Valid {
+			t.Errorf("live asset = %+v, want it still leased", st)
+		}
+		s.wantEvents(t, EventFailed, []uint64{dead}, []uint64{other})
+	})
+}
