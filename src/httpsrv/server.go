@@ -79,7 +79,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 		return nil, fmt.Errorf("error setting trusted proxies: %w", err)
 	}
 
-	s.engine.Use(s.logRequest, s.recover)
+	s.engine.Use(s.describeRequest)
 	s.engine.NoRoute(s.noRoute)
 	s.engine.GET("/healthz", s.healthz)
 	s.engine.GET("/readyz", s.readyz)
@@ -93,7 +93,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 }
 
 func (s *Server) Handler() http.Handler {
-	return releaseUnreadBody(s.engine)
+	return releaseUnreadBody(s.logRequests(s.engine))
 }
 
 // BeginShutdown makes /readyz fail while every other route keeps serving, so a load balancer

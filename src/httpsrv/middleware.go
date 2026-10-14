@@ -1,6 +1,8 @@
 package httpsrv
 
 import (
+	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -61,44 +63,121 @@ func (r *eofReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// logRequest puts the request's logger into its context and writes one line once the request is done.
+type requestLogKey struct{}
+
+// requestLog carries the request's logger out of the engine to logRequests, which writes the request line.
+// It stays empty when Gin answers without running any middleware.
+type requestLog struct {
+	log *slog.Logger
+}
+
+// logRequests writes one line per request once it's done, and recovers a panic from anywhere in the engine.
+// It wraps the engine because Gin answers a trailing-slash redirect without running any middleware.
 // It logs no headers, so the Authorization value never reaches the log.
-func (s *Server) logRequest(c *gin.Context) {
-	start := time.Now()
-	log := s.log.With(
-		slog.String("method", c.Request.Method),
-		slog.String("route", c.FullPath()),
-		slog.String("client_ip", c.ClientIP()),
-	)
-	c.Request = c.Request.WithContext(logging.CtxWithLogger(c.Request.Context(), log))
+func (s *Server) logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rl := &requestLog{}
+		r = r.WithContext(context.WithValue(r.Context(), requestLogKey{}, rl))
+		sw := &statusWriter{ResponseWriter: w}
+		defer func() {
+			v := recover()
+			log := rl.log
+			if log == nil {
+				log = s.requestLogger(r.Method, "", s.clientIP(r))
+			}
+			// net/http's sentinel for aborting a response must reach the server to cut the connection.
+			aborted := v == http.ErrAbortHandler
+			if v != nil && !aborted {
+				log.Error("panic serving request", "panic", v, "stack", string(debug.Stack()))
+				if sw.status == 0 {
+					writeInternalError(sw)
+				}
+			}
+			status := sw.status
+			if status == 0 && !aborted {
+				status = http.StatusOK
+			}
+			log.LogAttrs(r.Context(), slog.LevelInfo, "request",
+				slog.Int("status", status),
+				slog.Duration("duration", time.Since(start)),
+			)
+			if aborted {
+				panic(v)
+			}
+		}()
+		next.ServeHTTP(sw, r)
+	})
+}
 
-	c.Next()
+// describeRequest gives the request a logger with its method, route and client, for its handlers and its request line.
+func (s *Server) describeRequest(c *gin.Context) {
+	s.setLogger(c, s.requestLogger(c.Request.Method, c.FullPath(), c.ClientIP()))
+}
 
-	// Authentication replaces the logger with one carrying the tenant.
-	s.logger(c).LogAttrs(c.Request.Context(), slog.LevelInfo, "request",
-		slog.Int("status", c.Writer.Status()),
-		slog.Duration("duration", time.Since(start)),
+func (s *Server) requestLogger(method, route, clientIP string) *slog.Logger {
+	return s.log.With(
+		slog.String("method", method),
+		slog.String("route", route),
+		slog.String("client_ip", clientIP),
 	)
 }
 
-func (s *Server) recover(c *gin.Context) {
-	defer func() {
-		v := recover()
-		if v == nil {
-			return
-		}
-		// net/http's sentinel for aborting a response must reach the server to cut the connection.
-		if v == http.ErrAbortHandler {
-			panic(v)
-		}
-		s.logger(c).Error("panic serving request", "panic", v, "stack", string(debug.Stack()))
-		if c.Writer.Written() {
-			c.Abort()
-			return
-		}
-		c.AbortWithStatusJSON(http.StatusInternalServerError, internalError())
-	}()
-	c.Next()
+// clientIP resolves the client's address through the engine's trusted proxies for a request
+// the engine answered without a context of its own.
+func (s *Server) clientIP(r *http.Request) string {
+	c := gin.CreateTestContextOnly(nil, s.engine)
+	c.Request = r
+	return c.ClientIP()
+}
+
+func (s *Server) setLogger(c *gin.Context, log *slog.Logger) {
+	ctx := c.Request.Context()
+	if rl, ok := ctx.Value(requestLogKey{}).(*requestLog); ok {
+		rl.log = log
+	}
+	c.Request = c.Request.WithContext(logging.CtxWithLogger(ctx, log))
+}
+
+func writeInternalError(w http.ResponseWriter) {
+	body, err := json.Marshal(internalError())
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusInternalServerError)
+	if err == nil {
+		_, _ = w.Write(body)
+	}
+}
+
+// statusWriter records the status a response went out with.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.ResponseWriter.WriteHeader(code)
+	if w.status == 0 {
+		w.status = code
+	}
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return n, err
+}
+
+func (w *statusWriter) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (s *Server) authenticate(c *gin.Context) {
@@ -107,14 +186,12 @@ func (s *Server) authenticate(c *gin.Context) {
 		s.writeError(c, tenant.ErrUnauthenticated)
 		return
 	}
-	ctx := c.Request.Context()
-	t, err := s.tenants.Authenticate(ctx, key)
+	t, err := s.tenants.Authenticate(c.Request.Context(), key)
 	if err != nil {
 		s.writeError(c, err)
 		return
 	}
-	log := s.logger(c).With(slog.String("tenant", t.Slug))
-	c.Request = c.Request.WithContext(logging.CtxWithLogger(ctx, log))
+	s.setLogger(c, s.logger(c).With(slog.String("tenant", t.Slug)))
 	c.Set(tenantKey, t)
 	c.Next()
 }
