@@ -79,6 +79,14 @@ func (l *Local) Open(path string) (io.ReadSeekCloser, error) {
 	return f, nil
 }
 
+// Touch sets the file's modification time to now, so SweepTemp spares a temp file that is still in use.
+func (l *Local) Touch(path string) error {
+	if err := os.Chtimes(path, time.Time{}, time.Now()); err != nil {
+		return fmt.Errorf("error touching file: %w", err)
+	}
+	return nil
+}
+
 func (l *Local) Remove(path string) error {
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("error removing file: %w", err)
