@@ -207,6 +207,19 @@ func (r *Repository) rendition(ctx context.Context, tenantID uint64, assetID uui
 	return newRenditionFromRepo(row), nil
 }
 
+// leasedAsset returns what processing a leased asset needs: its public ID and its loudness target.
+func (r *Repository) leasedAsset(ctx context.Context, l lease) (id uuid.UUID, targetLUFS float64, err error) {
+	var row assetRow
+	err = r.db.WithContext(ctx).
+		Select("public_id", "target_lufs").
+		Where("id = ? AND tenant_id = ?", l.ID, l.TenantID).
+		Take(&row).Error
+	if err != nil {
+		return uuid.UUID{}, 0, translate("error reading leased asset", err)
+	}
+	return uuid.UUID(row.PublicID), row.TargetLUFS, nil
+}
+
 func renditionsOf(tenantID uint64) func(*gorm.DB) *gorm.DB {
 	return func(tx *gorm.DB) *gorm.DB {
 		return tx.Where("tenant_id = ?", tenantID).Order("profile")

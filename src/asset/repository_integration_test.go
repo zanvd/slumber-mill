@@ -1026,6 +1026,26 @@ func TestExtend(t *testing.T) {
 	}
 }
 
+func TestLeasedAsset(t *testing.T) {
+	s := newLeaseStack(t)
+	owner := s.tenant(t, "owner")
+	other := s.tenant(t, "other")
+	publicID, id := s.queue(t, owner)
+	s.queue(t, other)
+	s.exec(t, "UPDATE assets SET target_lufs = -18.5 WHERE id = ?", id)
+	l := s.claimNext(t)
+
+	gotID, target, err := s.repo.leasedAsset(t.Context(), l)
+
+	if err != nil || gotID != publicID || target != -18.5 {
+		t.Errorf("leasedAsset() = %s, %v, %v; want %s, -18.5", gotID, target, err, publicID)
+	}
+	wrongTenant := lease{ID: l.ID, TenantID: other, Attempt: l.Attempt}
+	if gotID, _, err := s.repo.leasedAsset(t.Context(), wrongTenant); err != ErrNotFound {
+		t.Errorf("leasedAsset() under another tenant = %s, %v; want %v", gotID, err, ErrNotFound)
+	}
+}
+
 func TestFinish(t *testing.T) {
 	s := newLeaseStack(t)
 	tenant := s.tenant(t, "owner")
