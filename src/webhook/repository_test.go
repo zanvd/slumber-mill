@@ -246,3 +246,35 @@ func checkStatement(t *testing.T, got statement) {
 		}
 	}
 }
+
+func TestRelayLockName(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+	}{
+		{"short", "slumber_mill"},
+		{"empty", ""},
+		{"the longest MySQL allows", strings.Repeat("d", 64)},
+		{"multibyte", strings.Repeat("é", 64)},
+		{"far longer than MySQL allows", strings.Repeat("d", 10000)},
+	}
+	seen := make(map[string]string)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := relayLockName(tc.database)
+			if len(got) > 64 {
+				t.Errorf("relayLockName() is %d characters, want at most 64: %q", len(got), got)
+			}
+			if !strings.HasPrefix(got, "slumber-mill.relay.") {
+				t.Errorf("relayLockName() = %q, want the prefix slumber-mill.relay.", got)
+			}
+			if again := relayLockName(tc.database); again != got {
+				t.Errorf("relayLockName() = %q, then %q", got, again)
+			}
+			if other, ok := seen[got]; ok {
+				t.Errorf("relayLockName() = %q for %q too", got, other)
+			}
+			seen[got] = tc.name
+		})
+	}
+}
