@@ -32,6 +32,7 @@ type repo interface {
 	tenantByID(ctx context.Context, id uint64) (Tenant, error)
 	tenantByAPIKeyHash(ctx context.Context, hash [sha256.Size]byte) (Tenant, error)
 	webhook(ctx context.Context, id uint64) (sealedWebhook, error)
+	webhookTenantIDs(ctx context.Context, ids []uint64) ([]uint64, error)
 }
 
 type box interface {
@@ -160,6 +161,23 @@ func (s *Service) WebhookTarget(ctx context.Context, tenantID uint64) (Webhook, 
 		return Webhook{}, fmt.Errorf("error opening webhook secret of tenant %d: %w", tenantID, err)
 	}
 	return Webhook{URL: w.url, Secret: v}, nil
+}
+
+// WebhookTenants reports which of the tenants have a webhook URL, in one query. Tenants that don't exist
+// and tenants without a URL are absent from the result. It opens no secret, so it works without a key ring.
+func (s *Service) WebhookTenants(ctx context.Context, ids []uint64) (map[uint64]bool, error) {
+	has := make(map[uint64]bool)
+	if len(ids) == 0 {
+		return has, nil
+	}
+	found, err := s.repo.webhookTenantIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("error reading webhook tenants: %w", err)
+	}
+	for _, id := range found {
+		has[id] = true
+	}
+	return has, nil
 }
 
 // webhookSecretAAD binds a sealed secret to its row: slugs are unique, immutable and can't contain a slash.

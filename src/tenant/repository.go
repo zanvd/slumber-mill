@@ -110,6 +110,19 @@ func (r *Repository) webhook(ctx context.Context, id uint64) (sealedWebhook, err
 	return sealedWebhook{slug: row.Slug, url: stringOrEmpty(row.WebhookURL), sealed: row.WebhookSecretEnc}, nil
 }
 
+// webhookTenantIDs returns the IDs among ids of tenants that have a webhook URL.
+func (r *Repository) webhookTenantIDs(ctx context.Context, ids []uint64) ([]uint64, error) {
+	var found []uint64
+	err := r.db.WithContext(ctx).
+		Model(&tenantRow{}).
+		Where("id IN ? AND webhook_url IS NOT NULL", ids).
+		Pluck("id", &found).Error
+	if err != nil {
+		return nil, translate("error querying tenants", err)
+	}
+	return found, nil
+}
+
 func translate(msg string, err error) error {
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):

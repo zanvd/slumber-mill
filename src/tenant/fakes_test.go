@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/zanvd/slumber-mill/src/secret"
@@ -25,6 +26,8 @@ type fakeRepo struct {
 	rows  []fakeRow
 	errs  map[string]error
 	calls []string
+	// idQueries are the ID lists webhookTenantIDs got.
+	idQueries [][]uint64
 }
 
 func (f *fakeRepo) insertTenant(_ context.Context, t Tenant, hash [sha256.Size]byte, sealed []byte) (uint64, error) {
@@ -75,6 +78,21 @@ func (f *fakeRepo) webhook(_ context.Context, id uint64) (sealedWebhook, error) 
 		return sealedWebhook{}, err
 	}
 	return sealedWebhook{slug: r.tenant.Slug, url: r.tenant.WebhookURL, sealed: bytes.Clone(r.sealed)}, nil
+}
+
+func (f *fakeRepo) webhookTenantIDs(_ context.Context, ids []uint64) ([]uint64, error) {
+	f.calls = append(f.calls, "webhookTenantIDs")
+	f.idQueries = append(f.idQueries, slices.Clone(ids))
+	if err := f.errs["webhookTenantIDs"]; err != nil {
+		return nil, err
+	}
+	var found []uint64
+	for _, r := range f.rows {
+		if r.tenant.WebhookURL != "" && slices.Contains(ids, r.tenant.ID) {
+			found = append(found, r.tenant.ID)
+		}
+	}
+	return found, nil
 }
 
 func (f *fakeRepo) row(id uint64) (fakeRow, error) {

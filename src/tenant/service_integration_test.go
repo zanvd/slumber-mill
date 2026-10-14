@@ -11,10 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/zanvd/slumber-mill/src/db"
 	"github.com/zanvd/slumber-mill/src/logging"
@@ -252,6 +255,54 @@ func TestWebhookTargetIntegration(t *testing.T) {
 	if _, err := s.svc.WebhookTarget(testCtx(t), plain.ID+100); !errors.Is(err, ErrNotFound) {
 		t.Errorf("WebhookTarget(missing) error = %v, want ErrNotFound", err)
 	}
+}
+
+func TestWebhookTenantsIntegration(t *testing.T) {
+	s := newStack(t, testutil.NewDatabase(t), oldRing)
+	acme, _ := s.create(t, CreateParams{Slug: "acme", WebhookURL: testURL, TargetLUFS: -16})
+	plain, _ := s.create(t, CreateParams{Slug: "plain", TargetLUFS: -16})
+	globex, _ := s.create(t, CreateParams{Slug: "globex", WebhookURL: testURL, TargetLUFS: -16})
+	missing := globex.ID + 100
+	noKeyRing := NewService(s.repo, nil, nil)
+
+	tests := []struct {
+		name string
+		ids  []uint64
+		want map[uint64]bool
+	}{
+		{"with and without a URL", []uint64{acme.ID, plain.ID, globex.ID}, map[uint64]bool{acme.ID: true, globex.ID: true}},
+		{"missing tenant", []uint64{missing, acme.ID}, map[uint64]bool{acme.ID: true}},
+		{"only a tenant without a URL", []uint64{plain.ID}, map[uint64]bool{}},
+		{"only a missing tenant", []uint64{missing}, map[uint64]bool{}},
+		{"duplicates", []uint64{acme.ID, acme.ID, plain.ID, plain.ID}, map[uint64]bool{acme.ID: true}},
+		{"empty list", []uint64{}, map[uint64]bool{}},
+		{"nil list", nil, map[uint64]bool{}},
+	}
+	for _, tc := range tests {
+		for name, svc := range map[string]*Service{"key ring": s.svc, "no key ring": noKeyRing} {
+			t.Run(tc.name+", "+name, func(t *testing.T) {
+				got, err := svc.WebhookTenants(testCtx(t), tc.ids)
+				if err != nil {
+					t.Fatalf("WebhookTenants() error = %v", err)
+				}
+				if got == nil || !maps.Equal(got, tc.want) {
+					t.Errorf("WebhookTenants() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	}
+
+	t.Run("database error", func(t *testing.T) {
+		cancelled, cancel := context.WithCancel(testCtx(t))
+		cancel()
+		got, err := noKeyRing.WebhookTenants(cancelled, []uint64{acme.ID})
+		if !errors.Is(err, errDatabase) || got != nil {
+			t.Fatalf("WebhookTenants() = %v, %v; want nil and %v", got, err, errDatabase)
+		}
+		if _, ok := errors.AsType[*mysql.MySQLError](err); ok || errors.Is(err, context.Canceled) {
+			t.Errorf("the driver's or the context's error is reachable through %v", err)
+		}
+	})
 }
 
 // A sealed secret opens only in its own row, under any key in the ring (§13).
