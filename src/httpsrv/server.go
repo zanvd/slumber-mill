@@ -1,6 +1,7 @@
 package httpsrv
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,9 @@ type tenantService interface {
 }
 
 type assetService interface {
+	Stage(ctx context.Context, r io.Reader) (asset.Upload, error)
+	Discard(ctx context.Context, u asset.Upload)
+	Create(ctx context.Context, p asset.CreateParams) (a asset.Asset, replayed bool, err error)
 	Get(ctx context.Context, tenantID uint64, id string) (asset.Asset, error)
 	List(ctx context.Context, tenantID uint64, limit int, cursor string) (asset.Page, error)
 	OpenRendition(ctx context.Context, tenantID uint64, id, profile string) (asset.Rendition, io.ReadSeekCloser, error)
@@ -37,27 +41,38 @@ type Config struct {
 	TrustedProxies []string
 	// Readiness is pinged by /readyz; *sql.DB satisfies it.
 	Readiness pinger
+	// MaxUploadBytes caps an upload's whole request body. Zero means DefaultMaxUploadBytes.
+	MaxUploadBytes int64
+	// MaxUploadsPerTenant caps each tenant's concurrent uploads. Zero means DefaultMaxUploadsPerTenant.
+	MaxUploadsPerTenant int
 }
 
 type Server struct {
-	log       *slog.Logger
-	tenants   tenantService
-	assets    assetService
-	readiness pinger
-	engine    *gin.Engine
-	draining  atomic.Bool
+	log            *slog.Logger
+	tenants        tenantService
+	assets         assetService
+	readiness      pinger
+	maxUploadBytes int64
+	uploads        *uploadSlots
+	engine         *gin.Engine
+	draining       atomic.Bool
 }
 
 func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg Config) (*Server, error) {
 	if log == nil || tenants == nil || assets == nil || cfg.Readiness == nil {
 		return nil, errors.New("error creating HTTP server: logger, services and readiness check are required")
 	}
+	if cfg.MaxUploadBytes < 0 || cfg.MaxUploadsPerTenant < 0 {
+		return nil, errors.New("error creating HTTP server: upload limits must not be negative")
+	}
 	s := &Server{
-		log:       log,
-		tenants:   tenants,
-		assets:    assets,
-		readiness: cfg.Readiness,
-		engine:    gin.New(),
+		log:            log,
+		tenants:        tenants,
+		assets:         assets,
+		readiness:      cfg.Readiness,
+		maxUploadBytes: cmp.Or(cfg.MaxUploadBytes, DefaultMaxUploadBytes),
+		uploads:        newUploadSlots(cmp.Or(cfg.MaxUploadsPerTenant, DefaultMaxUploadsPerTenant)),
+		engine:         gin.New(),
 	}
 	// Gin trusts every proxy until this is called; nil trusts none.
 	if err := s.engine.SetTrustedProxies(cfg.TrustedProxies); err != nil {
@@ -70,6 +85,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 	s.engine.GET("/readyz", s.readyz)
 
 	v1 := s.engine.Group("/v1", s.authenticate)
+	v1.POST("/assets", s.createAsset)
 	v1.GET("/assets", s.listAssets)
 	v1.GET("/assets/:id", s.getAsset)
 	v1.GET("/assets/:id/renditions/:profile", s.getRendition)

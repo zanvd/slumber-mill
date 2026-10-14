@@ -135,6 +135,12 @@ func TestNewServer(t *testing.T) {
 			cfg: Config{Readiness: &fakePinger{}, TrustedProxies: []string{"10.0.0.0/8", "fd00::/8", "192.0.2.1"}}},
 		{name: "bad proxy", tenants: &fakeTenants{}, assets: &fakeAssets{},
 			cfg: Config{Readiness: &fakePinger{}, TrustedProxies: []string{"not-a-cidr"}}, wantErr: true},
+		{name: "upload limits", tenants: &fakeTenants{}, assets: &fakeAssets{},
+			cfg: Config{Readiness: &fakePinger{}, MaxUploadBytes: 1 << 20, MaxUploadsPerTenant: 1}},
+		{name: "negative upload bytes", tenants: &fakeTenants{}, assets: &fakeAssets{},
+			cfg: Config{Readiness: &fakePinger{}, MaxUploadBytes: -1}, wantErr: true},
+		{name: "negative uploads per tenant", tenants: &fakeTenants{}, assets: &fakeAssets{},
+			cfg: Config{Readiness: &fakePinger{}, MaxUploadsPerTenant: -1}, wantErr: true},
 		{name: "no readiness", tenants: &fakeTenants{}, assets: &fakeAssets{}, wantErr: true},
 		{name: "no tenants", assets: &fakeAssets{}, cfg: ok, wantErr: true},
 		{name: "no assets", tenants: &fakeTenants{}, cfg: ok, wantErr: true},
@@ -248,6 +254,15 @@ func TestErrorMapping(t *testing.T) {
 		{name: "idempotency key reused", err: asset.ErrIdempotencyKeyReused,
 			wantStatus: http.StatusUnprocessableEntity,
 			want:       apiv1.NewError("idempotency_key_reused", "idempotency key already used for a different upload")},
+		{name: "upload too large", err: fmt.Errorf("%w: http: request body too large", errUploadTooLarge),
+			wantStatus: http.StatusRequestEntityTooLarge,
+			want:       apiv1.NewError("file_too_large", "upload exceeds the size limit")},
+		{name: "upload stalled", err: errUploadStalled, wantStatus: http.StatusRequestTimeout,
+			want: apiv1.NewError("request_timeout", "timed out waiting for the upload")},
+		{name: "too many uploads", err: errTooManyUploads, wantStatus: http.StatusTooManyRequests,
+			want: apiv1.NewError("too_many_uploads", "too many uploads in progress")},
+		{name: "malformed upload", err: fmt.Errorf("%w: unexpected EOF", errMalformedUpload),
+			wantStatus: http.StatusBadRequest, want: apiv1.NewError("invalid_request", "malformed multipart body")},
 		{name: "anything else", err: fmt.Errorf("error getting asset: %w: dial tcp 10.0.0.3:3306: secret detail", errBoom),
 			wantStatus: http.StatusInternalServerError, want: internalError()},
 	}
@@ -307,7 +322,7 @@ func TestClientGone(t *testing.T) {
 			defer cancel()
 			if tt.cancel {
 				// net/http cancels the request's context when the client hangs up mid-request.
-				f.assets.onCall = cancel
+				f.assets.onCall = func(assetCall) { cancel() }
 			}
 
 			w := f.serve(authed("/v1/assets").WithContext(ctx))
