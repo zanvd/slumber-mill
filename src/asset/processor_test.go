@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -22,8 +23,10 @@ import (
 	"github.com/zanvd/slumber-mill/src/worker"
 )
 
-// claimed is the lease the pool hands the processor in these tests.
+// claimed is the lease the pool hands the processor in these tests, for processorLease.
 var claimed = worker.Lease{ID: 11, TenantID: tenantID, Attempt: 2}
+
+const processorLease = time.Minute
 
 type processorFixture struct {
 	p     *Processor
@@ -45,7 +48,7 @@ func newProcessorFixture(t *testing.T) *processorFixture {
 		calls: c,
 		root:  root,
 	}
-	p, err := NewProcessor(f.repo, f.files, f.tc, ProcessorConfig{WorkerID: "encode-1", Lease: time.Minute})
+	p, err := NewProcessor(f.repo, f.files, f.tc, ProcessorConfig{WorkerID: "encode-1", Lease: processorLease})
 	if err != nil {
 		t.Fatalf("NewProcessor() error = %v", err)
 	}
@@ -74,6 +77,7 @@ func TestNewProcessor(t *testing.T) {
 		{"no worker ID", repo, files, tr, ProcessorConfig{Lease: time.Minute}},
 		{"no lease", repo, files, tr, ProcessorConfig{WorkerID: "encode-1"}},
 		{"negative lease", repo, files, tr, ProcessorConfig{WorkerID: "encode-1", Lease: -time.Second}},
+		{"lease too short to refresh", repo, files, tr, ProcessorConfig{WorkerID: "encode-1", Lease: 2}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -111,7 +115,7 @@ func TestProcessorClaim(t *testing.T) {
 				t.Errorf("Claim() = %+v, %t, %v; want %+v, %t, %v", got, ok, err, tc.want, tc.wantOK, tc.wantErr)
 			}
 			if !slices.Equal(f.repo.workerIDs, []string{"encode-1"}) ||
-				!slices.Equal(f.repo.durations, []time.Duration{time.Minute}) {
+				!slices.Equal(f.repo.durations, []time.Duration{processorLease}) {
 				t.Errorf("claim() got worker IDs %v and leases %v, want encode-1 for 1m",
 					f.repo.workerIDs, f.repo.durations)
 			}
@@ -135,7 +139,7 @@ func TestProcessorExtendAndRelease(t *testing.T) {
 	if want := []lease{lease(claimed), lease(claimed)}; !slices.Equal(f.repo.leases, want) {
 		t.Errorf("leases = %+v, want %+v", f.repo.leases, want)
 	}
-	if want := []time.Duration{time.Minute}; !slices.Equal(f.repo.durations, want) {
+	if want := []time.Duration{processorLease}; !slices.Equal(f.repo.durations, want) {
 		t.Errorf("extend() got %v, want %v", f.repo.durations, want)
 	}
 }
@@ -360,6 +364,147 @@ func TestProcessorContexts(t *testing.T) {
 		}
 		if f.repo.finishLog != log {
 			t.Error("finish's context lost the work's logger")
+		}
+	})
+}
+
+// TestProcessorKeepsTempOutputsFresh has the transcoder hold the temp outputs for three leases before pass 2
+// writes them and for three after: whenever the startup sweep looks, each was modified less than a lease ago.
+func TestProcessorKeepsTempOutputsFresh(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newProcessorFixture(t)
+		// New files get the real time, decades after the bubble's clock starts. Moving the clock there
+		// makes a file that nothing refreshes age as the clock advances.
+		info, err := os.Stat(f.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Until(info.ModTime()))
+		checkFresh := func(outputs []audio.Output) {
+			for _, o := range outputs {
+				info, err := os.Stat(o.Path)
+				if err != nil {
+					t.Errorf("error reading %s: %v", o.Path, err)
+					continue
+				}
+				if age := time.Since(info.ModTime()); age < 0 || age >= processorLease {
+					t.Errorf("at %v, %s was modified %v ago, want less than a lease", time.Now(),
+						filepath.Base(o.Path), age)
+				}
+			}
+		}
+		f.tc.render = func(_ context.Context, outputs []audio.Output) (audio.Result, error) {
+			for range 6 {
+				synctest.Sleep(processorLease / 2)
+				checkFresh(outputs)
+			}
+			res, err := fakeRender(outputs)
+			for range 6 {
+				synctest.Sleep(processorLease / 2)
+				checkFresh(outputs)
+			}
+			return res, err
+		}
+
+		if err := f.p.Process(t.Context(), claimed); err != nil {
+			t.Fatalf("Process() error = %v", err)
+		}
+	})
+}
+
+// TestProcessorStopsRefreshing lets the processor refresh its temp outputs for a lease, then checks that nothing
+// is touched once Process has returned, however it ended. A refresher left running would also deadlock the bubble.
+func TestProcessorStopsRefreshing(t *testing.T) {
+	tests := []struct {
+		name                     string
+		transcodeErr, promoteErr error
+	}{
+		{"after success", nil, nil},
+		{"after a transcoder error", errBoom, nil},
+		{"after promoting fails", nil, errBoom},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newProcessorFixture(t)
+				f.files.errs["Promote"] = tc.promoteErr
+				f.tc.render = func(_ context.Context, outputs []audio.Output) (audio.Result, error) {
+					synctest.Sleep(processorLease)
+					res, err := fakeRender(outputs)
+					if tc.transcodeErr != nil {
+						return audio.Result{}, tc.transcodeErr
+					}
+					return res, err
+				}
+
+				err := f.p.Process(t.Context(), claimed)
+				touched := f.files.touches()
+				synctest.Sleep(3 * processorLease)
+
+				if wantErr := tc.transcodeErr != nil || tc.promoteErr != nil; (err != nil) != wantErr {
+					t.Errorf("Process() error = %v, want an error: %t", err, wantErr)
+				}
+				if len(touched) == 0 {
+					t.Error("nothing was touched while Process ran")
+				}
+				if after := f.files.touches(); len(after) != len(touched) {
+					t.Errorf("touched %v after Process returned", after[len(touched):])
+				}
+			})
+		})
+	}
+}
+
+func TestProcessorIgnoresFailedTouches(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newProcessorFixture(t)
+		f.files.errs["Touch"] = errBoom
+		f.tc.render = func(_ context.Context, outputs []audio.Output) (audio.Result, error) {
+			synctest.Sleep(processorLease)
+			return fakeRender(outputs)
+		}
+		var logs bytes.Buffer
+		ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil)))
+
+		if err := f.p.Process(ctx, claimed); err != nil {
+			t.Fatalf("Process() error = %v", err)
+		}
+
+		if len(f.repo.finished) != 1 {
+			t.Errorf("finished %d times, want once", len(f.repo.finished))
+		}
+		touched := f.files.touches()
+		warnings := strings.Count(logs.String(), `"msg":"error refreshing temp output"`)
+		if len(touched) == 0 || warnings != len(touched) || !strings.Contains(logs.String(), "boom") {
+			t.Errorf("%d touches and logs %s; want a warning with the error for each touch", len(touched), logs.String())
+		}
+	})
+}
+
+// TestProcessorSkipsPromotedOutputs holds the hash of the second rendition for a lease, after the first has been
+// promoted: only the second temp output is touched meanwhile.
+func TestProcessorSkipsPromotedOutputs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newProcessorFixture(t)
+		f.files.beforeOpen = func(path string) {
+			if path == f.tc.outputs[1].Path {
+				synctest.Sleep(processorLease)
+			}
+		}
+		var logs bytes.Buffer
+		ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil)))
+
+		if err := f.p.Process(ctx, claimed); err != nil {
+			t.Fatalf("Process() error = %v", err)
+		}
+
+		second := f.tc.outputs[1].Path
+		touched := f.files.touches()
+		if len(touched) == 0 || slices.ContainsFunc(touched, func(path string) bool { return path != second }) {
+			t.Errorf("touched %v, want only %s, which wasn't promoted yet", touched, second)
+		}
+		if logs.Len() > 0 {
+			t.Errorf("logs = %s, want none", logs.String())
 		}
 	})
 }

@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"slices"
+	"sync"
 	"time"
 	"uuid"
 
@@ -41,6 +43,7 @@ type renditionStore interface {
 	Open(path string) (io.ReadSeekCloser, error)
 	Promote(tmp, final string) error
 	Remove(path string) error
+	Touch(path string) error
 }
 
 type transcoder interface {
@@ -73,8 +76,8 @@ func NewProcessor(r leaseRepo, files renditionStore, tc transcoder, cfg Processo
 		return nil, errors.New("a transcoder is required")
 	case cfg.WorkerID == "":
 		return nil, errors.New("a worker ID is required")
-	case cfg.Lease <= 0:
-		return nil, fmt.Errorf("lease %v is not positive", cfg.Lease)
+	case cfg.Lease/3 <= 0:
+		return nil, fmt.Errorf("lease %v is too short", cfg.Lease)
 	}
 	return &Processor{repo: r, files: files, tc: tc, cfg: cfg, profiles: audio.Profiles()}, nil
 }
@@ -118,7 +121,10 @@ func (p *Processor) Process(ctx context.Context, l worker.Lease) error {
 func (p *Processor) render(ctx context.Context, l lease, assetID uuid.UUID, targetLUFS float64) (processed, error) {
 	outputs := make([]audio.Output, 0, len(p.profiles))
 	promoted := 0
+	var held heldFiles
+	stopRefreshing := p.keepFresh(ctx, &held)
 	defer func() {
+		stopRefreshing()
 		for _, o := range outputs[promoted:] {
 			p.remove(ctx, o.Path)
 		}
@@ -129,6 +135,7 @@ func (p *Processor) render(ctx context.Context, l lease, assetID uuid.UUID, targ
 		if err != nil {
 			return processed{}, fmt.Errorf("error creating a temp output: %w", err)
 		}
+		held.hold(f.Name())
 		outputs = append(outputs, audio.Output{Profile: profile, Path: f.Name()})
 		if err := f.Close(); err != nil {
 			return processed{}, fmt.Errorf("error closing a temp output: %w", err)
@@ -153,6 +160,7 @@ func (p *Processor) render(ctx context.Context, l lease, assetID uuid.UUID, targ
 		if err != nil {
 			return processed{}, fmt.Errorf("error locating rendition %s: %w", r.Profile.Name, err)
 		}
+		held.release(r.Path)
 		if err := p.files.Promote(r.Path, final); err != nil {
 			return processed{}, fmt.Errorf("error promoting rendition %s: %w", r.Profile.Name, err)
 		}
@@ -160,6 +168,61 @@ func (p *Processor) render(ctx context.Context, l lease, assetID uuid.UUID, targ
 		out.Renditions = append(out.Renditions, newRendition(r, sum, size))
 	}
 	return out, nil
+}
+
+// keepFresh touches the held files every lease/3 until the returned stop has returned. The startup sweep
+// removes temp files older than the lease, and nothing writes the outputs through pass 1 or verification.
+func (p *Processor) keepFresh(ctx context.Context, held *heldFiles) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		t := time.NewTicker(p.cfg.Lease / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				held.each(func(path string) {
+					if err := p.files.Touch(path); err != nil {
+						logging.LoggerFromContext(ctx).LogAttrs(ctx, slog.LevelWarn, "error refreshing temp output",
+							slog.String("path", path), slog.String("error", err.Error()))
+					}
+				})
+			}
+		}
+	})
+	return func() {
+		close(done)
+		wg.Wait()
+	}
+}
+
+// heldFiles are the temp outputs that keepFresh touches.
+type heldFiles struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (h *heldFiles) hold(path string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.paths = append(h.paths, path)
+}
+
+// release stops refreshing path, after any touch under way has finished.
+func (h *heldFiles) release(path string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.paths = slices.DeleteFunc(h.paths, func(held string) bool { return held == path })
+}
+
+func (h *heldFiles) each(fn func(path string)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, path := range h.paths {
+		fn(path)
+	}
 }
 
 // matchOutputs checks that the transcoder rendered the outputs it was given, in order,

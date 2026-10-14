@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"uuid"
@@ -183,11 +184,19 @@ type fakeFiles struct {
 	errs  map[string]error
 	// errAfter lets a method succeed that many times before it fails with its error in errs.
 	errAfter map[string]int
-	made     map[string]int
+	// beforeOpen, if set, runs as Open starts.
+	beforeOpen func(path string)
+
+	// mu guards what Touch shares, since the processor touches files from another goroutine.
+	mu      sync.Mutex
+	made    map[string]int
+	touched []string
 }
 
 // fail counts a call to method and returns the error it fails with, if any.
 func (f *fakeFiles) fail(method string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.made == nil {
 		f.made = make(map[string]int)
 	}
@@ -232,10 +241,31 @@ func (f *fakeFiles) Promote(tmp, final string) error {
 
 func (f *fakeFiles) Open(path string) (io.ReadSeekCloser, error) {
 	f.calls.add("Open")
+	if f.beforeOpen != nil {
+		f.beforeOpen(path)
+	}
 	if err := f.fail("Open"); err != nil {
 		return nil, err
 	}
 	return os.Open(path)
+}
+
+// Touch records every path it is asked to touch, and unless it fails, sets the file's modification time to now
+// as storage.Local does.
+func (f *fakeFiles) Touch(path string) error {
+	f.mu.Lock()
+	f.touched = append(f.touched, path)
+	f.mu.Unlock()
+	if err := f.fail("Touch"); err != nil {
+		return err
+	}
+	return os.Chtimes(path, time.Time{}, time.Now())
+}
+
+func (f *fakeFiles) touches() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.touched)
 }
 
 // Remove records which directory under the root the file was in: Remove tmp, Remove sources.
