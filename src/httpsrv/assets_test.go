@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -232,5 +233,27 @@ func wantJSON(t *testing.T, body []byte, want any) {
 	}
 	if got := strings.TrimSpace(string(body)); got != string(wantBody) {
 		t.Errorf("body = %s\nwant %s", got, wantBody)
+	}
+}
+
+func TestGetRenditionSeekFailure(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.assets.rendition = asset.Rendition{Profile: asset.ProfileAAC128k, CreatedAt: created}
+	f.assets.content = []byte("0123456789abcdef")
+	f.assets.seekErr = errors.New("disk on fire")
+	w := f.serve(authed("/v1/assets/" + uuid.NewV7().String() + "/renditions/aac_128k"))
+
+	wantErrorBody(t, w, http.StatusInternalServerError, internalError())
+	line := f.logLine(t, "request failed")
+	if got, _ := line["error"].(string); !strings.Contains(got, "seeker can't seek") {
+		t.Errorf("logged error = %q, want the ServeContent cause", got)
+	}
+	if strings.Contains(w.Body.String(), "seek") {
+		t.Errorf("body = %q, leaks the cause", w.Body)
+	}
+	for i, file := range f.assets.files {
+		if !file.closed {
+			t.Errorf("file %d not closed", i)
+		}
 	}
 }

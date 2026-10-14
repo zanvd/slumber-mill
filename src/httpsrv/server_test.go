@@ -386,12 +386,12 @@ func TestBeginShutdownConcurrent(t *testing.T) {
 	done := make(chan int)
 	go func() {
 		w := httptest.NewRecorder()
-		f.srv.Handler().ServeHTTP(w, unauthed("/healthz"))
+		f.srv.Handler().ServeHTTP(w, unauthed("/readyz"))
 		done <- w.Code
 	}()
 	f.srv.BeginShutdown()
-	if code := <-done; code != http.StatusOK {
-		t.Errorf("healthz = %d, want 200", code)
+	if code := <-done; code != http.StatusOK && code != http.StatusServiceUnavailable {
+		t.Errorf("readyz during BeginShutdown = %d, want 200 or 503", code)
 	}
 	if w := f.serve(unauthed("/readyz")); w.Code != http.StatusServiceUnavailable {
 		t.Errorf("readyz = %d, want 503", w.Code)

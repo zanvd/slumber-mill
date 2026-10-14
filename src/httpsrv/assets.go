@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -58,7 +59,9 @@ func (s *Server) getRendition(c *gin.Context) {
 	h.Set("Content-Type", "audio/mp4")
 	h.Set("ETag", `"`+hex.EncodeToString(r.SHA256[:])+`"`)
 	h.Set("Cache-Control", "private, max-age=31536000, immutable")
-	http.ServeContent(&serveContentWriter{ResponseWriter: c.Writer, s: s, c: c}, c.Request, "", r.CreatedAt, f)
+	w := &serveContentWriter{ResponseWriter: c.Writer, s: s, c: c}
+	http.ServeContent(w, c.Request, "", r.CreatedAt, f)
+	w.flush()
 }
 
 // serveContentWriter turns the error responses http.ServeContent writes itself (412, 416 and 500)
@@ -68,7 +71,10 @@ type serveContentWriter struct {
 	s      *Server
 	c      *gin.Context
 	failed bool
+	status int
 }
+
+const maxCauseLen = 200
 
 func (w *serveContentWriter) WriteHeader(status int) {
 	if status < http.StatusBadRequest {
@@ -80,20 +86,37 @@ func (w *serveContentWriter) WriteHeader(status int) {
 	for _, k := range []string{"Content-Type", "Content-Length", "Cache-Control", "ETag", "Last-Modified"} {
 		h.Del(k)
 	}
-	var err error
 	switch status {
 	case http.StatusPreconditionFailed:
-		err = errPreconditionFailed
+		w.s.writeError(w.c, errPreconditionFailed)
 	case http.StatusRequestedRangeNotSatisfiable:
-		err = errRangeNotSatisfiable
+		w.s.writeError(w.c, errRangeNotSatisfiable)
 	default:
-		err = fmt.Errorf("error serving rendition: status %d", status)
+		// http.Error writes the cause after the status, so the error is reported on the first Write.
+		w.status = status
 	}
-	w.s.writeError(w.c, err)
+}
+
+func (w *serveContentWriter) report(cause string) {
+	status := w.status
+	w.status = 0
+	if len(cause) > maxCauseLen {
+		cause = cause[:maxCauseLen]
+	}
+	w.s.writeError(w.c, fmt.Errorf("error serving rendition: status %d: %s", status, strings.TrimSpace(cause)))
+}
+
+func (w *serveContentWriter) flush() {
+	if w.status != 0 {
+		w.report("")
+	}
 }
 
 func (w *serveContentWriter) Write(p []byte) (int, error) {
 	if w.failed {
+		if w.status != 0 {
+			w.report(string(p))
+		}
 		return len(p), nil
 	}
 	return w.ResponseWriter.Write(p)

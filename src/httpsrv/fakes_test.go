@@ -47,6 +47,7 @@ type fakeAssets struct {
 	page      asset.Page
 	rendition asset.Rendition
 	content   []byte
+	seekErr   error
 	err       error
 	panicOnce any
 	onCall    func()
@@ -87,14 +88,22 @@ func (f *fakeAssets) OpenRendition(ctx context.Context, tenantID uint64, id, pro
 	if err != nil {
 		return asset.Rendition{}, nil, err
 	}
-	file := &fakeFile{Reader: bytes.NewReader(f.content)}
+	file := &fakeFile{Reader: bytes.NewReader(f.content), seekErr: f.seekErr}
 	f.files = append(f.files, file)
 	return f.rendition, file, nil
 }
 
 type fakeFile struct {
 	*bytes.Reader
-	closed bool
+	seekErr error
+	closed  bool
+}
+
+func (f *fakeFile) Seek(offset int64, whence int) (int64, error) {
+	if f.seekErr != nil {
+		return 0, f.seekErr
+	}
+	return f.Reader.Seek(offset, whence)
 }
 
 func (f *fakeFile) Close() error {

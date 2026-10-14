@@ -59,7 +59,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 		readiness: cfg.Readiness,
 		engine:    gin.New(),
 	}
-	// Gin trusts every proxy until this is called (pitfall 2); nil trusts none.
+	// Gin trusts every proxy until this is called; nil trusts none.
 	if err := s.engine.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		return nil, fmt.Errorf("error setting trusted proxies: %w", err)
 	}
@@ -81,7 +81,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 // BeginShutdown makes /readyz fail while every other route keeps serving, so a load balancer
-// can take the node out before the listener closes (pitfall 28).
+// can take the node out before the listener closes.
 func (s *Server) BeginShutdown() {
 	s.draining.Store(true)
 }
