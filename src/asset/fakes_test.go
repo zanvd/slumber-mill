@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,9 @@ import (
 	"testing"
 	"time"
 	"uuid"
+
+	"github.com/zanvd/slumber-mill/src/audio"
+	"github.com/zanvd/slumber-mill/src/logging"
 )
 
 // fakeNow stands in for MySQL's clock, so a test can tell a re-read asset from the one the service built.
@@ -177,11 +181,26 @@ type fakeFiles struct {
 	calls *calls
 	root  string
 	errs  map[string]error
+	// errAfter lets a method succeed that many times before it fails with its error in errs.
+	errAfter map[string]int
+	made     map[string]int
+}
+
+// fail counts a call to method and returns the error it fails with, if any.
+func (f *fakeFiles) fail(method string) error {
+	if f.made == nil {
+		f.made = make(map[string]int)
+	}
+	f.made[method]++
+	if f.made[method] <= f.errAfter[method] {
+		return nil
+	}
+	return f.errs[method]
 }
 
 func (f *fakeFiles) TempFile() (*os.File, error) {
 	f.calls.add("TempFile")
-	if err := f.errs["TempFile"]; err != nil {
+	if err := f.fail("TempFile"); err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(f.root, "tmp")
@@ -202,7 +221,7 @@ func (f *fakeFiles) RenditionPath(tenantID uint64, assetID uuid.UUID, profile st
 
 func (f *fakeFiles) Promote(tmp, final string) error {
 	f.calls.add("Promote")
-	if err := f.errs["Promote"]; err != nil {
+	if err := f.fail("Promote"); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(final), 0o750); err != nil {
@@ -213,6 +232,9 @@ func (f *fakeFiles) Promote(tmp, final string) error {
 
 func (f *fakeFiles) Open(path string) (io.ReadSeekCloser, error) {
 	f.calls.add("Open")
+	if err := f.fail("Open"); err != nil {
+		return nil, err
+	}
 	return os.Open(path)
 }
 
@@ -224,7 +246,7 @@ func (f *fakeFiles) Remove(path string) error {
 	}
 	dir, _, _ := strings.Cut(filepath.ToSlash(rel), "/")
 	f.calls.add("Remove " + dir)
-	if err := f.errs["Remove"]; err != nil {
+	if err := f.fail("Remove"); err != nil {
 		return err
 	}
 	return os.Remove(path)
@@ -246,4 +268,151 @@ func filesUnder(t *testing.T, root string) []string {
 		t.Fatalf("error listing files: %v", err)
 	}
 	return files
+}
+
+// fakeLeaseRepo is the processor's repository. It records what each call got, and like a database driver,
+// every method fails once its context is done.
+type fakeLeaseRepo struct {
+	calls *calls
+	errs  map[string]error
+	// due is the lease claim hands out; nil means nothing is due.
+	due *lease
+	// assetID and targetLUFS are what leasedAsset returns.
+	assetID    uuid.UUID
+	targetLUFS float64
+	// requeued and failed are what reap returns.
+	requeued, failed int
+
+	workerIDs []string
+	// durations are the lease durations claim and extend got.
+	durations []time.Duration
+	// leases are the leases every other method got.
+	leases   []lease
+	finished []processed
+	failures []failure
+	// finishAt is when finish was called, and finishDeadline and finishLog are what its context carried.
+	finishAt, finishDeadline time.Time
+	finishLog                *slog.Logger
+}
+
+func (f *fakeLeaseRepo) err(ctx context.Context, method string) error {
+	f.calls.add(method)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.errs[method]
+}
+
+func (f *fakeLeaseRepo) claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error) {
+	f.workerIDs = append(f.workerIDs, workerID)
+	f.durations = append(f.durations, d)
+	if err := f.err(ctx, "claim"); err != nil {
+		return lease{}, false, err
+	}
+	if f.due == nil {
+		return lease{}, false, nil
+	}
+	return *f.due, true, nil
+}
+
+func (f *fakeLeaseRepo) extend(ctx context.Context, l lease, d time.Duration) error {
+	f.leases = append(f.leases, l)
+	f.durations = append(f.durations, d)
+	return f.err(ctx, "extend")
+}
+
+func (f *fakeLeaseRepo) leasedAsset(ctx context.Context, l lease) (uuid.UUID, float64, error) {
+	f.leases = append(f.leases, l)
+	if err := f.err(ctx, "leasedAsset"); err != nil {
+		return uuid.UUID{}, 0, err
+	}
+	return f.assetID, f.targetLUFS, nil
+}
+
+func (f *fakeLeaseRepo) finish(ctx context.Context, l lease, p processed) error {
+	f.leases = append(f.leases, l)
+	f.finished = append(f.finished, p)
+	f.finishAt = time.Now()
+	f.finishDeadline, _ = ctx.Deadline()
+	f.finishLog = logging.LoggerFromContext(ctx)
+	return f.err(ctx, "finish")
+}
+
+func (f *fakeLeaseRepo) fail(ctx context.Context, l lease, fl failure) (bool, error) {
+	f.leases = append(f.leases, l)
+	f.failures = append(f.failures, fl)
+	if err := f.err(ctx, "fail"); err != nil {
+		return false, err
+	}
+	return fl.Permanent, nil
+}
+
+func (f *fakeLeaseRepo) release(ctx context.Context, l lease) error {
+	f.leases = append(f.leases, l)
+	return f.err(ctx, "release")
+}
+
+func (f *fakeLeaseRepo) reap(ctx context.Context) (int, int, error) {
+	if err := f.err(ctx, "reap"); err != nil {
+		return 0, 0, err
+	}
+	return f.requeued, f.failed, nil
+}
+
+// fakeTranscoder records what it was asked for, and renders with render, or with fakeRender if render is nil.
+type fakeTranscoder struct {
+	calls  *calls
+	render func(ctx context.Context, outputs []audio.Output) (audio.Result, error)
+
+	src        string
+	targetLUFS float64
+	outputs    []audio.Output
+	// deadline is the deadline of the context Process got.
+	deadline time.Time
+}
+
+func (f *fakeTranscoder) Process(ctx context.Context, src string, targetLUFS float64, outputs []audio.Output) (
+	audio.Result, error) {
+	if f.calls != nil {
+		f.calls.add("Process")
+	}
+	f.src, f.targetLUFS, f.outputs = src, targetLUFS, slices.Clone(outputs)
+	f.deadline, _ = ctx.Deadline()
+	if f.render != nil {
+		return f.render(ctx, outputs)
+	}
+	return fakeRender(outputs)
+}
+
+// fakeRender writes fakeRendering to each output and returns a result for them, as audio would:
+// stereo renders linear and mono dynamic, and each rendition's measurement differs from its loudness.
+func fakeRender(outputs []audio.Output) (audio.Result, error) {
+	res := audio.Result{
+		Source: audio.Source{Codec: "flac", SampleRate: 44_100, Channels: 2, Duration: 600_500 * time.Millisecond},
+		Input:  audio.Input{LUFS: -23.45, TruePeakDBTP: -0.25, LRALU: 7.5, MaxMomentaryLUFS: -10.5},
+		Warnings: []audio.Warning{
+			audio.WarningSuddenLoudEvent, audio.WarningDynamicNormalization, audio.WarningSourceMayClip,
+		},
+	}
+	for _, o := range outputs {
+		if err := os.WriteFile(o.Path, []byte(fakeRendering(o.Profile.Name)), 0o640); err != nil {
+			return audio.Result{}, err
+		}
+		r := audio.Rendition{
+			Profile: o.Profile, Path: o.Path, Channels: 2,
+			Measured:  audio.Loudness{LUFS: -24.1, TruePeakDBTP: -3.2, LRALU: 6.5},
+			Predicted: audio.Dynamic, Normalization: audio.Linear,
+			Loudness: audio.Loudness{LUFS: -16.03, TruePeakDBTP: -1.52, LRALU: 4.1},
+		}
+		if o.Profile.MaxChannels == 1 {
+			r.Channels, r.Predicted, r.Normalization = 1, audio.Linear, audio.Dynamic
+			r.Loudness = audio.Loudness{LUFS: -15.76, TruePeakDBTP: -1.61, LRALU: 3.9}
+		}
+		res.Renditions = append(res.Renditions, r)
+	}
+	return res, nil
+}
+
+func fakeRendering(profile string) string {
+	return profile + " rendition"
 }
