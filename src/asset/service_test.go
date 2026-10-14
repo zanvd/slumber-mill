@@ -884,6 +884,117 @@ func TestOpenRendition(t *testing.T) {
 	})
 }
 
+func testEvents(n int) []Event {
+	events := make([]Event, n)
+	for i := range events {
+		events[i] = Event{
+			ID: uuid.NewV7(), TenantID: tenantID, Type: EventReady, CreatedAt: fakeNow,
+			Asset: stored(tenantID, "Rain "+strconv.Itoa(i), "audio", ""),
+		}
+	}
+	return events
+}
+
+func TestUnrelayedEvents(t *testing.T) {
+	events := testEvents(3)
+	tests := []struct {
+		limit int
+		want  []Event
+	}{
+		{1, events[:1]},
+		{2, events[:2]},
+		{3, events},
+		{MaxEventBatch, events},
+	}
+	for _, tc := range tests {
+		t.Run("limit "+strconv.Itoa(tc.limit), func(t *testing.T) {
+			f := newFixture(t)
+			f.repo.events = events
+
+			got, err := f.svc.UnrelayedEvents(t.Context(), tc.limit)
+
+			if err != nil {
+				t.Fatalf("UnrelayedEvents() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("UnrelayedEvents() = %+v, want %+v", got, tc.want)
+			}
+			if want := []int{tc.limit}; !slices.Equal(f.repo.eventLimits, want) {
+				t.Errorf("repository read with limits %v, want %v", f.repo.eventLimits, want)
+			}
+		})
+	}
+}
+
+func TestUnrelayedEventsRejectsInvalidLimits(t *testing.T) {
+	for _, limit := range []int{0, -1, MaxEventBatch + 1, math.MaxInt, math.MinInt} {
+		t.Run("limit "+strconv.Itoa(limit), func(t *testing.T) {
+			f := newFixture(t)
+			f.repo.events = testEvents(1)
+
+			events, err := f.svc.UnrelayedEvents(t.Context(), limit)
+
+			if err == nil || events != nil {
+				t.Errorf("UnrelayedEvents() = %+v, %v; want an error", events, err)
+			}
+			if len(f.calls.list) > 0 {
+				t.Errorf("calls = %v, want none", f.calls.list)
+			}
+		})
+	}
+}
+
+func TestMarkRelayed(t *testing.T) {
+	tests := []struct {
+		name      string
+		n         int
+		wantErr   bool
+		wantCalls []string
+	}{
+		{"none", 0, false, nil},
+		{"one", 1, false, []string{"markRelayed"}},
+		{"a full batch", MaxEventBatch, false, []string{"markRelayed"}},
+		{"more than a batch", MaxEventBatch + 1, true, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			var ids []uuid.UUID
+			for range tc.n {
+				ids = append(ids, uuid.NewV7())
+			}
+
+			err := f.svc.MarkRelayed(t.Context(), ids)
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("MarkRelayed() error = %v, want an error: %t", err, tc.wantErr)
+			}
+			if !slices.Equal(f.calls.list, tc.wantCalls) {
+				t.Errorf("calls = %v, want %v", f.calls.list, tc.wantCalls)
+			}
+			if tc.wantCalls != nil && !reflect.DeepEqual(f.repo.markedIDs, [][]uuid.UUID{ids}) {
+				t.Errorf("repository marked %v, want %v", f.repo.markedIDs, ids)
+			}
+		})
+	}
+}
+
+func TestEventMethodsWrapRepositoryErrors(t *testing.T) {
+	f := newFixture(t)
+	f.repo.events = testEvents(1)
+	f.repo.errs["unrelayedEvents"] = errBoom
+	f.repo.errs["markRelayed"] = errBoom
+
+	events, err := f.svc.UnrelayedEvents(t.Context(), 1)
+	if !errors.Is(err, errBoom) || !strings.HasPrefix(err.Error(), "error reading unrelayed events: ") || events != nil {
+		t.Errorf("UnrelayedEvents() = %+v, %v; want %v wrapped", events, err, errBoom)
+	}
+	err = f.svc.MarkRelayed(t.Context(), []uuid.UUID{f.repo.events[0].ID})
+	if !errors.Is(err, errBoom) || !strings.HasPrefix(err.Error(), "error marking events relayed: ") {
+		t.Errorf("MarkRelayed() error = %v, want %v wrapped", err, errBoom)
+	}
+}
+
 func fields(name, message string) []validation.Field {
 	return []validation.Field{{Name: name, Message: message}}
 }

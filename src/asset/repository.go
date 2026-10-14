@@ -213,6 +213,68 @@ func renditionsOf(tenantID uint64) func(*gorm.DB) *gorm.DB {
 	}
 }
 
+// unrelayedEvents returns up to limit events not yet marked relayed, oldest first, each with its asset as it is now.
+// Each asset is read under its event's tenant, so an event can't carry another tenant's asset or renditions.
+func (r *Repository) unrelayedEvents(ctx context.Context, limit int) ([]Event, error) {
+	var rows []eventRow
+	err := r.db.WithContext(ctx).Where("relayed_at IS NULL").Order("id").Limit(limit).Find(&rows).Error
+	if err != nil {
+		return nil, translate("error reading asset events", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	keys := make([][]any, len(rows))
+	for i, e := range rows {
+		keys[i] = []any{e.AssetID, e.TenantID}
+	}
+	var assets []assetRow
+	err = r.db.WithContext(ctx).
+		Preload("Renditions", func(tx *gorm.DB) *gorm.DB {
+			return tx.Where("(asset_id, tenant_id) IN ?", keys).Order("profile")
+		}).
+		Where("(id, tenant_id) IN ?", keys).
+		Find(&assets).Error
+	if err != nil {
+		return nil, translate("error reading the assets of events", err)
+	}
+	byID := make(map[uint64]assetRow, len(assets))
+	for _, a := range assets {
+		byID[a.ID] = a
+	}
+	events := make([]Event, len(rows))
+	for i, e := range rows {
+		a, ok := byID[e.AssetID]
+		if !ok || a.TenantID != e.TenantID {
+			return nil, fmt.Errorf("error reading asset events: event %s has no asset %d of tenant %d",
+				e.EventID, e.AssetID, e.TenantID)
+		}
+		events[i] = Event{
+			ID:        uuid.UUID(e.EventID),
+			TenantID:  e.TenantID,
+			Type:      e.Type,
+			CreatedAt: e.CreatedAt,
+			Asset:     newAssetFromRepo(a),
+		}
+	}
+	return events, nil
+}
+
+// markRelayed sets relayed_at on those of the events that don't have it yet.
+func (r *Repository) markRelayed(ctx context.Context, ids []uuid.UUID) error {
+	eventIDs := make([]db.ID, len(ids))
+	for i, id := range ids {
+		eventIDs[i] = db.ID(id)
+	}
+	err := r.db.WithContext(ctx).Table("asset_events").
+		Where("event_id IN ? AND relayed_at IS NULL", eventIDs).
+		Updates(map[string]any{"relayed_at": gorm.Expr("NOW(6)")}).Error
+	if err != nil {
+		return translate("error marking asset events relayed", err)
+	}
+	return nil
+}
+
 // claim leases the asset that has been due longest to workerID for d. It returns false when nothing is due.
 func (r *Repository) claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error) {
 	l, ok, err := r.leases.Claim(ctx, workerID, d)

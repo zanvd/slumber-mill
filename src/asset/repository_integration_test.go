@@ -1377,3 +1377,120 @@ func TestReap(t *testing.T) {
 		s.wantEvents(t, EventFailed, []uint64{dead}, []uint64{other})
 	})
 }
+
+// TestEvents finishes three assets of two tenants, and reads and marks their events as the relay does.
+func TestEvents(t *testing.T) {
+	s := newLeaseStack(t)
+	owner := s.tenant(t, "owner")
+	other := s.tenant(t, "other")
+	tenants := []uint64{owner, other, owner}
+	publicIDs := make([]uuid.UUID, len(tenants))
+	for i, tenant := range tenants {
+		publicIDs[i], _ = s.queue(t, tenant)
+	}
+	for i := range tenants {
+		l := s.claimNext(t)
+		if i == 1 {
+			if _, err := s.repo.fail(t.Context(), l, failure{Permanent: true, Reason: "not audio"}); err != nil {
+				t.Fatalf("fail() error = %v", err)
+			}
+		} else if err := s.repo.finish(t.Context(), l, testProcessed()); err != nil {
+			t.Fatalf("finish() error = %v", err)
+		}
+	}
+	outbox := s.events(t)
+	if len(outbox) != len(tenants) {
+		t.Fatalf("%d events, want %d", len(outbox), len(tenants))
+	}
+	want := make([]Event, len(outbox))
+	for i, e := range outbox {
+		a, err := s.repo.assetByID(t.Context(), tenants[i], publicIDs[i])
+		if err != nil {
+			t.Fatalf("assetByID() error = %v", err)
+		}
+		want[i] = Event{ID: uuid.UUID(e.EventID), TenantID: tenants[i], Type: e.Type, CreatedAt: e.CreatedAt, Asset: a}
+	}
+	if want[0].Type != EventReady || want[1].Type != EventFailed || len(want[0].Asset.Renditions) != 2 {
+		t.Fatalf("events = %+v, want a ready asset with renditions, then a failed one", want)
+	}
+
+	t.Run("oldest first, up to the limit", func(t *testing.T) {
+		for _, limit := range []int{1, 2, 3, MaxEventBatch} {
+			got, err := s.svc.UnrelayedEvents(t.Context(), limit)
+			if err != nil {
+				t.Fatalf("UnrelayedEvents(%d) error = %v", limit, err)
+			}
+			if wantN := min(limit, len(want)); !reflect.DeepEqual(got, want[:wantN]) {
+				t.Errorf("UnrelayedEvents(%d) = %+v\nwant  %+v", limit, got, want[:wantN])
+			}
+		}
+	})
+	t.Run("marked events are left out", func(t *testing.T) {
+		if err := s.svc.MarkRelayed(t.Context(), []uuid.UUID{want[0].ID, want[1].ID}); err != nil {
+			t.Fatalf("MarkRelayed() error = %v", err)
+		}
+		marked := s.events(t)
+		if !marked[0].RelayedAt.Valid || !marked[1].RelayedAt.Valid || marked[2].RelayedAt.Valid {
+			t.Fatalf("events = %+v, want the first two relayed", marked)
+		}
+		got, err := s.svc.UnrelayedEvents(t.Context(), MaxEventBatch)
+		if err != nil || !reflect.DeepEqual(got, want[2:]) {
+			t.Errorf("UnrelayedEvents() = %+v, %v; want %+v", got, err, want[2:])
+		}
+
+		if err := s.svc.MarkRelayed(t.Context(), []uuid.UUID{want[0].ID, uuid.NewV7()}); err != nil {
+			t.Fatalf("MarkRelayed() again: error = %v", err)
+		}
+		if again := s.events(t); !reflect.DeepEqual(again, marked) {
+			t.Errorf("marking again changed the events from %+v\nto %+v", marked, again)
+		}
+	})
+	t.Run("nothing left", func(t *testing.T) {
+		if err := s.svc.MarkRelayed(t.Context(), []uuid.UUID{want[2].ID}); err != nil {
+			t.Fatalf("MarkRelayed() error = %v", err)
+		}
+		if got, err := s.svc.UnrelayedEvents(t.Context(), MaxEventBatch); err != nil || len(got) != 0 {
+			t.Errorf("UnrelayedEvents() = %+v, %v; want none", got, err)
+		}
+	})
+}
+
+// TestEventsReadTheirTenantsAssets stores rows whose tenant doesn't match their asset's,
+// which the relay must not pass on as the event's.
+func TestEventsReadTheirTenantsAssets(t *testing.T) {
+	t.Run("another tenant's rendition is left out", func(t *testing.T) {
+		s := newLeaseStack(t)
+		owner := s.tenant(t, "owner")
+		other := s.tenant(t, "other")
+		publicID, id := s.queue(t, owner)
+		if err := s.repo.finish(t.Context(), s.claimNext(t), testProcessed()); err != nil {
+			t.Fatalf("finish() error = %v", err)
+		}
+		s.exec(t, "UPDATE renditions SET tenant_id = ? WHERE asset_id = ? AND profile = 'aac_64k'", other, id)
+
+		events, err := s.svc.UnrelayedEvents(t.Context(), MaxEventBatch)
+
+		if err != nil || len(events) != 1 {
+			t.Fatalf("UnrelayedEvents() = %+v, %v; want one event", events, err)
+		}
+		if a := events[0].Asset; a.ID != publicID || len(a.Renditions) != 1 || a.Renditions[0].Profile != ProfileAAC128k {
+			t.Errorf("event's asset = %+v, want %s with only its own aac_128k rendition", a, publicID)
+		}
+	})
+	t.Run("an event of another tenant's asset is an error", func(t *testing.T) {
+		s := newLeaseStack(t)
+		owner := s.tenant(t, "owner")
+		other := s.tenant(t, "other")
+		_, id := s.queue(t, owner)
+		if err := s.repo.finish(t.Context(), s.claimNext(t), testProcessed()); err != nil {
+			t.Fatalf("finish() error = %v", err)
+		}
+		s.exec(t, "UPDATE asset_events SET tenant_id = ? WHERE asset_id = ?", other, id)
+
+		events, err := s.svc.UnrelayedEvents(t.Context(), MaxEventBatch)
+
+		if err == nil || events != nil {
+			t.Errorf("UnrelayedEvents() = %+v, %v; want an error", events, err)
+		}
+	})
+}

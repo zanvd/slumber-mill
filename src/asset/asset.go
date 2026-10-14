@@ -110,6 +110,16 @@ type Rendition struct {
 	CreatedAt     time.Time
 }
 
+// Event records that an asset finished, for the webhook relay to deliver.
+type Event struct {
+	ID        uuid.UUID
+	TenantID  uint64
+	Type      EventType
+	CreatedAt time.Time
+	// Asset is the event's asset as it is now, which is final once it has an event.
+	Asset Asset
+}
+
 // lease is a claimed asset. Its fields are those of worker.Lease and db.Lease, so it converts to and from either.
 type lease struct {
 	ID, TenantID uint64

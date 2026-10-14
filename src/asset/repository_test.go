@@ -67,12 +67,13 @@ type statement struct {
 }
 
 // recorder keeps every statement GORM builds, and answers asset reads with rows,
-// so the renditions' preload runs too. It answers db's scan for expired leases with leaseRows,
-// and counts every update as one matched row.
+// so the renditions' preload runs too. It answers the outbox read with eventRows, and then the assets read
+// with each event's asset; db's scan for expired leases with leaseRows; and counts every update as one matched row.
 type recorder struct {
 	pool       *dryRunPool
 	statements []statement
 	leaseRows  []lease
+	eventRows  []eventRow
 }
 
 func (r *recorder) record(gdb *gorm.DB) {
@@ -87,7 +88,14 @@ func (r *recorder) query(gdb *gorm.DB) {
 	case *assetRow:
 		*dest = assetRow{ID: 11, TenantID: 42}
 	case *[]assetRow:
-		*dest = append(*dest, assetRow{ID: 12, TenantID: 42}, assetRow{ID: 11, TenantID: 42})
+		if r.eventRows == nil {
+			*dest = append(*dest, assetRow{ID: 12, TenantID: 42}, assetRow{ID: 11, TenantID: 42})
+		}
+		for _, e := range r.eventRows {
+			*dest = append(*dest, assetRow{ID: e.AssetID, TenantID: e.TenantID})
+		}
+	case *[]eventRow:
+		*dest = append(*dest, r.eventRows...)
 	default:
 		if gdb.Statement.Table == "assets" {
 			r.answerLeaseScan(gdb)
@@ -251,6 +259,73 @@ func TestReadsFilterOnTenant(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestUnrelayedEventsSQL reads events of two tenants: each asset and its renditions are read under its event's tenant.
+func TestUnrelayedEventsSQL(t *testing.T) {
+	r, rec := dryRun(t)
+	rec.eventRows = []eventRow{
+		{ID: 1, EventID: db.NewID(), TenantID: 42, AssetID: 11, Type: EventReady},
+		{ID: 2, EventID: db.NewID(), TenantID: 43, AssetID: 12, Type: EventFailed},
+	}
+
+	events, err := r.unrelayedEvents(t.Context(), 100)
+
+	if err != nil {
+		t.Fatalf("unrelayedEvents() error = %v", err)
+	}
+	if len(events) != 2 || len(rec.statements) != 3 {
+		t.Fatalf("got %d events from %d statements, want 2 from 3: %v", len(events), len(rec.statements), rec.statements)
+	}
+	for i, e := range events {
+		row := rec.eventRows[i]
+		if e.ID != uuid.UUID(row.EventID) || e.TenantID != row.TenantID || e.Type != row.Type ||
+			e.Asset.TenantID != row.TenantID {
+			t.Errorf("event %d = %+v, want it built from %+v", i, e, row)
+		}
+	}
+	for i, want := range []wantStatement{
+		{contains: []string{"FROM `asset_events` WHERE relayed_at IS NULL ORDER BY id LIMIT ?"}, vars: map[int]any{0: 100}},
+		{
+			contains: []string{"FROM `assets` WHERE (id, tenant_id) IN ((?,?),(?,?))"},
+			vars:     map[int]any{0: uint64(11), 1: uint64(42), 2: uint64(12), 3: uint64(43)},
+		},
+		{
+			contains: []string{"FROM `renditions` WHERE `renditions`.`asset_id` IN (?,?) AND (asset_id, tenant_id) IN ((?,?),(?,?))"},
+			vars:     map[int]any{2: uint64(11), 3: uint64(42), 4: uint64(12), 5: uint64(43)},
+		},
+	} {
+		checkStatement(t, rec.statements[i], want)
+	}
+}
+
+func TestUnrelayedEventsWithoutEvents(t *testing.T) {
+	r, rec := dryRun(t)
+	events, err := r.unrelayedEvents(t.Context(), 100)
+	if err != nil || events != nil || len(rec.statements) != 1 {
+		t.Errorf("unrelayedEvents() = %+v, %v from %v; want nothing from one statement", events, err, rec.statements)
+	}
+}
+
+func TestMarkRelayedSQL(t *testing.T) {
+	r, rec := dryRun(t)
+	ids := []uuid.UUID{uuid.NewV7(), uuid.NewV7()}
+
+	if err := r.markRelayed(t.Context(), ids); err != nil {
+		t.Fatalf("markRelayed() error = %v", err)
+	}
+
+	if len(rec.statements) != 1 {
+		t.Fatalf("ran %d statements, want 1: %v", len(rec.statements), rec.statements)
+	}
+	checkStatement(t, rec.statements[0], wantStatement{
+		contains: []string{"UPDATE `asset_events` SET `relayed_at`=NOW(6) WHERE event_id IN (?,?) AND relayed_at IS NULL"},
+		columns:  []string{"relayed_at"},
+		vars:     map[int]any{0: db.ID(ids[0]), 1: db.ID(ids[1])},
+	})
+	if rec.statements[0].inTx || len(rec.pool.isolation) > 0 {
+		t.Error("markRelayed() opened a transaction")
 	}
 }
 
