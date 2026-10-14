@@ -433,7 +433,8 @@ func Permanent(err error) error // wrap errors that retrying can't fix
   the row already finished cancels the work's context, and the driver could then report a committed autocommit
   completion as cancelled.
 - **Panics** become a failed attempt, not a dead worker.
-- **On startup, sweep `tmp/`** of files older than the lease (pitfall 25).
+- **On startup, sweep `tmp/`** of files older than the lease (pitfall 25). The processor refreshes its temp files'
+  modification time every `lease / 3` while it holds them, so only a dead attempt's files age past the lease.
 - The pool puts a logger carrying `worker`, `pool`, `id`, `tenant_id`, `attempt` and `took` into the work's context.
 - `RunUntilIdle(ctx)` processes until nothing is due, for tests.
 
