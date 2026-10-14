@@ -886,6 +886,8 @@ A Makefile may wrap these, as long as each target stays a single `docker compose
 ### Other process behaviour
 
 - **API:** `ReadHeaderTimeout: 10s`, `IdleTimeout: 2m`, no overall `ReadTimeout` (§9).
+  It sets Gin to release mode at startup, because debug mode writes to stdout,
+  which is reserved for `tenant create`'s secrets.
 - **Unread request bodies:** A request whose body the handler doesn't read to its end loses its connection: the response says `Connection: close`, and the read deadline is expired once the handler is done, so a client that stalls its body can't hold the connection.
 - **DB pool:** `MaxOpenConns 25`, `MaxIdleConns 25`, `ConnMaxLifetime 5m`.
 - **Logging:** `slog` JSON to stderr. Request lines carry the route template (`c.FullPath()`), status,
