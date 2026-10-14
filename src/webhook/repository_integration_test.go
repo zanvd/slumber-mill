@@ -186,7 +186,7 @@ func TestInsertDeliveriesKeepsTheFirst(t *testing.T) {
 func TestRelayLockSession(t *testing.T) {
 	dsn := testutil.NewDatabase(t)
 	s, other := newStack(t, dsn), newStack(t, dsn)
-	take := func(s *stack) relayLock {
+	take := func(t *testing.T, s *stack) relayLock {
 		t.Helper()
 		lock, ok, err := s.repo.lockRelay(t.Context())
 		if err != nil || !ok {
@@ -195,7 +195,7 @@ func TestRelayLockSession(t *testing.T) {
 		return lock
 	}
 
-	lock := take(s)
+	lock := take(t, s)
 	if _, ok, err := other.repo.lockRelay(t.Context()); ok || err != nil {
 		t.Errorf("lockRelay() on another pool = %t, %v; want false, nil", ok, err)
 	}
@@ -212,15 +212,15 @@ func TestRelayLockSession(t *testing.T) {
 	}
 
 	t.Run("discarded", func(t *testing.T) {
-		lock := take(other)
+		lock := take(t, other)
 		discard(lock.(*sessionLock).conn)
-		other.waitUntilFree(t)
+		s.waitUntilFree(t)
 		if err := lock.check(t.Context()); !errors.Is(err, errLockLost) {
 			t.Errorf("check() error = %v, want %v", err, errLockLost)
 		}
 	})
 	t.Run("killed", func(t *testing.T) {
-		lock := take(s)
+		lock := take(t, s)
 		s.killHolder(t)
 		if err := lock.check(t.Context()); !errors.Is(err, errLockLost) {
 			t.Errorf("check() error = %v, want %v", err, errLockLost)
