@@ -623,6 +623,7 @@ Tenants supply URLs, so the client must not become a proxy into the private netw
   so no fixed list can cover it.
 - `Proxy: nil`, since environment proxies would bypass the check; redirects aren't followed (`http.ErrUseLastResponse`).
 - Timeouts: dial 5 s, TLS handshake 5 s, response headers 10 s, overall 15 s, `IdleConnTimeout` 90 s.
+- Errors returned by the client show the URL only as `scheme://host[:port]`, since tenant URLs often carry credentials in the path or query.
 - `ErrBlockedAddress` is permanent. `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE=true` is for local development and tests only.
   `egress.ErrUnresolvable` (the lookup failed, timed out or returned no addresses) is retryable for deliveries,
   since DNS failures are often transient.
