@@ -1,0 +1,152 @@
+package webhook
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/zanvd/slumber-mill/src/db"
+)
+
+const (
+	// relayLockName elects the one relay. Like every GET_LOCK name, it is shared by the whole MySQL server.
+	relayLockName = "slumber-mill.relay"
+	// lockQueryTimeout bounds each query on the relay lock's session.
+	lockQueryTimeout = 5 * time.Second
+)
+
+// Repository holds the webhook_deliveries table and the relay lock. Its methods are unexported,
+// so other packages go through Relay and Deliverer.
+type Repository struct {
+	db *gorm.DB
+}
+
+func NewRepository(gdb *gorm.DB) *Repository {
+	return &Repository{db: gdb}
+}
+
+type deliveryRow struct {
+	ID       uint64 `gorm:"primaryKey"`
+	EventID  db.ID  `gorm:"column:event_id"`
+	TenantID uint64 `gorm:"column:tenant_id"`
+	Body     []byte `gorm:"column:body"`
+}
+
+func (deliveryRow) TableName() string { return "webhook_deliveries" }
+
+// insertDeliveries queues a delivery for each event that has none yet. An event that already has one
+// keeps it as it is, body included.
+func (r *Repository) insertDeliveries(ctx context.Context, ds []delivery) error {
+	if len(ds) == 0 {
+		return nil
+	}
+	rows := make([]deliveryRow, len(ds))
+	for i, d := range ds {
+		rows[i] = deliveryRow{EventID: db.ID(d.EventID), TenantID: d.TenantID, Body: d.Body}
+	}
+	err := r.db.WithContext(ctx).
+		Select("event_id", "tenant_id", "body").
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&rows).Error
+	if err != nil {
+		return translate("error inserting deliveries", err)
+	}
+	return nil
+}
+
+// lockRelay tries once, without waiting, to take the relay lock on a session of its own,
+// which holds the lock until it is released or the session ends. It returns false when another session holds it.
+func (r *Repository) lockRelay(ctx context.Context) (relayLock, bool, error) {
+	pool, err := r.db.DB()
+	if err != nil {
+		return nil, false, fmt.Errorf("error taking the relay lock: %w: %v", errDatabase, err)
+	}
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("error taking the relay lock: %w: %v", errDatabase, err)
+	}
+	var got sql.NullInt64
+	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", relayLockName).Scan(&got)
+	switch {
+	case err != nil:
+		// MySQL may have granted the lock before the call failed, so the session can't go back to the pool.
+		discard(conn)
+		return nil, false, fmt.Errorf("error taking the relay lock: %w: %v", errDatabase, err)
+	case !got.Valid:
+		discard(conn)
+		return nil, false, fmt.Errorf("error taking the relay lock: %w: GET_LOCK returned NULL", errDatabase)
+	case got.Int64 != 1:
+		_ = conn.Close()
+		return nil, false, nil
+	}
+	return &sessionLock{conn: conn}, true, nil
+}
+
+// sessionLock is the relay lock, held by the session of conn.
+type sessionLock struct {
+	conn *sql.Conn
+}
+
+// check returns errLockLost unless the session is alive and still holds the lock. A lost lock's session is ended.
+func (l *sessionLock) check(ctx context.Context) error {
+	ctx, cancel := lockContext(ctx)
+	defer cancel()
+	var mine sql.NullInt64
+	err := l.conn.QueryRowContext(ctx, "SELECT IS_USED_LOCK(?) = CONNECTION_ID()", relayLockName).Scan(&mine)
+	if err != nil {
+		discard(l.conn)
+		return fmt.Errorf("error checking the relay lock: %w: %v", errLockLost, err)
+	}
+	if mine.Int64 != 1 {
+		discard(l.conn)
+		return fmt.Errorf("error checking the relay lock: %w: this session doesn't hold it", errLockLost)
+	}
+	return nil
+}
+
+// release gives up the lock and returns the session to the pool. If it can't, it ends the session instead,
+// which frees the lock too: a pooled session must never keep it, or no other relay could take over.
+func (l *sessionLock) release(ctx context.Context) error {
+	ctx, cancel := lockContext(ctx)
+	defer cancel()
+	var released sql.NullInt64
+	err := l.conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", relayLockName).Scan(&released)
+	if err != nil {
+		discard(l.conn)
+		return fmt.Errorf("error releasing the relay lock: %w: %v", errDatabase, err)
+	}
+	if released.Int64 != 1 {
+		discard(l.conn)
+		return fmt.Errorf("error releasing the relay lock: %w: this session didn't hold it", errLockLost)
+	}
+	if err := l.conn.Close(); err != nil {
+		return fmt.Errorf("error releasing the relay lock: %w: %v", errDatabase, err)
+	}
+	return nil
+}
+
+// lockContext keeps ctx's values but not its cancellation: the driver closes a connection whose query is
+// cancelled, and that would end the lock's session on shutdown before RELEASE_LOCK could run.
+func lockContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), lockQueryTimeout)
+}
+
+// discard ends conn's session rather than returning it to the pool:
+// database/sql closes a connection that reports driver.ErrBadConn.
+func discard(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	_ = conn.Close()
+}
+
+func translate(msg string, err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("%s: %w", msg, errNotFound)
+	}
+	return fmt.Errorf("%s: %w: %v", msg, errDatabase, err)
+}
