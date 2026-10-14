@@ -542,12 +542,14 @@ func TestPostDrain(t *testing.T) {
 	tests := []struct {
 		name      string
 		size      int   // -1: chunked and endless
+		minRead   int64 // when the first post returns
 		maxRead   int64 // over both posts
 		wantConns int64
 	}{
-		{"short body is drained and the connection reused", 1 << 10, 2 * (1<<10 + slack), 1},
-		{"long body", 64 << 20, 2 * (drainLimit + slack), 2},
-		{"endless body", -1, 2 * (drainLimit + transportDrain + slack), 2},
+		// Past the transport's 4 KiB buffer, so only Post's own drain has read all of it by the time Post returns.
+		{"body within the limit is drained and the connection reused", 48 << 10, 48 << 10, 2 * (48<<10 + slack), 1},
+		{"long body", 64 << 20, 0, 2 * (drainLimit + slack), 2},
+		{"endless body", -1, 0, 2 * (drainLimit + transportDrain + slack), 2},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -578,10 +580,13 @@ func TestPostDrain(t *testing.T) {
 				return countingConn{conn, &read}, nil
 			}
 
-			for range 2 {
+			for i := range 2 {
 				status, err := c.Post(t.Context(), rcv.urlFor("127.0.0.1"), testEventID, testSignature, testBody)
 				if err != nil || status != http.StatusOK {
 					t.Fatalf("Post() = %d, %v, want %d, nil", status, err, http.StatusOK)
+				}
+				if n := read.Load(); i == 0 && n < tc.minRead {
+					t.Errorf("client had read %d bytes when Post returned, want at least %d", n, tc.minRead)
 				}
 			}
 			// The receiver's handler returns once its writes fail, after the client has closed every connection
