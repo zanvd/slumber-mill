@@ -970,3 +970,43 @@ func TestPanicReleasesConnection(t *testing.T) {
 		})
 	}
 }
+
+// What Gin's writer offers handlers still reaches net/http's through the request logging.
+func TestWriterInterfaces(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler gin.HandlerFunc
+	}{
+		{name: "hijack", handler: func(c *gin.Context) {
+			conn, rw, err := c.Writer.Hijack()
+			if err != nil {
+				c.String(http.StatusInternalServerError, err.Error())
+				return
+			}
+			defer conn.Close()
+			_, _ = rw.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
+			_ = rw.Flush()
+		}},
+		{name: "stream", handler: func(c *gin.Context) {
+			c.Stream(func(w io.Writer) bool {
+				_, _ = io.WriteString(w, "done")
+				return false
+			})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.srv.engine.GET("/writer", tt.handler)
+				conn, br := f.rawConn(t)
+
+				send(t, conn, "GET /writer HTTP/1.1\r\nHost: api.test\r\n\r\n")
+				resp, body := readResponse(t, br)
+				if resp.StatusCode != http.StatusOK || string(body) != "done" {
+					t.Errorf("response = %d %q, want 200 %q", resp.StatusCode, body, "done")
+				}
+			})
+		})
+	}
+}

@@ -1,10 +1,12 @@
 package httpsrv
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -148,7 +150,8 @@ func writeInternalError(w http.ResponseWriter) {
 	}
 }
 
-// statusWriter records the status a response went out with.
+// statusWriter records the status given to the writer, which a client may never see if the connection is cut.
+// Gin's writer asserts Hijacker and CloseNotifier on it without checking, so it forwards both.
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -174,6 +177,14 @@ func (w *statusWriter) Flush() {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *statusWriter) CloseNotify() <-chan bool {
+	return w.ResponseWriter.(http.CloseNotifier).CloseNotify()
 }
 
 func (w *statusWriter) Unwrap() http.ResponseWriter {
