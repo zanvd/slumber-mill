@@ -122,7 +122,6 @@ func NewError(code, message string) ErrorResponse {
 	return ErrorResponse{Error: ErrorBody{Code: code, Message: message}}
 }
 
-// NewValidationError builds the envelope for err, with one entry in fields per invalid field.
 func NewValidationError(code, message string, err *validation.Error) ErrorResponse {
 	resp := NewError(code, message)
 	if err == nil {
