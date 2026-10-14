@@ -940,3 +940,33 @@ func TestAbortedHandlerReleasesConnection(t *testing.T) {
 		})
 	}
 }
+
+// A handler that panics before the declared body arrives gets the 500 and loses the connection at once.
+func TestPanicReleasesConnection(t *testing.T) {
+	for _, framing := range []string{"Content-Length: 1000\r\n", "Transfer-Encoding: chunked\r\n"} {
+		t.Run(framing[:strings.Index(framing, ":")], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.srv.engine.POST("/boom", func(*gin.Context) { panic("kaboom") })
+				conn, br := f.rawConn(t)
+
+				start := time.Now()
+				send(t, conn, "POST /boom HTTP/1.1\r\nHost: api.test\r\n"+framing+"\r\n")
+				resp, body := readResponse(t, br)
+				if resp.StatusCode != http.StatusInternalServerError || !resp.Close || time.Since(start) != 0 {
+					t.Fatalf("status %d with connection closed = %v after %v, want 500 closing at once; body %s",
+						resp.StatusCode, resp.Close, time.Since(start), body)
+				}
+				var got apiv1.ErrorResponse
+				if err := json.Unmarshal(body, &got); err != nil || !reflect.DeepEqual(got, internalError()) {
+					t.Errorf("body %s (%v), want %+v", body, err, internalError())
+				}
+				if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
+					t.Errorf("reading after the 500 returned %v after %v, want io.EOF at once",
+						err, time.Since(start))
+				}
+				f.logLine(t, "panic serving request")
+			})
+		})
+	}
+}
