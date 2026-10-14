@@ -20,6 +20,10 @@ var (
 	errShuttingDown        = errors.New("shutting down")
 	errPreconditionFailed  = errors.New("precondition failed")
 	errRangeNotSatisfiable = errors.New("range not satisfiable")
+	errUploadTooLarge      = errors.New("upload too large")
+	errUploadStalled       = errors.New("upload stalled")
+	errTooManyUploads      = errors.New("too many concurrent uploads")
+	errMalformedUpload     = errors.New("malformed multipart body")
 )
 
 // writeError is the one place errors become responses. It aborts the handler chain.
@@ -43,6 +47,14 @@ func (s *Server) mapError(c *gin.Context, err error) (int, apiv1.ErrorResponse) 
 	case errors.Is(err, asset.ErrIdempotencyKeyReused):
 		return http.StatusUnprocessableEntity,
 			apiv1.NewError("idempotency_key_reused", "idempotency key already used for a different upload")
+	case errors.Is(err, errUploadTooLarge):
+		return http.StatusRequestEntityTooLarge, apiv1.NewError("file_too_large", "upload exceeds the size limit")
+	case errors.Is(err, errUploadStalled):
+		return http.StatusRequestTimeout, apiv1.NewError("request_timeout", "timed out waiting for the upload")
+	case errors.Is(err, errTooManyUploads):
+		return http.StatusTooManyRequests, apiv1.NewError("too_many_uploads", "too many uploads in progress")
+	case errors.Is(err, errMalformedUpload):
+		return http.StatusBadRequest, apiv1.NewError("invalid_request", "malformed multipart body")
 	case errors.Is(err, errPreconditionFailed):
 		return http.StatusPreconditionFailed, apiv1.NewError("precondition_failed", "precondition failed")
 	case errors.Is(err, errRangeNotSatisfiable):

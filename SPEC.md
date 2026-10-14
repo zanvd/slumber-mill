@@ -663,7 +663,8 @@ On the last page, `next_cursor` is `null`.
 - **Limits at the edge:** `http.MaxBytesReader` on the whole body (default 2 GiB) → `413 file_too_large`,
   and an **idle-read deadline**: no overall `ReadTimeout`,
   but every successful read pushes `http.ResponseController(c.Writer).SetReadDeadline(now + 30s)` forward → `408`
-  (pitfall 3). Concurrent uploads per tenant are capped with an in-process semaphore → `429`.
+  (pitfall 3). Concurrent uploads per tenant are capped with an in-process semaphore
+  (`SLUMBER_MILL_MAX_UPLOADS_PER_TENANT`, default 4) → `429`.
 - **The service never sees HTTP.** The handler's body wrapper records why reading stopped,
   and the handler checks that record (413 or 408) before mapping the service's error.
 - **Streaming:** the handler walks the parts with `r.MultipartReader()`, reads `title` itself,
@@ -869,6 +870,7 @@ A Makefile may wrap these, as long as each target stays a single `docker compose
 | `SLUMBER_MILL_DATA_DIR` | `/data` |
 | `SLUMBER_MILL_HTTP_ADDR` | `:8080` |
 | `SLUMBER_MILL_MAX_UPLOAD_BYTES` | `2147483648` |
+| `SLUMBER_MILL_MAX_UPLOADS_PER_TENANT` | `4` |
 | `SLUMBER_MILL_ENCODE_CONCURRENCY` | `runtime.GOMAXPROCS(0)` (follows the container's CPU limit) |
 | `SLUMBER_MILL_WEBHOOK_CONCURRENCY` | `8` |
 | `SLUMBER_MILL_SHUTDOWN_GRACE` | `30s` |
