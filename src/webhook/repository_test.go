@@ -263,7 +263,7 @@ func TestRelayLockName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := relayLockName(tc.database)
 			if len(got) > 64 {
-				t.Errorf("relayLockName() is %d characters, want at most 64: %q", len(got), got)
+				t.Errorf("relayLockName() is %d characters, want at most 64: %.80q", len(got), got)
 			}
 			if !strings.HasPrefix(got, "slumber-mill.relay.") {
 				t.Errorf("relayLockName() = %q, want the prefix slumber-mill.relay.", got)
