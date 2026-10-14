@@ -588,12 +588,16 @@ func (f *fixture) rawConn(t *testing.T) (net.Conn, *bufio.Reader) {
 	return conn, bufio.NewReader(conn)
 }
 
-// roundTrip writes req to conn and reads the whole response from br.
-func roundTrip(t *testing.T, conn net.Conn, br *bufio.Reader, req string) (*http.Response, []byte) {
+func send(t *testing.T, conn net.Conn, s string) {
 	t.Helper()
-	if _, err := io.WriteString(conn, req); err != nil {
+	if _, err := io.WriteString(conn, s); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// readResponse reads a whole response from br.
+func readResponse(t *testing.T, br *bufio.Reader) (*http.Response, []byte) {
+	t.Helper()
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -606,8 +610,8 @@ func roundTrip(t *testing.T, conn net.Conn, br *bufio.Reader, req string) (*http
 	return resp, body
 }
 
-// A client that declares a request body and never sends it must not keep the connection
-// once it has its response, whichever route answers.
+// A client that declares a request body and never sends it gets its response at once,
+// and loses the connection when the grace for the body runs out, whichever route answers.
 func TestUnreadBodyReleasesConnection(t *testing.T) {
 	id := uuid.NewV7().String()
 	rendition := bytes.Repeat([]byte("a"), 64<<10)
@@ -654,17 +658,18 @@ func TestUnreadBodyReleasesConnection(t *testing.T) {
 					conn, br := f.rawConn(t)
 
 					start := time.Now()
-					resp, body := roundTrip(t, conn, br,
-						tt.target+" HTTP/1.1\r\nHost: api.test\r\n"+tt.header+fr.header+"\r\n")
-					if resp.StatusCode != tt.wantStatus {
-						t.Fatalf("status = %d, want %d; body %s", resp.StatusCode, tt.wantStatus, body)
+					send(t, conn, tt.target+" HTTP/1.1\r\nHost: api.test\r\n"+tt.header+fr.header+"\r\n")
+					resp, body := readResponse(t, br)
+					if resp.StatusCode != tt.wantStatus || time.Since(start) != 0 {
+						t.Fatalf("status %d after %v, want %d at once; body %s",
+							resp.StatusCode, time.Since(start), tt.wantStatus, body)
 					}
 					if tt.wantBody != nil && !bytes.Equal(body, tt.wantBody) {
 						t.Errorf("got a %d-byte body, want %d bytes", len(body), len(tt.wantBody))
 					}
-					if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != 0 {
-						t.Errorf("reading after the %d returned %v after %v, want io.EOF at once",
-							tt.wantStatus, err, time.Since(start))
+					if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != unreadBodyGrace {
+						t.Errorf("reading after the %d returned %v after %v, want io.EOF after %v",
+							tt.wantStatus, err, time.Since(start), unreadBodyGrace)
 					}
 					select {
 					case err := <-ctxErr:
@@ -682,47 +687,86 @@ func TestUnreadBodyReleasesConnection(t *testing.T) {
 	}
 }
 
-// Requests without a body, or whose body was read or arrived in full, keep their connection.
+// Requests without a body, or whose body was read or sent in full, keep their connection for the next request.
 func TestConnectionReuse(t *testing.T) {
+	id := uuid.NewV7().String()
 	upload := string(multipartBody(t, titlePart("Rain"), filePart("RIFF-audio")))
 	const uploadHeader = "POST /v1/assets HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer " + validKey +
 		"\r\nContent-Type: " + formContentType + "\r\n"
 	const healthz = "GET /healthz HTTP/1.1\r\nHost: api.test\r\n\r\n"
-	type step struct {
-		req        string
-		wantStatus int
-	}
 	tests := []struct {
-		name  string
-		steps []step
+		name string
+		req  string
+		// late is sent after req while the handler is held in the asset service, so it arrives after the header.
+		late       string
+		wantStatus int
 	}{
-		{name: "no bodies", steps: []step{{healthz, http.StatusOK}, {healthz, http.StatusOK}}},
-		{name: "upload with a declared length", steps: []step{
-			{fmt.Sprintf("%sContent-Length: %d\r\n\r\n%s", uploadHeader, len(upload), upload), http.StatusAccepted},
-			{healthz, http.StatusOK},
-		}},
-		{name: "chunked upload", steps: []step{
-			{fmt.Sprintf("%sTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", uploadHeader, len(upload), upload),
-				http.StatusAccepted},
-			{healthz, http.StatusOK},
-		}},
-		{name: "unread body sent in full", steps: []step{
-			{"GET /healthz HTTP/1.1\r\nHost: api.test\r\nContent-Length: 5\r\n\r\nhello", http.StatusOK},
-			{healthz, http.StatusOK},
-		}},
+		{name: "no body", req: healthz, wantStatus: http.StatusOK},
+		{name: "upload with a declared length",
+			req:        fmt.Sprintf("%sContent-Length: %d\r\n\r\n%s", uploadHeader, len(upload), upload),
+			wantStatus: http.StatusAccepted},
+		{name: "chunked upload",
+			req: fmt.Sprintf("%sTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n",
+				uploadHeader, len(upload), upload),
+			wantStatus: http.StatusAccepted},
+		{name: "unread body sent with the header",
+			req: "GET /healthz HTTP/1.1\r\nHost: api.test\r\nContent-Length: 5\r\n\r\nhello", wantStatus: http.StatusOK},
+		// net/http reads 4 KiB with the header, so most of this body is still on the connection.
+		{name: "unread body larger than the read buffer",
+			req:        "GET /healthz HTTP/1.1\r\nHost: api.test\r\nContent-Length: 10000\r\n\r\n" + strings.Repeat("x", 10000),
+			wantStatus: http.StatusOK},
+		{name: "unread body sent after the header",
+			req: "GET /v1/assets/" + id + " HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer " + validKey +
+				"\r\nContent-Length: 5\r\n\r\n",
+			late: "hello", wantStatus: http.StatusOK},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newFixture(t, Config{})
 				f.assets.asset = queuedAsset()
+				held := make(chan struct{})
+				if tt.late != "" {
+					f.assets.onCall = func(assetCall) { <-held }
+				}
 				conn, br := f.rawConn(t)
-				for i, s := range tt.steps {
-					resp, body := roundTrip(t, conn, br, s.req)
-					if resp.StatusCode != s.wantStatus || resp.Close {
-						t.Fatalf("request %d: status %d with connection closed = %v, want %d and kept open; body %s",
-							i, resp.StatusCode, resp.Close, s.wantStatus, body)
+
+				send(t, conn, tt.req)
+				if tt.late != "" {
+					synctest.Wait()
+					send(t, conn, tt.late)
+					synctest.Wait()
+				}
+				close(held)
+				for i, want := range []int{tt.wantStatus, http.StatusOK} {
+					if i > 0 {
+						send(t, conn, healthz)
 					}
+					resp, body := readResponse(t, br)
+					if resp.StatusCode != want || resp.Close {
+						t.Fatalf("request %d: status %d with connection closed = %v, want %d and kept open; body %s",
+							i, resp.StatusCode, resp.Close, want, body)
+					}
+				}
+			})
+		})
+	}
+}
+
+// A handler aborted with http.ErrAbortHandler before the declared body arrives must not keep the connection.
+func TestAbortedHandlerReleasesConnection(t *testing.T) {
+	for _, framing := range []string{"Content-Length: 1000\r\n", "Transfer-Encoding: chunked\r\n"} {
+		t.Run(framing[:strings.Index(framing, ":")], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, Config{})
+				f.srv.engine.POST("/abort", func(*gin.Context) { panic(http.ErrAbortHandler) })
+				conn, br := f.rawConn(t)
+
+				start := time.Now()
+				send(t, conn, "POST /abort HTTP/1.1\r\nHost: api.test\r\n"+framing+"\r\n")
+				if _, err := br.ReadByte(); err != io.EOF || time.Since(start) != unreadBodyGrace {
+					t.Errorf("reading after the abort returned %v after %v, want io.EOF after %v",
+						err, time.Since(start), unreadBodyGrace)
 				}
 			})
 		})

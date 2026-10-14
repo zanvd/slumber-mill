@@ -14,13 +14,19 @@ import (
 	"github.com/zanvd/slumber-mill/src/tenant"
 )
 
-const tenantKey = "httpsrv.tenant"
+const (
+	tenantKey = "httpsrv.tenant"
+
+	// unreadBodyGrace is how long net/http may go on reading a body the handler left unread
+	// once the handler is done, so that a client that sent it keeps its connection.
+	unreadBodyGrace = time.Second
+)
 
 // releaseUnreadBody stops a client that declares a request body and never sends it from holding the connection.
 // To reuse a connection, net/http reads up to 256 KiB of a body the handler left unread, with no deadline:
 // before it writes the response, which may be while the handler runs, and again once the handler returns.
-// Full duplex skips the first read. After the handler, an expired deadline limits the second read
-// to what has already arrived, and the connection is closed unless that was the whole body.
+// Full duplex skips the first read. The second gets unreadBodyGrace, after which the connection is closed
+// unless the whole body has arrived, or no time at all when the response already closes the connection.
 // It wraps the engine because Gin answers a trailing-slash redirect without running any middleware.
 func releaseUnreadBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -34,10 +40,18 @@ func releaseUnreadBody(next http.Handler) http.Handler {
 		_ = rc.EnableFullDuplex()
 		body := &eofReader{ReadCloser: r.Body}
 		r.Body = body
+		// Deferred, so a handler aborted with http.ErrAbortHandler releases the connection too.
+		defer func() {
+			if body.eof {
+				return
+			}
+			deadline := time.Now()
+			if w.Header().Get("Connection") != "close" {
+				deadline = deadline.Add(unreadBodyGrace)
+			}
+			_ = rc.SetReadDeadline(deadline)
+		}()
 		next.ServeHTTP(w, r)
-		if !body.eof {
-			_ = rc.SetReadDeadline(time.Now())
-		}
 	})
 }
 
