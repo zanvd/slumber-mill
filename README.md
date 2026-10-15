@@ -7,7 +7,7 @@ and the webhook pool notifies the tenant with a signed webhook.
 The scope is narrow on purpose: one upload path, two renditions, two event types.
 The depth goes into what fails in production: concurrency on MySQL, tenant isolation, webhook delivery,
 shutdown, and loudness that is verified rather than assumed.
-[SPEC.md](SPEC.md) is the full design; `§N` below means one of its sections.
+[SPEC.md](SPEC.md) is the full design.
 
 ```mermaid
 flowchart LR
@@ -22,7 +22,8 @@ flowchart LR
     W -- "signed POST" --> H[Tenant webhook]
 ```
 
-One binary, four subcommands, each run as its own Compose service:
+One binary with four subcommands. `migrate`, `api` and each worker pool run as their own Compose service;
+`tenant create` runs as a one-off command in the `api` service:
 
 ```
 slumber-mill migrate                 apply database migrations
@@ -33,8 +34,9 @@ slumber-mill tenant create -slug S [-webhook-url U] [-target-lufs F]
 
 ## Quick start
 
-The host needs Docker with Compose v2 and nothing else. On Linux, if your user ID isn't 1000,
-put `APP_UID=<id -u>` in a gitignored `.env` first: the containers write to `var/` as that user.
+The host needs Docker with Compose v2 and nothing else; `make` is optional. On Linux, if your user ID isn't 1000,
+put `APP_UID=` followed by the output of `id -u` in a gitignored `.env` first: the containers write to `var/` as
+that user.
 
 ```sh
 docker compose up -d --build                               # MySQL, migrations, API and both pools
@@ -48,16 +50,20 @@ docker compose run --rm dev go test -tags integration -coverprofile=/out/cover.o
 A Makefile wraps these: `make up`, `make tenant SLUG=demo`, `make test-unit`, `make test`, `make vet`, `make fmt`,
 `make tidy`, `make cover`, `make down` and `make process-checks`.
 
-Upload a file with the API key that `tenant create` printed, then poll until the asset is `ready` and download
-a rendition (`aac_128k` or `aac_64k`):
+Export the key from the `api_key:` line that `tenant create` printed as `API_KEY`, upload a file, set `ASSET_ID` to
+the `id` field of the 202 response, then poll until the asset's `status` is `ready` and download a rendition
+(`aac_128k` or `aac_64k`):
 
 ```sh
+export API_KEY=sm_...
 curl -H "Authorization: Bearer $API_KEY" -F title=Rain -F file=@rain.wav http://127.0.0.1:8080/v1/assets
+export ASSET_ID=<the id from the response>
 curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8080/v1/assets/$ASSET_ID
 curl -H "Authorization: Bearer $API_KEY" -o rain-128k.m4a http://127.0.0.1:8080/v1/assets/$ASSET_ID/renditions/aac_128k
 ```
 
-The API listens on `127.0.0.1:8080` only. Uploads and renditions live in `var/data`, so they can be played from there.
+The API listens on `:8080` inside its container, and Compose publishes that port on `127.0.0.1` only, so the local
+stack isn't open to the network. Uploads and renditions live in `var/data`, so they can be played from there.
 
 ### HTTP API
 
@@ -83,9 +89,10 @@ A tenant created with `-webhook-url` gets `asset.ready` and `asset.failed` event
 `{"id": "<uuid>", "type": "...", "created_at": "...", "data": <asset>}`, where `data` is the API's own asset shape.
 The request is a POST with `SlumberMill-Event-Id` and `SlumberMill-Signature: t=<unix>,v1=<hex>`, where `v1` is
 the HMAC-SHA256 of `<t>.<body>` under the tenant's webhook secret. Delivery is at-least-once and unordered,
-so receivers dedupe on the event ID. A 2xx is delivered, 410 Gone stops retrying, and anything else, redirects
-included, is retried until the delivery has had 12 attempts, with a backoff that starts at 30 seconds and caps at 6 hours.
-The Go package `webhook` exports `Verify` for receivers; it accepts several `v1` values so secrets can rotate.
+so receivers dedupe on the event ID. A 2xx counts as delivered, 410 Gone stops retrying, and anything else,
+redirects included, is retried until the delivery has had 12 attempts, with a backoff that starts at 30 seconds
+and caps at 6 hours. The package `github.com/zanvd/slumber-mill/src/webhook` exports `Verify` for receivers;
+it accepts several `v1` values so secrets can rotate.
 
 ## Operations
 
@@ -99,7 +106,7 @@ webhook_secret: whsec_...
 ```
 
 The `webhook_secret` line appears only when the tenant has a `-webhook-url`. Only hashes and ciphertext are stored,
-so lose them and they are gone. Logs go to stderr as JSON. `-target-lufs` defaults to -16 and must be from -70 to -5.
+so if you lose them, they are gone. Logs go to stderr as JSON. `-target-lufs` defaults to -16 and must be from -70 to -5.
 The command refuses a webhook URL whose host isn't public.
 
 Exit codes, for every subcommand: 0 for success or help, 1 for a runtime or configuration error,
@@ -129,8 +136,8 @@ Environment variables, with the defaults used when one is unset:
   value is a configuration error and the process exits 1. The `api` and both pools read it, because the startup
   sweep of `tmp/` removes files older than the lease. The webhook lease is fixed at 1 minute.
   A worker heartbeats every third of its lease.
-- **Retention.** The webhook pool deletes delivered deliveries 30 days after delivery and relayed events 30 days
-  after relay, in small batches. The 30 days are fixed, not configurable. It runs at startup and then hourly.
+- **Retention.** The webhook pool deletes deliveries in the `delivered` state 30 days after delivery and relayed
+  events 30 days after relay, in small batches. The 30 days are fixed, not configurable. It runs at startup and then hourly.
   Assets and renditions are never deleted.
 - **The secret key.** Only `api` (which runs `tenant create`) and `worker-webhook` get `SLUMBER_MILL_SECRET_KEYS`.
   Compose sets a fixed key marked dev-only; production reads it from a secret manager.
@@ -174,8 +181,9 @@ Uploads go through a pinned `curlimages/curl` container on the project's network
 ### MySQL connection limit
 
 Compose starts MySQL with `--max-connections=400`; the server's default is 151.
-Every process opens one pool of at most 25 connections (`MaxOpenConns 25`), and the worst case is that all of
-them are full at the same time while the test suite runs against the same server:
+Each service process (`api`, `worker-encode`, `worker-webhook` and a one-off `tenant create`) opens one pool of at
+most 25 connections (`MaxOpenConns 25`); a test package may hold two. The worst case is that all of them are full
+at the same time while the test suite runs against the same server:
 
 | Source | Connections |
 |---|---|
@@ -204,21 +212,24 @@ Each with its trade-off.
 - **Leasing on MySQL, not Redis or SQS.** One fewer system to operate, and the work is created in the same insert
   or transaction as the data it belongs to. A claim is `SELECT ... FOR UPDATE SKIP LOCKED` in READ COMMITTED:
   under REPEATABLE READ the gap locks cost uploads a third of their throughput and tripled their p99 latency.
-  Every write after a claim is fenced on the row's id, state and `attempts`, so a worker that lost its lease
-  changes nothing. Every time comes from `NOW(6)`, so clock skew between hosts can't distort a lease.
+  Every write after a claim is fenced, meaning it matches only while the row's id, state and `attempts` are still
+  the claimant's, so a worker that lost its lease changes nothing. Every time comes from `NOW(6)`, so clock skew between hosts can't distort a lease.
   A reaper requeues expired leases with a short delay, not the retry backoff. The price is that MySQL does the
   queueing: throughput is bounded by one database, and finished rows must stay cheap (they did, at a million
   finished rows per table).
-- **Layers.** Gin handlers, services and GORM repositories are joined by interfaces that their consumers declare.
-  Gin appears only in `httpsrv/` and GORM only in `db/` and the `repository.go` files, so a service tests against
+- **Layers.** Gin (the HTTP framework) handlers, services and GORM (the Go database library) repositories are joined
+  by interfaces that their consumers declare. Gin appears only in `httpsrv/` and GORM only in `db/` and the `repository.go` files, so a service tests against
   a hand-written fake and a handler against a fake service. The cost is a little ceremony: models convert to
   domain types at every boundary.
 - **GORM rules that keep leasing correct.** Skip the default transaction, translate duplicate-key errors,
   pass the caller's context on every call, let MySQL write the timestamps, update with maps rather than structs
   (a struct silently drops zero values), and check `RowsAffected` on every fence, which needs `clientFoundRows=true`.
   No `AutoMigrate`: schema changes are numbered SQL files.
-- **Per-rendition loudness, verified.** The mono downmix of an uncorrelated stereo recording lands about 3 LU
-  below the stereo file, dual-mono content gains 3 dB of peak, and the AAC encoder moves both loudness and peak.
+- **Per-rendition loudness, verified.** Loudness is measured in LUFS (loudness units relative to full scale), and a
+  difference of one loudness unit is 1 LU. The true peak, in dBTP (decibels, true peak), is the highest level the
+  decoded waveform reaches, including between samples. The mono downmix of an uncorrelated stereo recording lands
+  about 3 LU below the stereo file, dual-mono content gains 3 dB of peak, and the AAC encoder moves both loudness
+  and peak.
   A listener asleep with the volume set for one story notices a quiet or sudden file, so the encode pool measures
   each output channel layout after the downmix, normalises each with its own two-pass `loudnorm`, then re-measures
   every encoded file. Each must be within 1 LU of the tenant's target (default -16 LUFS) with a true peak at or below
@@ -230,7 +241,7 @@ Each with its trade-off.
   verification pass per upload.
 - **Tenant isolation, IDs and secrets.** Every tenant-owned query filters on `tenant_id`, and another tenant's asset
   is the same 404 as a missing one. Public and event IDs are UUIDv7 in `BINARY(16)`, which keeps inserts
-  append-mostly at the cost of revealing the creation time. Idempotency keys are `ascii_bin`, so `Upload-42` and
+  append-mostly at the cost of revealing the creation time. Idempotency keys use the `ascii_bin` collation, so `Upload-42` and
   `upload-42` are different keys; under MySQL's default collation they would collide. API keys are stored as SHA-256
   only. Webhook secrets can't be hashed, since every delivery signs with the secret itself, so they are stored as
   AES-256-GCM ciphertext bound to their row and tenant, under a key ring that lets a new key go first.
@@ -259,7 +270,7 @@ Each with its trade-off.
 
 Migrations are numbered SQL files in `src/db/migrations/`, applied in order under a MySQL lock, so many instances
 can start at once. MySQL DDL commits implicitly, so each file is one logical, re-runnable change, with `ALGORITHM`
-and `LOCK` stated, so MySQL refuses an unsafe change instead of silently blocking writes. Measured on MySQL 8.0:
+and `LOCK` stated, so MySQL refuses an unsafe change instead of silently blocking writes. SPEC.md measured these on MySQL 8.0.46; the Compose stack runs MySQL 8.4:
 
 | Change | Result |
 |---|---|
@@ -279,7 +290,7 @@ For a change that spans a deploy (not built, only written down here):
   metadata-lock waits, and set a low `lock_wait_timeout` on DDL sessions.
 - **Backfills** run in keyset batches, with sleeps and a replica-lag check between them.
 - **Examples.** Adding `language` to `assets` is INSTANT. A `rejected` status is appended to the ENUM, never inserted.
-  The idempotency-key collation fix is done online with the new-column route.
+  The idempotency-key collation fix is done online with the new-column route above.
 
 ## Known limitations
 
@@ -296,8 +307,9 @@ For a change that spans a deploy (not built, only written down here):
   to 480,256 samples despite the MP4 edit list. A seamless soundscape can click at every seam unless the player
   honours gapless metadata or crossfades.
 - **A source louder than 0 LUFS isn't handled.** loudnorm's `measured_I` option accepts -99 to 0, so pass 2 is
-  expected to fail on such a source (from the notes of the audio pull request; not run since). The failure is a plain
-  ffmpeg exit, not a rejection: the processor retries it with backoff, and after three attempts the asset ends
+  expected to fail on such a source. That comes from the open questions of
+  [pull request #11](https://github.com/zanvd/slumber-mill/pull/11), which added the audio package, and hasn't
+  been re-run since. The failure is a plain ffmpeg exit, not a rejection: the encode pool retries it with backoff, and after three attempts the asset ends
   `failed` with the generic message "processing failed after repeated attempts", not a tenant-specific one.
   It's rare, and nothing checks for it up front.
 - **Re-sealing webhook secrets under a new key is documented, not built.** A new key can go first in the key ring,
