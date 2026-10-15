@@ -1,6 +1,24 @@
+x-runtime-build: &runtime-build
+  context: .
+  target: runtime
+  args:
+    APP_UID: ${APP_UID:-1000}
+
+x-data-volume: &data-volume
+  type: bind
+  source: ./var/data
+  target: /data
+  bind:
+    create_host_path: false
+
+# DEV ONLY: a fixed key for the local stack. Production reads its key ring from a secret manager.
+x-dev-only-secret-keys: &dev-only-secret-keys "1:2msFlHD07Wase5XLGZqo/KQADXNakuUYbBeutcmLD0Q="
+
 services:
   mysql:
     image: mysql:8.4
+    # The README works out the worst case, 362 connections.
+    command: ["--max-connections=400"]
     environment:
       MYSQL_RANDOM_ROOT_PASSWORD: "yes"
       MYSQL_DATABASE: slumber_mill
@@ -19,7 +37,58 @@ services:
       start_period: 2m
       start_interval: 1s
 
+  migrate:
+    build: *runtime-build
+    command: ["migrate"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  api:
+    build: *runtime-build
+    command: ["api"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SLUMBER_MILL_SECRET_KEYS: *dev-only-secret-keys
+      SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE: "true"
+    volumes:
+      - *data-volume
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 45s
+
+  worker-encode:
+    build:
+      context: .
+      target: runtime-media
+      args:
+        APP_UID: ${APP_UID:-1000}
+    command: ["worker", "-pool", "encode"]
+    cpus: 2
+    volumes:
+      - *data-volume
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 45s
+
+  worker-webhook:
+    build: *runtime-build
+    command: ["worker", "-pool", "webhook"]
+    environment:
+      SLUMBER_MILL_SECRET_KEYS: *dev-only-secret-keys
+      SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE: "true"
+    volumes:
+      - *data-volume
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 45s
+
   dev:
+    profiles: ["dev"]
     build:
       context: .
       target: dev
