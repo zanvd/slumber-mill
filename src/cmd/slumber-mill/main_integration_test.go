@@ -12,6 +12,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -404,6 +406,126 @@ func TestAPIServesUntilDrained(t *testing.T) {
 	}
 	if stdout.Len() > 0 {
 		t.Errorf("api wrote to stdout: %q", stdout.String())
+	}
+}
+
+// cancelOnLog writes log lines to w, and calls cancel once it has written a record with msg,
+// so the command is stopped at that point of its startup.
+type cancelOnLog struct {
+	w      io.Writer
+	msg    string
+	cancel context.CancelFunc
+}
+
+func (c cancelOnLog) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	var rec struct {
+		Msg string `json:"msg"`
+	}
+	if json.Unmarshal(p, &rec) == nil && rec.Msg == c.msg {
+		c.cancel()
+	}
+	return n, err
+}
+
+// TestStopDuringStartup signals the long-running commands before and while they start up. A stop isn't a crash,
+// so each one exits 0, and the API stops without serving; a real startup error still exits 1.
+func TestStopDuringStartup(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	apiEnv := func(addr string) map[string]string {
+		return map[string]string{envDSN: dsn, envHTTPAddr: addr, envDrainDelay: "1s", envShutdownGrace: "1s"}
+	}
+	webhookEnv := map[string]string{envDSN: dsn, envSecretKeys: newKeyRing()}
+
+	tests := []struct {
+		name string
+		args []string
+		env  map[string]string
+		// stopBefore cancels the context before the command starts, and stopOn once it logs that message.
+		// With neither, nothing stops the command.
+		stopBefore  bool
+		stopOn      string
+		wantCode    int
+		wantLogs    []string
+		notWantLogs []string
+		wantError   []string
+	}{
+		{name: "api stopped before startup", args: []string{"api"}, env: apiEnv("127.0.0.1:0"), stopBefore: true,
+			wantLogs: []string{"stopped before serving HTTP"}, notWantLogs: []string{"serving HTTP", "command failed"}},
+		{name: "api stopped during startup", args: []string{"api"}, env: apiEnv("127.0.0.1:0"),
+			stopOn:   "swept temp files",
+			wantLogs: []string{"stopped before serving HTTP"}, notWantLogs: []string{"serving HTTP", "command failed"}},
+		// The host name is resolved on the signal's context, which can fail the listen.
+		{name: "api on a host name stopped before startup", args: []string{"api"}, env: apiEnv("localhost:0"),
+			stopBefore: true,
+			wantLogs:   []string{"stopped before serving HTTP"}, notWantLogs: []string{"serving HTTP", "command failed"}},
+		{name: "api with its port taken", args: []string{"api"}, env: apiEnv(taken.Addr().String()),
+			wantCode: exitError, wantLogs: []string{"command failed"}, notWantLogs: []string{"serving HTTP"},
+			wantError: []string{"error listening on " + taken.Addr().String(), "address already in use"}},
+		{name: "webhook pool stopped before startup", args: []string{"worker", "-pool", "webhook"}, env: webhookEnv,
+			stopBefore: true, wantLogs: []string{"worker pool stopped"}, notWantLogs: []string{"command failed"}},
+		{name: "webhook pool stopped during startup", args: []string{"worker", "-pool", "webhook"}, env: webhookEnv,
+			stopOn: "swept temp files", wantLogs: []string{"worker pool stopped"}, notWantLogs: []string{"command failed"}},
+		{name: "encode pool stopped during startup", args: []string{"worker", "-pool", "encode"},
+			env: map[string]string{envDSN: dsn}, stopOn: "found ffmpeg",
+			wantLogs: []string{"swept temp files", "worker pool stopped"}, notWantLogs: []string{"command failed"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := maps.Clone(tt.env)
+			env[envDataDir] = t.TempDir()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.stopBefore {
+				cancel()
+			}
+			var stdout, stderr bytes.Buffer
+			var logs io.Writer = &stderr
+			if tt.stopOn != "" {
+				logs = cancelOnLog{w: &stderr, msg: tt.stopOn, cancel: cancel}
+			}
+			done := make(chan int, 1)
+			go func() { done <- run(ctx, tt.args, envFrom(env), &stdout, logs) }()
+			code := waitFor(t, done, "exit")
+
+			if code != tt.wantCode {
+				t.Errorf("exit code %d, want %d; stderr:\n%s", code, tt.wantCode, stderr.String())
+			}
+			records := map[string]map[string]any{}
+			for line := range strings.Lines(stderr.String()) {
+				var rec map[string]any
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					t.Errorf("stderr line isn't JSON: %q", line)
+					continue
+				}
+				if msg, _ := rec["msg"].(string); records[msg] == nil {
+					records[msg] = rec
+				}
+			}
+			for _, msg := range tt.wantLogs {
+				if records[msg] == nil {
+					t.Errorf("no %q logged; stderr:\n%s", msg, stderr.String())
+				}
+			}
+			for _, msg := range tt.notWantLogs {
+				if records[msg] != nil {
+					t.Errorf("logged %v, want no %q", records[msg], msg)
+				}
+			}
+			for _, want := range tt.wantError {
+				if got, _ := records["command failed"]["error"].(string); !strings.Contains(got, want) {
+					t.Errorf("logged the error %q, want it to contain %q", got, want)
+				}
+			}
+			if stdout.Len() > 0 {
+				t.Errorf("wrote to stdout: %q", stdout.String())
+			}
+		})
 	}
 }
 

@@ -197,6 +197,14 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.HTTPAddr)
+	// A signal before the server serves is a stop, even when it failed the listen: there is nothing to drain.
+	if ctx.Err() != nil {
+		if ln != nil {
+			ln.Close()
+		}
+		log.InfoContext(ctx, "stopped before serving HTTP")
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("error listening on %s: %w", cfg.HTTPAddr, err)
 	}
