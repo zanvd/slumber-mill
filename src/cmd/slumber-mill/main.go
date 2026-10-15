@@ -233,6 +233,9 @@ func runEncodePool(ctx context.Context, log *slog.Logger, getenv func(string) st
 	ff := audio.New()
 	files := storage.NewLocal(cfg.DataDir)
 	if err := startEncode(ctx, poolLog, ff, files, cfg.Lease); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 

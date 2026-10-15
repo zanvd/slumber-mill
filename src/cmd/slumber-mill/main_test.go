@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -22,9 +23,11 @@ func TestRun(t *testing.T) {
 	dataDir := t.TempDir()
 
 	tests := []struct {
-		name          string
-		args          []string
-		env           map[string]string
+		name string
+		args []string
+		env  map[string]string
+		// stopped runs the command on a context cancelled already, as when a signal arrives during startup.
+		stopped       bool
 		wantCode      int
 		wantStderr    []string
 		notWantStderr []string
@@ -78,6 +81,11 @@ func TestRun(t *testing.T) {
 		{name: "webhook worker with a bad DSN", args: []string{"worker", "-pool", "webhook"},
 			env:      map[string]string{envSecretKeys: validKeys, envDSN: badDSN, envDataDir: dataDir},
 			wantCode: exitError, wantStderr: []string{"error parsing DSN"}, notWantStderr: []string{validKeys[2:]}},
+		// Whether or not ffmpeg is installed, the check fails on the cancelled context; a bad DSN would fail
+		// the command if startup went on.
+		{name: "encode worker stopped during the ffmpeg check", args: []string{"worker", "-pool", "encode"},
+			env: map[string]string{envDSN: badDSN, envDataDir: dataDir}, stopped: true, wantCode: exitOK,
+			notWantStderr: []string{"command failed", "ffmpeg", "DSN"}},
 
 		{name: "tenant without a subcommand", args: []string{"tenant"}, wantCode: exitUsage,
 			wantStderr: []string{"tenant: the only subcommand is create"}},
@@ -107,8 +115,13 @@ func TestRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.stopped {
+				cancel()
+			}
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), tt.args, envFrom(tt.env), &stdout, &stderr)
+			code := run(ctx, tt.args, envFrom(tt.env), &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr:\n%s", tt.args, code, tt.wantCode, stderr.String())
 			}
