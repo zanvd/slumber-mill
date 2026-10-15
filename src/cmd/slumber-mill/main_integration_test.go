@@ -673,6 +673,61 @@ func TestEncodeWorker(t *testing.T) {
 	}
 }
 
+// TestEncodeWorkerRecoversACrash starts the encode pool where a worker died mid-encode: its asset is still processing
+// on an expired lease, and its temp outputs are older than the lease. The new pool sweeps those files,
+// reaps the asset and encodes it as attempt 2.
+func TestEncodeWorkerRecoversACrash(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+	dataDir := t.TempDir()
+	s := newTestStack(t, dsn, dataDir)
+	tenantID, _ := s.createTenant(t, map[string]string{envDSN: dsn, envSecretKeys: newKeyRing()}, "-slug", "crash-test")
+	crashed := s.upload(t, tenantID, "Rain", testutil.DualMonoPink(t))
+	s.exec(t, "UPDATE assets SET status = 'processing', attempts = 1, locked_by = 'dead:1', "+
+		"lease_expires_at = NOW(6) - INTERVAL 1 SECOND WHERE public_id = ?", db.ID(crashed.ID))
+	left := []string{
+		plantTempFile(t, dataDir, "part-1", time.Now().Add(-90*time.Second)),
+		plantTempFile(t, dataDir, "part-2", time.Now().Add(-90*time.Second)),
+	}
+
+	env := envFrom(map[string]string{envDSN: dsn, envDataDir: dataDir, envEncodeLease: "1m"})
+	stderr, records := logRecords(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var stdout bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"worker", "-pool", "encode"}, env, &stdout, stderr)
+		stderr.Close()
+	}()
+
+	if swept := waitForLog(t, records, "swept temp files"); swept["removed"] != float64(len(left)) {
+		t.Errorf("logged %v, want the %d files the dead worker left removed", swept, len(left))
+	}
+	for _, path := range left {
+		if exists(t, path) {
+			t.Errorf("%s survived the startup sweep", path)
+		}
+	}
+	if reaped := waitForLog(t, records, "reaped assets whose lease expired"); reaped["requeued"] != float64(1) {
+		t.Errorf("logged %v, want the asset requeued", reaped)
+	}
+	if finished := waitForLog(t, records, "work finished"); finished["outcome"] != "done" ||
+		finished["attempt"] != float64(2) {
+		t.Errorf("logged %v, want the asset done on attempt 2", finished)
+	}
+	got, err := s.assets.Get(t.Context(), tenantID, crashed.ID.String())
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.Status != asset.StatusReady || len(got.Renditions) != 2 {
+		t.Errorf("asset is %s with %d renditions, want ready with 2", got.Status, len(got.Renditions))
+	}
+	cancel()
+	if code := waitFor(t, done, "exit"); code != exitOK {
+		t.Errorf("exit code %d, want 0", code)
+	}
+}
+
 // receivedWebhook is a webhook as the test receiver got it.
 type receivedWebhook struct {
 	eventID   string
