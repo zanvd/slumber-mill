@@ -887,6 +887,8 @@ A Makefile may wrap these, as long as each target stays a single `docker compose
 
 The temp refresh (every lease/3) and the startup temp sweep's age follow the encode lease,
 so `api` and both pools read `SLUMBER_MILL_ENCODE_LEASE`.
+Its minimum is `1m`, twice the 30 s an upload may go without a write, since nothing refreshes a staged upload's
+temp file; a shorter value is a configuration error, and the process exits 1.
 
 ### Other process behaviour
 

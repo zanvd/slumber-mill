@@ -35,6 +35,10 @@ const (
 	defaultEncodeLease        = 2 * time.Minute
 	defaultShutdownGrace      = 30 * time.Second
 	defaultDrainDelay         = 10 * time.Second
+
+	// minEncodeLease keeps the startup sweep, whose age is the encode lease, well clear of staged uploads:
+	// nothing refreshes their temp files, and an upload may go 30 s without a write.
+	minEncodeLease = time.Minute
 )
 
 type migrateConfig struct {
@@ -95,7 +99,7 @@ func loadAPIConfig(getenv func(string) string) (apiConfig, error) {
 		MaxUploadBytes:      p.positiveInt64(envMaxUploadBytes, httpsrv.DefaultMaxUploadBytes),
 		MaxUploadsPerTenant: p.positiveInt(envMaxUploadsPerTenant, httpsrv.DefaultMaxUploadsPerTenant),
 		TrustedProxies:      p.addresses(envTrustedProxies),
-		EncodeLease:         p.positiveDuration(envEncodeLease, defaultEncodeLease),
+		EncodeLease:         p.durationAtLeast(envEncodeLease, defaultEncodeLease, minEncodeLease),
 		DrainDelay:          p.duration(envDrainDelay, defaultDrainDelay),
 		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
 	}
@@ -108,7 +112,7 @@ func loadEncodeConfig(getenv func(string) string) (encodeConfig, error) {
 		DSN:           p.string(envDSN, defaultDSN),
 		DataDir:       p.string(envDataDir, defaultDataDir),
 		Concurrency:   p.positiveInt(envEncodeConcurrency, runtime.GOMAXPROCS(0)),
-		Lease:         p.positiveDuration(envEncodeLease, defaultEncodeLease),
+		Lease:         p.durationAtLeast(envEncodeLease, defaultEncodeLease, minEncodeLease),
 		ShutdownGrace: p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
 	}
 	return cfg, p.err()
@@ -120,7 +124,7 @@ func loadWebhookConfig(getenv func(string) string) (webhookConfig, error) {
 		DSN:                 p.string(envDSN, defaultDSN),
 		DataDir:             p.string(envDataDir, defaultDataDir),
 		Concurrency:         p.positiveInt(envWebhookConcurrency, defaultWebhookConcurrency),
-		EncodeLease:         p.positiveDuration(envEncodeLease, defaultEncodeLease),
+		EncodeLease:         p.durationAtLeast(envEncodeLease, defaultEncodeLease, minEncodeLease),
 		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
 		WebhookAllowPrivate: p.bool(envWebhookAllowPrivate, false),
 		SecretKeys:          p.secret(envSecretKeys),
@@ -200,24 +204,24 @@ func (p *envParser) positiveInt(name string, def int) int {
 }
 
 func (p *envParser) duration(name string, def time.Duration) time.Duration {
-	return p.durationFrom(name, def, 0)
+	return p.durationFrom(name, def, 0, "a duration of zero or more, such as 10s")
 }
 
 func (p *envParser) positiveDuration(name string, def time.Duration) time.Duration {
-	return p.durationFrom(name, def, time.Nanosecond)
+	return p.durationFrom(name, def, time.Nanosecond, "a positive duration, such as 30s")
 }
 
-func (p *envParser) durationFrom(name string, def, minimum time.Duration) time.Duration {
+func (p *envParser) durationAtLeast(name string, def, minimum time.Duration) time.Duration {
+	return p.durationFrom(name, def, minimum, "a duration of at least "+minimum.String()+", such as "+def.String())
+}
+
+func (p *envParser) durationFrom(name string, def, minimum time.Duration, want string) time.Duration {
 	v := p.lookup(name)
 	if v == "" {
 		return def
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d < minimum {
-		want := "a duration of zero or more, such as 10s"
-		if minimum > 0 {
-			want = "a positive duration, such as 30s"
-		}
 		p.invalid(name, want, v)
 		return def
 	}

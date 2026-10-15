@@ -66,7 +66,7 @@ func TestRun(t *testing.T) {
 		{name: "encode worker with bad configuration", args: []string{"worker", "-pool", "encode"},
 			env:      map[string]string{envEncodeLease: "soon", envEncodeConcurrency: "0"},
 			wantCode: exitError,
-			wantStderr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a positive duration, such as 30s, got \"soon\"`,
+			wantStderr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"soon\"`,
 				`SLUMBER_MILL_ENCODE_CONCURRENCY must be a positive integer, got \"0\"`}},
 		{name: "webhook worker with bad configuration", args: []string{"worker", "-pool", "webhook"},
 			env:      map[string]string{envWebhookConcurrency: "lots"},
@@ -81,6 +81,23 @@ func TestRun(t *testing.T) {
 		{name: "webhook worker with a bad DSN", args: []string{"worker", "-pool", "webhook"},
 			env:      map[string]string{envSecretKeys: validKeys, envDSN: badDSN, envDataDir: dataDir},
 			wantCode: exitError, wantStderr: []string{"error parsing DSN"}, notWantStderr: []string{validKeys[2:]}},
+		{name: "api with an encode lease below the minimum", args: []string{"api"},
+			env:      map[string]string{envEncodeLease: "59s", envDataDir: dataDir},
+			wantCode: exitError,
+			wantStderr: []string{
+				`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"59s\"`}},
+		{name: "encode worker with an encode lease below the minimum", args: []string{"worker", "-pool", "encode"},
+			env:      map[string]string{envEncodeLease: "2ns", envDataDir: dataDir},
+			wantCode: exitError,
+			wantStderr: []string{
+				`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"2ns\"`},
+			notWantStderr: []string{"ffmpeg", "swept"}},
+		{name: "webhook worker with an encode lease below the minimum", args: []string{"worker", "-pool", "webhook"},
+			env:      map[string]string{envSecretKeys: validKeys, envEncodeLease: "59s", envDataDir: dataDir},
+			wantCode: exitError,
+			wantStderr: []string{
+				`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"59s\"`},
+			notWantStderr: []string{"swept"}},
 		// Whether or not ffmpeg is installed, the check fails on the cancelled context; a bad DSN would fail
 		// the command if startup went on.
 		{name: "encode worker stopped during the ffmpeg check", args: []string{"worker", "-pool", "encode"},

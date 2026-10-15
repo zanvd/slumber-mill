@@ -63,9 +63,18 @@ func TestLoadAPIConfig(t *testing.T) {
 			},
 		},
 		{
-			name:    "encode lease zero",
-			env:     map[string]string{envEncodeLease: "0s"},
-			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a positive duration, such as 30s, got "0s"`},
+			name:    "encode lease below the minimum",
+			env:     map[string]string{envEncodeLease: "59s"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "59s"`},
+		},
+		{
+			name: "encode lease at the minimum",
+			env:  map[string]string{envEncodeLease: "1m"},
+			want: func() apiConfig {
+				c := defaults
+				c.EncodeLease = time.Minute
+				return c
+			}(),
 		},
 		{
 			name:    "upload limit not a number",
@@ -205,12 +214,26 @@ func TestLoadEncodeConfig(t *testing.T) {
 		{
 			name:    "lease without a unit",
 			env:     map[string]string{envEncodeLease: "120"},
-			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a positive duration, such as 30s, got "120"`},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "120"`},
 		},
 		{
 			name:    "lease negative",
 			env:     map[string]string{envEncodeLease: "-2m"},
-			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a positive duration, such as 30s, got "-2m"`},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "-2m"`},
+		},
+		{
+			name:    "lease below the minimum",
+			env:     map[string]string{envEncodeLease: "59s"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "59s"`},
+		},
+		{
+			name: "lease at the minimum",
+			env:  map[string]string{envEncodeLease: "1m"},
+			want: func() encodeConfig {
+				c := defaults
+				c.Lease = time.Minute
+				return c
+			}(),
 		},
 		{
 			name:    "every invalid variable is reported",
@@ -300,9 +323,18 @@ func TestLoadWebhookConfig(t *testing.T) {
 			wantErr: []string{`SLUMBER_MILL_WEBHOOK_CONCURRENCY must be a positive integer, got "-8"`},
 		},
 		{
-			name:    "encode lease zero",
-			env:     map[string]string{envSecretKeys: keys, envEncodeLease: "0"},
-			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a positive duration, such as 30s, got "0"`},
+			name:    "encode lease below the minimum",
+			env:     map[string]string{envSecretKeys: keys, envEncodeLease: "59s"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "59s"`},
+		},
+		{
+			name: "encode lease at the minimum",
+			env:  map[string]string{envSecretKeys: keys, envEncodeLease: "1m"},
+			want: func() plain {
+				c := defaults
+				c.EncodeLease = time.Minute
+				return c
+			}(),
 		},
 		{
 			name: "every invalid variable is reported",
