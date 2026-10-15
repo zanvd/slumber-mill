@@ -57,7 +57,7 @@ the `id` field of the 202 response, then poll until the asset's `status` is `rea
 ```sh
 export API_KEY=sm_...
 curl -H "Authorization: Bearer $API_KEY" -F title=Rain -F file=@rain.wav http://127.0.0.1:8080/v1/assets
-export ASSET_ID=<the id from the response>
+export ASSET_ID=...
 curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8080/v1/assets/$ASSET_ID
 curl -H "Authorization: Bearer $API_KEY" -o rain-128k.m4a http://127.0.0.1:8080/v1/assets/$ASSET_ID/renditions/aac_128k
 ```
