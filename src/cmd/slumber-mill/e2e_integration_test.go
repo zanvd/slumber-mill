@@ -460,7 +460,7 @@ func TestEndToEndRejected(t *testing.T) {
 // becomes ready, and its signed asset.ready arrives, while the long one is still processing.
 // Then the long one becomes ready and its own signed asset.ready arrives.
 func TestEndToEndShortBeforeLong(t *testing.T) {
-	const longSource = 3 * time.Minute
+	const longSource = 2 * time.Minute
 	e := startE2E(t, e2eConfig{encodeConcurrency: 2})
 	long := e.upload(t, "Ocean, all night", testutil.PinkClip(t, longSource))
 	e.waitStatus(t, long.ID, "processing")
