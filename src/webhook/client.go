@@ -86,6 +86,11 @@ func (c *Client) Post(ctx context.Context, url, eventID, signature string, body 
 	return resp.StatusCode, nil
 }
 
+// CloseIdleConnections closes the connections that earlier posts left open for reuse.
+func (c *Client) CloseIdleConnections() {
+	c.http.CloseIdleConnections()
+}
+
 // redactURLError returns a copy of err with the URL cut to scheme://host[:port], since webhook URLs carry credentials.
 // The copy keeps the wrapped error, so errors.Is, errors.As and Timeout see what they saw before.
 func redactURLError(err error) error {
