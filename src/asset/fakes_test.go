@@ -50,6 +50,36 @@ type fakeRepo struct {
 	relayed     map[uuid.UUID]bool
 	eventLimits []int
 	markedIDs   [][]uuid.UUID
+	// expired is how many events are past retention, with IDs 1 to expired; afterPurge, if set,
+	// runs after each retention batch with its number, counting from 1.
+	expired    int
+	afterPurge func(batch int)
+	purges     []purgeArgs
+}
+
+type purgeArgs struct {
+	age   time.Duration
+	after eventCursor
+	limit int
+}
+
+// deleteRelayedEvents deletes up to limit of the expired events after the cursor.
+func (f *fakeRepo) deleteRelayedEvents(ctx context.Context, age time.Duration, after eventCursor, limit int) (
+	int, eventCursor, bool, error) {
+	f.calls.add("deleteRelayedEvents")
+	f.purges = append(f.purges, purgeArgs{age, after, limit})
+	if f.afterPurge != nil {
+		defer f.afterPurge(len(f.purges))
+	}
+	if err := f.err(ctx, "deleteRelayedEvents"); err != nil {
+		return 0, after, false, err
+	}
+	n := min(limit, f.expired-int(after.ID))
+	if n == 0 {
+		return 0, after, false, nil
+	}
+	next := eventCursor{RelayedAt: fakeNow, ID: after.ID + uint64(n)}
+	return n, next, n == limit, nil
 }
 
 func (f *fakeRepo) unrelayedEvents(ctx context.Context, limit int) ([]Event, error) {

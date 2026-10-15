@@ -31,6 +31,7 @@ import (
 
 // stack is the real service, repository and storage on a throwaway database and directory.
 type stack struct {
+	gdb   *gorm.DB
 	repo  *Repository
 	svc   *Service
 	store *storage.Local
@@ -57,7 +58,7 @@ func newStackOn(t *testing.T, dsn string) *stack {
 	root := t.TempDir()
 	store := storage.NewLocal(root)
 	repo := NewRepository(gdb)
-	return &stack{repo: repo, svc: NewService(repo, store), store: store, root: root, pool: pool}
+	return &stack{gdb: gdb, repo: repo, svc: NewService(repo, store), store: store, root: root, pool: pool}
 }
 
 func (s *stack) tenant(t *testing.T, slug string) uint64 {

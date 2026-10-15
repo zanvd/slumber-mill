@@ -389,7 +389,8 @@ FOR UPDATE SKIP LOCKED
   so work that keeps killing workers eventually fails, but it requeues with a short fixed delay (about 5 s),
   not the backoff (pitfall 26). Running out of attempts fails the row as above. Each pool reaps only its own table.
 - **Clock:** every time comes from `NOW(6)`, so clock skew between hosts can't distort leases.
-- **Retention:** delete delivered deliveries and relayed events after N days, in small keyset batches.
+- **Retention:** delete delivered deliveries 30 days after delivery (`updated_at`)
+  and relayed events 30 days after relay (`relayed_at`), in small keyset batches.
 - **Finished rows stay cheap.** Assets are never deleted, so finished rows pile up.
   With 1,048,576 finished rows in each of `assets`, `asset_events` and `webhook_deliveries`
   (926 MB, far beyond the buffer pool), every hot query stayed an index range scan over the unfinished rows:
