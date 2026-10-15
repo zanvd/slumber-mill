@@ -441,9 +441,10 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 
 ## 7. Audio processing (encode pool)
 
-Three attempts, backoff from 30 s to 10 min, a 3 h timeout.
-Budget about 140 s per 10 minutes of audio, even with two encodes sharing two cores,
-roughly 2.3 hours for a 10-hour soundscape (pitfall 23),
+Three attempts, backoff from 30 s to 10 min, a 4 h timeout.
+Under `cpus: 2` one stereo encode took about 93 s per 10 minutes of audio on a warm 10-minute file
+and 119 s on a 60-minute file; with two 60-minute encodes sharing two cores, 126 s and 151 s
+(about 160–175 s while fully overlapped), so a 10-hour soundscape needs roughly 2–3 hours (pitfall 23),
 and size the timeout, the lease and the pool's CPU limit with that in mind.
 
 ### Steps
@@ -1039,6 +1040,9 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     (30 s, 31 s, 18 s and 10 s; loudnorm alone at 34×); a review measured 88–92 s there.
     Under `docker run --cpus 2`, one encode took 91 s and 91.5 s of CPU, so an encode uses about one core,
     and two at once, the pool's size at `GOMAXPROCS` = 2, took 122 s each.
+    In the full stack under Compose with `cpus: 2`, a warm 10-minute stereo encode took 93 s, a 60-minute one 714 s
+    (119 s per 10 minutes), and two 60-minute encodes at once 758 s and 908 s;
+    the first encode after start-up took 147 s for 10 minutes.
 
 ### Processes and operations
 
