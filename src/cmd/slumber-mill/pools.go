@@ -37,7 +37,6 @@ func workerID() string {
 	return host + ":" + strconv.Itoa(os.Getpid())
 }
 
-// startEncode checks that ffmpeg and ffprobe run, and only then sweeps temp files.
 func startEncode(ctx context.Context, log *slog.Logger, ff versioner, files tempSweeper, sweepAge time.Duration) error {
 	ffmpeg, ffprobe, err := ff.Version(ctx)
 	if err != nil {
@@ -73,7 +72,6 @@ func runWebhook(ctx context.Context, relay, deliveries runner, client idleCloser
 	wg.Wait()
 }
 
-// retentionDelete deletes the rows older than age and returns how many it deleted.
 type retentionDelete func(ctx context.Context, age time.Duration) (int, error)
 
 // retain runs each delete with age at once, and again interval after each run ends, until ctx is done.

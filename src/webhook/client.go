@@ -86,7 +86,6 @@ func (c *Client) Post(ctx context.Context, url, eventID, signature string, body 
 	return resp.StatusCode, nil
 }
 
-// CloseIdleConnections closes the connections that earlier posts left open for reuse.
 func (c *Client) CloseIdleConnections() {
 	c.http.CloseIdleConnections()
 }

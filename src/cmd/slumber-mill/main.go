@@ -43,7 +43,6 @@ const (
 	// webhookLease is how long a claim or a heartbeat holds a delivery: well past the client's 15 s overall timeout,
 	// so a delivery rarely needs a heartbeat.
 	webhookLease = time.Minute
-	// retention is how long delivered deliveries and relayed events are kept.
 	retention = 30 * 24 * time.Hour
 	// retentionInterval is how long the webhook pool waits after a retention run before the next.
 	retentionInterval = time.Hour
