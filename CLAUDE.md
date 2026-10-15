@@ -105,7 +105,7 @@ docker compose run --rm dev go test -tags integration -coverprofile=/out/cover.o
 - Each worktree is its own Compose project, named after its directory, so parallel agents don't share MySQL.
   Only one of them at a time runs the full stack with `up`, because `api` publishes port 8080.
 - GitHub work goes through `git` and the `gh` CLI on the host, as the bot (see "Identity").
-- A Makefile may wrap these, as long as each target stays a single `docker compose` command (§12).
+- A Makefile may wrap these, as long as each target stays a single `docker compose` command (§12); the one exception is `process-checks`, which runs `bash scripts/process-checks.sh`.
 - Test and tool output goes to `/out` (`var/out` on the host). Nothing the containers write lands in `src/`.
 
 ## Definition of done
