@@ -312,6 +312,12 @@ For a change that spans a deploy (not built, only written down here):
   been re-run since. The failure is a plain ffmpeg exit, not a rejection: the encode pool retries it with backoff, and after three attempts the asset ends
   `failed` with the generic message "processing failed after repeated attempts", not a tenant-specific one.
   It's rare, and nothing checks for it up front.
+- **Long noise-like soundscapes can still be rejected.** The 64k rendition rebuilds peaks the limiter removed,
+  and its true peak can exceed -1.5 dBTP, more likely the longer the file.
+- **Long bright content can miss the loudness tolerance at 64k.** White noise, hiss and rain measure about
+  -17.0 LUFS for a -16 target, since the 64k encode has no `-cutoff`.
+- **Bright content at loud targets can fail the peak ceiling.** Around -9 LUFS and above, the encoder's added
+  peaks leave too little headroom.
 - **Re-sealing webhook secrets under a new key is documented, not built.** A new key can go first in the key ring,
   and older ciphertexts still open; re-sealing the old rows and then dropping the old key is manual.
 - **The webhook egress check and NAT64.** See "SSRF defences" above.

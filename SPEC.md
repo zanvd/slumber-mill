@@ -441,9 +441,10 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 
 ## 7. Audio processing (encode pool)
 
-Three attempts, backoff from 30 s to 10 min, a 3 h timeout.
-Budget about 140 s per 10 minutes of audio, even with two encodes sharing two cores,
-roughly 2.3 hours for a 10-hour soundscape (pitfall 23),
+Three attempts, backoff from 30 s to 10 min, a 4 h timeout.
+Under `cpus: 2` one stereo encode took about 93 s per 10 minutes of audio on a warm 10-minute file
+and 119 s on a 60-minute file; with two 60-minute encodes sharing two cores, 126 s and 151 s
+(about 160–175 s while fully overlapped), so a 10-hour soundscape needs roughly 2–3 hours (pitfall 23),
 and size the timeout, the lease and the pool's CPU limit with that in mind.
 
 ### Steps
@@ -495,9 +496,11 @@ The pass-2 command from step 5 (line breaks added for readability):
 
 Both outputs are 48 kHz MP4/AAC with `+faststart`.
 The integrated target comes from the tenant (default −16 LUFS) and is snapshotted onto the asset at upload.
-The published ceiling is −1.5 dBTP. loudnorm gets a pre-encode `TP` of −4.0 dBTP, 2.5 dB of headroom below it,
-because the encoder adds true peak (pitfall 17), and `LRA=50`, its maximum in 6.1.1:
+The published ceiling is −1.5 dBTP. loudnorm gets a pre-encode `TP` of −4.5 dBTP, 3 dB of headroom below it,
+because resampling and the encoder add true peak (pitfall 17), and `LRA=50`, its maximum in 6.1.1:
 it never blocks linear mode, and lower values pull dynamic renders off target.
+A lower `TP` doesn't buy more: at −5.0 the worst 64k peak was no lower,
+and at −6.0 the 64k rendition of pink noise landed 3–5 LU under target.
 
 ### Why per-rendition loudness (measured)
 
@@ -1011,8 +1014,15 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 15. **Normalise after downmixing, per rendition.** Uncorrelated stereo lost about 3 LU in mono
     (−18.75 and −19.39 LUFS for a −16 target); dual-mono gained 3 dB of peak (−0.14 dBTP against a −1.5 ceiling).
 16. **Verify every rendition.** Checking only the 128k file would have published the out-of-spec 64k one.
-17. **Codec drift on bright content.** White noise at AAC 128k measured −17.01 LUFS because of the encoder's low-pass;
-    `-cutoff 20000` brought it to −16.36. AAC added up to 2.3 dB of true peak.
+17. **The encoder drifts loudness and puts peaks back.** White noise at AAC 128k measured −17.01 LUFS because of the
+    encoder's low-pass; `-cutoff 20000` brought it to −16.36. On noise-like content the 64k mono encode rebuilds the
+    peaks loudnorm's limiter removed: its true peak sat about 14–14.7 dB above its loudness whatever the pre-encode
+    `TP`. With −4.0, 10- and 60-minute pink noise came out at −2.35 to −1.26 dBTP, 3 of 12 runs over the ceiling.
+    With −4.5 the worst of 9 was −1.84, with −5.0 the worst of 11 was −1.69, and with −6.0 the rendition fell to
+    −19 to −21 LUFS. The worst peak grew by roughly 0.3–0.5 dB for every tenfold increase in length, so a 10-hour
+    noise soundscape can still exceed the ceiling. Resampling loudnorm's 192 kHz output to 48 kHz adds 0.1–0.3 dB on
+    its own. At 64k, which has no `-cutoff`, white noise of 10 minutes or more measured −17.04 LUFS against a −16
+    target.
 18. **loudnorm's linear mode is a request.** A thunder crack in quiet rain made it fall back to dynamic mode silently:
     on target overall (−16.09), but the rain bed rose from −45.3 to −13.2 LUFS.
     The report saying so only prints at info level.
@@ -1030,6 +1040,9 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     (30 s, 31 s, 18 s and 10 s; loudnorm alone at 34×); a review measured 88–92 s there.
     Under `docker run --cpus 2`, one encode took 91 s and 91.5 s of CPU, so an encode uses about one core,
     and two at once, the pool's size at `GOMAXPROCS` = 2, took 122 s each.
+    In the full stack under Compose with `cpus: 2`, a warm 10-minute stereo encode took 93 s, a 60-minute one 714 s
+    (119 s per 10 minutes), and two 60-minute encodes at once 758 s and 908 s;
+    the first encode after start-up took 147 s for 10 minutes.
 
 ### Processes and operations
 

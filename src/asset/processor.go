@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	processTimeout = 3 * time.Hour
+	processTimeout = 4 * time.Hour
 	finishTimeout  = 15 * time.Second
 	retryBase      = 30 * time.Second
 	retryMax       = 10 * time.Minute
