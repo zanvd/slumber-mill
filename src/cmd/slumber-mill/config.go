@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,17 +19,22 @@ const (
 	envHTTPAddr            = "SLUMBER_MILL_HTTP_ADDR"
 	envMaxUploadBytes      = "SLUMBER_MILL_MAX_UPLOAD_BYTES"
 	envMaxUploadsPerTenant = "SLUMBER_MILL_MAX_UPLOADS_PER_TENANT"
+	envEncodeConcurrency   = "SLUMBER_MILL_ENCODE_CONCURRENCY"
+	envWebhookConcurrency  = "SLUMBER_MILL_WEBHOOK_CONCURRENCY"
+	envEncodeLease         = "SLUMBER_MILL_ENCODE_LEASE"
 	envShutdownGrace       = "SLUMBER_MILL_SHUTDOWN_GRACE"
 	envDrainDelay          = "SLUMBER_MILL_DRAIN_DELAY"
 	envTrustedProxies      = "SLUMBER_MILL_TRUSTED_PROXIES"
 	envWebhookAllowPrivate = "SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE"
 	envSecretKeys          = "SLUMBER_MILL_SECRET_KEYS"
 
-	defaultDSN           = "slumber_mill:slumber_mill@tcp(mysql:3306)/slumber_mill"
-	defaultDataDir       = "/data"
-	defaultHTTPAddr      = ":8080"
-	defaultShutdownGrace = 30 * time.Second
-	defaultDrainDelay    = 10 * time.Second
+	defaultDSN                = "slumber_mill:slumber_mill@tcp(mysql:3306)/slumber_mill"
+	defaultDataDir            = "/data"
+	defaultHTTPAddr           = ":8080"
+	defaultWebhookConcurrency = 8
+	defaultEncodeLease        = 2 * time.Minute
+	defaultShutdownGrace      = 30 * time.Second
+	defaultDrainDelay         = 10 * time.Second
 )
 
 type migrateConfig struct {
@@ -43,8 +49,29 @@ type apiConfig struct {
 	MaxUploadsPerTenant int
 	// TrustedProxies is nil when no proxy is trusted.
 	TrustedProxies []string
-	DrainDelay     time.Duration
-	ShutdownGrace  time.Duration
+	// EncodeLease is the encode pool's lease, which the startup temp sweep's age follows.
+	EncodeLease   time.Duration
+	DrainDelay    time.Duration
+	ShutdownGrace time.Duration
+}
+
+type encodeConfig struct {
+	DSN           string
+	DataDir       string
+	Concurrency   int
+	Lease         time.Duration
+	ShutdownGrace time.Duration
+}
+
+type webhookConfig struct {
+	DSN         string
+	DataDir     string
+	Concurrency int
+	// EncodeLease is the encode pool's lease, which the startup temp sweep's age follows.
+	EncodeLease         time.Duration
+	ShutdownGrace       time.Duration
+	WebhookAllowPrivate bool
+	SecretKeys          secret.Value
 }
 
 type tenantCreateConfig struct {
@@ -68,8 +95,35 @@ func loadAPIConfig(getenv func(string) string) (apiConfig, error) {
 		MaxUploadBytes:      p.positiveInt64(envMaxUploadBytes, httpsrv.DefaultMaxUploadBytes),
 		MaxUploadsPerTenant: p.positiveInt(envMaxUploadsPerTenant, httpsrv.DefaultMaxUploadsPerTenant),
 		TrustedProxies:      p.addresses(envTrustedProxies),
+		EncodeLease:         p.positiveDuration(envEncodeLease, defaultEncodeLease),
 		DrainDelay:          p.duration(envDrainDelay, defaultDrainDelay),
 		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
+	}
+	return cfg, p.err()
+}
+
+func loadEncodeConfig(getenv func(string) string) (encodeConfig, error) {
+	p := envParser{getenv: getenv}
+	cfg := encodeConfig{
+		DSN:           p.string(envDSN, defaultDSN),
+		DataDir:       p.string(envDataDir, defaultDataDir),
+		Concurrency:   p.positiveInt(envEncodeConcurrency, runtime.GOMAXPROCS(0)),
+		Lease:         p.positiveDuration(envEncodeLease, defaultEncodeLease),
+		ShutdownGrace: p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
+	}
+	return cfg, p.err()
+}
+
+func loadWebhookConfig(getenv func(string) string) (webhookConfig, error) {
+	p := envParser{getenv: getenv}
+	cfg := webhookConfig{
+		DSN:                 p.string(envDSN, defaultDSN),
+		DataDir:             p.string(envDataDir, defaultDataDir),
+		Concurrency:         p.positiveInt(envWebhookConcurrency, defaultWebhookConcurrency),
+		EncodeLease:         p.positiveDuration(envEncodeLease, defaultEncodeLease),
+		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
+		WebhookAllowPrivate: p.bool(envWebhookAllowPrivate, false),
+		SecretKeys:          p.secret(envSecretKeys),
 	}
 	return cfg, p.err()
 }

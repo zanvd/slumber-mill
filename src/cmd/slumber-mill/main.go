@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/zanvd/slumber-mill/src/asset"
+	"github.com/zanvd/slumber-mill/src/audio"
 	"github.com/zanvd/slumber-mill/src/db"
 	"github.com/zanvd/slumber-mill/src/egress"
 	"github.com/zanvd/slumber-mill/src/httpsrv"
@@ -23,6 +24,8 @@ import (
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/storage"
 	"github.com/zanvd/slumber-mill/src/tenant"
+	"github.com/zanvd/slumber-mill/src/webhook"
+	"github.com/zanvd/slumber-mill/src/worker"
 )
 
 const (
@@ -34,6 +37,12 @@ const (
 	idleTimeout       = 2 * time.Minute
 
 	defaultTargetLUFS = -16
+
+	// pollInterval is how long an idle slot waits, give or take half, before it claims again.
+	pollInterval = time.Second
+	// webhookLease is how long a claim or a heartbeat holds a delivery: well past the client's 15 s overall timeout,
+	// so a delivery rarely needs a heartbeat.
+	webhookLease = time.Minute
 )
 
 const usage = `usage:
@@ -101,7 +110,7 @@ func dispatch(ctx context.Context, log *slog.Logger, args []string, getenv func(
 		}
 		return runAPI(ctx, log, getenv)
 	case "worker":
-		return runWorker(rest)
+		return runWorker(ctx, log, rest, getenv)
 	case "tenant":
 		if len(rest) == 0 || rest[0] != "create" {
 			return usageError{"tenant: the only subcommand is create"}
@@ -152,6 +161,8 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 	if err != nil {
 		return err
 	}
+	files := storage.NewLocal(cfg.DataDir)
+	sweepTemp(ctx, log, files, cfg.EncodeLease)
 
 	gdb, err := db.Open(cfg.DSN, log)
 	if err != nil {
@@ -164,7 +175,7 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 	defer pool.Close()
 
 	tenants := tenant.NewService(tenant.NewRepository(gdb), nil, nil)
-	assets := asset.NewService(asset.NewRepository(gdb), storage.NewLocal(cfg.DataDir))
+	assets := asset.NewService(asset.NewRepository(gdb), files)
 	handler, err := httpsrv.NewServer(log, tenants, assets, httpsrv.Config{
 		TrustedProxies:      cfg.TrustedProxies,
 		Readiness:           pool,
@@ -190,20 +201,127 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 	return serve(ctx, log, srv, ln, handler, cfg.DrainDelay, cfg.ShutdownGrace)
 }
 
-func runWorker(args []string) error {
+func runWorker(ctx context.Context, log *slog.Logger, args []string, getenv func(string) string) error {
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	pool := fs.String("pool", "", "")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	switch *pool {
-	case "encode", "webhook":
-		return fmt.Errorf("worker -pool %s: not implemented yet", *pool)
+	case "encode":
+		return runEncodePool(ctx, log, getenv)
+	case "webhook":
+		return runWebhookPool(ctx, log, getenv)
 	case "":
 		return usageError{"worker: -pool is required"}
 	default:
 		return usageError{fmt.Sprintf("worker: unknown pool %q, want encode or webhook", *pool)}
 	}
+}
+
+func runEncodePool(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	cfg, err := loadEncodeConfig(getenv)
+	if err != nil {
+		return err
+	}
+	id := workerID()
+	poolLog := log.With("worker", id, "pool", "encode")
+	ff := audio.New()
+	files := storage.NewLocal(cfg.DataDir)
+	if err := startEncode(ctx, poolLog, ff, files, cfg.Lease); err != nil {
+		return err
+	}
+
+	gdb, err := db.Open(cfg.DSN, log)
+	if err != nil {
+		return err
+	}
+	pool, err := gdb.DB()
+	if err != nil {
+		return fmt.Errorf("error getting the database pool: %w", err)
+	}
+	defer pool.Close()
+
+	processor, err := asset.NewProcessor(asset.NewRepository(gdb), files, ff,
+		asset.ProcessorConfig{WorkerID: id, Lease: cfg.Lease})
+	if err != nil {
+		return fmt.Errorf("error creating the processor: %w", err)
+	}
+	encode, err := worker.NewPool(processor, worker.Config{
+		WorkerID:     id,
+		Pool:         "encode",
+		Concurrency:  cfg.Concurrency,
+		Lease:        cfg.Lease,
+		PollInterval: pollInterval,
+		Grace:        cfg.ShutdownGrace,
+		Log:          log,
+	})
+	if err != nil {
+		return fmt.Errorf("error creating the encode pool: %w", err)
+	}
+
+	poolLog.InfoContext(ctx, "worker pool started", "concurrency", cfg.Concurrency, "lease", cfg.Lease.String(),
+		"grace", cfg.ShutdownGrace.String())
+	encode.Run(ctx)
+	poolLog.InfoContext(ctx, "worker pool stopped")
+	return nil
+}
+
+func runWebhookPool(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	cfg, err := loadWebhookConfig(getenv)
+	if err != nil {
+		return err
+	}
+	box, err := secret.NewBox(string(cfg.SecretKeys.Bytes()))
+	if err != nil {
+		return fmt.Errorf("error loading %s: %w", envSecretKeys, err)
+	}
+	id := workerID()
+	poolLog := log.With("worker", id, "pool", "webhook")
+	files := storage.NewLocal(cfg.DataDir)
+	sweepTemp(ctx, poolLog, files, cfg.EncodeLease)
+
+	gdb, err := db.Open(cfg.DSN, log)
+	if err != nil {
+		return err
+	}
+	pool, err := gdb.DB()
+	if err != nil {
+		return fmt.Errorf("error getting the database pool: %w", err)
+	}
+	defer pool.Close()
+
+	tenants := tenant.NewService(tenant.NewRepository(gdb), box, nil)
+	assets := asset.NewService(asset.NewRepository(gdb), files)
+	repo := webhook.NewRepository(gdb)
+	relay, err := webhook.NewRelay(repo, assets, tenants)
+	if err != nil {
+		return fmt.Errorf("error creating the relay: %w", err)
+	}
+	client := webhook.NewClient(cfg.WebhookAllowPrivate)
+	deliverer, err := webhook.NewDeliverer(repo, tenants, client,
+		webhook.DelivererConfig{WorkerID: id, Lease: webhookLease})
+	if err != nil {
+		return fmt.Errorf("error creating the deliverer: %w", err)
+	}
+	deliveries, err := worker.NewPool(deliverer, worker.Config{
+		WorkerID:     id,
+		Pool:         "webhook",
+		Concurrency:  cfg.Concurrency,
+		Lease:        webhookLease,
+		PollInterval: pollInterval,
+		Grace:        cfg.ShutdownGrace,
+		Log:          log,
+	})
+	if err != nil {
+		return fmt.Errorf("error creating the webhook pool: %w", err)
+	}
+
+	poolLog.InfoContext(ctx, "worker pool started", "concurrency", cfg.Concurrency, "lease", webhookLease.String(),
+		"grace", cfg.ShutdownGrace.String())
+	runWebhook(logging.CtxWithLogger(ctx, poolLog), relay, deliveries, client)
+	poolLog.InfoContext(ctx, "worker pool stopped")
+	return nil
 }
 
 func runTenantCreate(ctx context.Context, log *slog.Logger, args []string, getenv func(string) string,
