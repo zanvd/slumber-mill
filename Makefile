@@ -1,4 +1,4 @@
-.PHONY: up down tenant test test-unit vet fmt tidy cover
+.PHONY: up down tenant test test-unit vet fmt tidy cover process-checks
 
 up:
 	docker compose up -d --build
@@ -26,3 +26,6 @@ tidy:
 
 cover:
 	docker compose run --rm dev go test -tags integration -coverprofile=/out/cover.out ./...
+
+process-checks:
+	bash scripts/process-checks.sh
