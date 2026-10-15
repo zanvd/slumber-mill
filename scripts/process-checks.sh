@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# The process-level checks (SPEC.md §13): how worker-encode stops, drains and crashes under Compose.
+# The process-level checks: how worker-encode stops, drains and crashes under Compose.
 #
-# Runs on the Compose project named by COMPOSE_PROJECT_NAME (default slumber-mill-process-checks):
-# brings it up, and takes it down with its volumes on exit. Needs only bash and Docker; curl, mysql and ffmpeg
-# run in the stack's containers. Generated files go to var/out/process-checks.
+# Runs on its own Compose project, named <COMPOSE_PROJECT_NAME or slumber-mill>-process-checks: brings it up,
+# and takes it down with its volumes and images on exit. Needs only bash 5 and Docker; curl, mysql and ffmpeg
+# run in containers. Generated files go to var/out/process-checks.
 set -euo pipefail
+((BASH_VERSINFO[0] >= 5)) || {
+  echo "process-checks.sh needs bash 5 or later" >&2
+  exit 1
+}
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-project=${COMPOSE_PROJECT_NAME:-slumber-mill-process-checks}
+project=${COMPOSE_PROJECT_NAME:-slumber-mill}-process-checks
 work=$root/var/out/process-checks
 data=$work/data
 fixture=$work/fixture.wav
 
 # Stereo noise long enough that an encode outlasts the shutdown grace: about 90 s of encoding on one core.
 fixture_seconds=600
-# Docker's default stop timeout, which check 3 stops with (pitfall 30).
+# Docker's default stop timeout, which check 3 stops with.
 short_stop=10
 # How long past the lease check 2 waits before restarting, for clock skew between Docker's VM and the host.
 lease_margin=10
@@ -83,10 +87,6 @@ run_check() {
   echo "${results[-1]}"
 }
 
-not() {
-  ! "$@"
-}
-
 sql() {
   compose exec -T -e MYSQL_PWD=slumber_mill mysql mysql -uslumber_mill -N -B slumber_mill -e "$1"
 }
@@ -122,16 +122,19 @@ none_processing() {
   [[ $(sql "SELECT COUNT(*) FROM assets WHERE status = 'processing'") == 0 ]]
 }
 
-# The mysql image is the one image in the stack with curl.
+http() {
+  compose run --rm --no-deps -T curl "$@"
+}
+
 api_ready() {
-  compose exec -T mysql curl -fsS -o /dev/null http://api:8080/readyz 2>/dev/null
+  http -fsS -o /dev/null http://api:8080/readyz 2>/dev/null
 }
 
 # upload TITLE posts the fixture and prints the new asset's ID.
 upload() {
   local body
-  body=$(compose exec -T mysql curl -sS --fail-with-body -H "Authorization: Bearer $api_key" \
-    -F "title=$1" -F "file=@-;filename=fixture.wav" http://api:8080/v1/assets <"$fixture") || {
+  body=$(http -sS --fail-with-body -H "Authorization: Bearer $api_key" \
+    -F "title=$1" -F "file=@/fixtures/${fixture##*/}" http://api:8080/v1/assets) || {
     log "upload failed: $body"
     return 1
   }
@@ -214,10 +217,11 @@ temp_files_at_least() {
 
 teardown() {
   local code=$?
+  trap '' INT TERM
   log "saving the logs to $work/compose.log and taking the project down"
   compose logs --no-color --timestamps >"$work/compose.log" 2>&1 || true
-  compose down -v --remove-orphans >/dev/null 2>&1 ||
-    log "error taking the project down; run: docker compose -p $project down -v --remove-orphans"
+  compose --profile process-checks down -v --remove-orphans --rmi local >/dev/null 2>&1 ||
+    log "error taking the project down; run: docker compose -p $project down -v --remove-orphans --rmi local"
   rm -rf "${data:?}"
   rm -f "$fixture"
   exit "$code"
@@ -225,7 +229,7 @@ teardown() {
 
 prepare() {
   log "starting from a clean project $project"
-  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  compose --profile process-checks down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "${data:?}"
   mkdir -p "$data"
 
@@ -356,8 +360,8 @@ check_short_stop() {
   code=$(exit_code "$cid") || return 1
 
   expect "worker-encode was killed after ${took}s with code $code, want 137 (SIGKILL)" test "$code" -eq 137 || ok=1
-  expect "asset is $(state_text "$asset_c"), not queued with attempts $((attempts - 1)): not released" \
-    not state_is "$asset_c" queued $((attempts - 1)) || ok=1
+  expect "asset is $(state_text "$asset_c"), want processing with attempts $attempts: not released" \
+    state_is "$asset_c" processing "$attempts" || ok=1
   return "$ok"
 }
 

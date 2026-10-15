@@ -20,3 +20,16 @@ services:
   worker-webhook:
     volumes:
       - *check-data
+
+  # The script's HTTP client, run with compose run --rm.
+  curl:
+    profiles: ["process-checks"]
+    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+    entrypoint: ["curl"]
+    volumes:
+      - type: bind
+        source: ./var/out/process-checks
+        target: /fixtures
+        read_only: true
+        bind:
+          create_host_path: false

@@ -16,11 +16,12 @@ under Compose while it is encoding:
    released. That's why `stop_grace_period` is longer than the grace.
 4. A second SIGTERM during the drain ends the worker at once.
 
-The script needs only bash and Docker, and takes 6–8 minutes, mostly encoding and waiting out the lease.
-It isn't run in CI. It works on its own Compose project, `COMPOSE_PROJECT_NAME` or `slumber-mill-process-checks`
-by default, which it builds, starts and **takes down with its volumes** when it ends, so don't point it at a project
-whose database you want to keep. It mounts `var/out/process-checks/data` as the data directory instead of `var/data`
-and publishes no port, so it can run beside a local stack, and it leaves the containers' logs in
+The script needs only bash 5 and Docker, and takes 6–8 minutes, mostly encoding and waiting out the lease.
+It isn't run in CI. It works on a Compose project of its own, `<name>-process-checks`, where `<name>` is
+`COMPOSE_PROJECT_NAME` or `slumber-mill`, so it never touches your everyday stack. It builds and starts that project,
+and when it ends takes it down with its volumes and the images it built. It mounts `var/out/process-checks/data`
+as the data directory instead of `var/data` and publishes no port, so it can run beside a local stack.
+Uploads go through a pinned `curlimages/curl` container on the project's network. The containers' logs are left in
 `var/out/process-checks/compose.log`.
 
 ## MySQL connection limit
