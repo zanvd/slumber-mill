@@ -137,6 +137,49 @@ func (r *Repository) reap(ctx context.Context) (requeued, failed int, err error)
 	return requeued, failed, nil
 }
 
+// deliveryCursor is where a retention batch of deliveries stopped: the run_after and ID of the last delivery it read.
+// The zero value starts from the oldest.
+type deliveryCursor struct {
+	RunAfter time.Time
+	ID       uint64
+}
+
+// deleteDelivered deletes a batch of deliveries delivered more than age ago, by updated_at, which no write changes
+// once a delivery is delivered: up to limit of them, after the cursor. It returns how many it deleted, where the
+// next batch starts, and whether the batch was full, so more may be left.
+//
+// The batch is read from ix_webhook_deliveries_claim (state, run_after) in its order. A delivery was claimed after
+// it was last due and delivered after it was claimed, so run_after <= updated_at: every delivery past the age is in
+// the range read, and the delete checks updated_at itself.
+func (r *Repository) deleteDelivered(ctx context.Context, age time.Duration, after deliveryCursor, limit int) (
+	deleted int, next deliveryCursor, full bool, err error) {
+	q := r.db.WithContext(ctx).Table("webhook_deliveries").
+		Select("id", "run_after").
+		Where("state = ? AND run_after < NOW(6) - INTERVAL ? MICROSECOND", "delivered", age.Microseconds())
+	if after.ID != 0 {
+		q = q.Where("(run_after > ? OR run_after = ? AND id > ?)", after.RunAfter, after.RunAfter, after.ID)
+	}
+	var keys []deliveryCursor
+	if err := q.Order("run_after, id").Limit(limit).Find(&keys).Error; err != nil {
+		return 0, after, false, translate("error reading delivered deliveries", err)
+	}
+	if len(keys) == 0 {
+		return 0, after, false, nil
+	}
+	ids := make([]uint64, len(keys))
+	for i, k := range keys {
+		ids[i] = k.ID
+	}
+	res := r.db.WithContext(ctx).
+		Where("id IN ? AND state = ? AND updated_at < NOW(6) - INTERVAL ? MICROSECOND",
+			ids, "delivered", age.Microseconds()).
+		Delete(&deliveryRow{})
+	if res.Error != nil {
+		return 0, after, false, translate("error deleting delivered deliveries", res.Error)
+	}
+	return int(res.RowsAffected), keys[len(keys)-1], len(keys) == limit, nil
+}
+
 // relayLockName names the relay lock of a database. GET_LOCK names are shared by the whole MySQL server,
 // so the database's name is part of it, hashed to keep the name within MySQL's limit of 64 characters.
 func relayLockName(database string) string {

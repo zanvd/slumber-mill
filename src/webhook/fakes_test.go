@@ -201,6 +201,38 @@ type fakeDeliveryRepo struct {
 	completeDeadline time.Time
 	completeErr      error
 	completeLog      *slog.Logger
+	// expired is how many deliveries are past retention, with IDs 1 to expired; afterPurge, if set,
+	// runs after each retention batch with its number, counting from 1.
+	expired    int
+	afterPurge func(batch int)
+	purges     []purgeArgs
+}
+
+type purgeArgs struct {
+	age   time.Duration
+	after deliveryCursor
+	limit int
+}
+
+// deleteDelivered deletes up to limit of the expired deliveries after the cursor.
+func (f *fakeDeliveryRepo) deleteDelivered(ctx context.Context, age time.Duration, after deliveryCursor, limit int) (
+	int, deliveryCursor, bool, error) {
+	f.mu.Lock()
+	f.purges = append(f.purges, purgeArgs{age, after, limit})
+	batch := len(f.purges)
+	err := f.err(ctx, "deleteDelivered")
+	f.mu.Unlock()
+	if f.afterPurge != nil {
+		defer f.afterPurge(batch)
+	}
+	if err != nil {
+		return 0, after, false, err
+	}
+	n := min(limit, f.expired-int(after.ID))
+	if n == 0 {
+		return 0, after, false, nil
+	}
+	return n, deliveryCursor{RunAfter: eventTime, ID: after.ID + uint64(n)}, n == limit, nil
 }
 
 func (f *fakeDeliveryRepo) err(ctx context.Context, method string) error {

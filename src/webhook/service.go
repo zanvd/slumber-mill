@@ -25,6 +25,11 @@ const (
 	completeTimeout = 15 * time.Second
 	retryBase       = 30 * time.Second
 	retryMax        = 6 * time.Hour
+
+	// defaultRetentionBatch is how many deliveries one retention batch deletes. Each batch is a read of the index
+	// and a delete by primary key of rows of a few kilobytes, so it holds its row locks and undo for milliseconds,
+	// while a day of deliveries still takes only a few hundred batches.
+	defaultRetentionBatch = 500
 )
 
 var (
@@ -231,6 +236,8 @@ type deliveryRepo interface {
 	fail(ctx context.Context, l lease, f failure) (bool, error)
 	release(ctx context.Context, l lease) error
 	reap(ctx context.Context) (requeued, failed int, err error)
+	deleteDelivered(ctx context.Context, age time.Duration, after deliveryCursor, limit int) (
+		deleted int, next deliveryCursor, full bool, err error)
 }
 
 type poster interface {
@@ -250,6 +257,8 @@ type Deliverer struct {
 	tenants webhookTargets
 	client  poster
 	cfg     DelivererConfig
+	// retentionBatch is defaultRetentionBatch outside tests.
+	retentionBatch int
 }
 
 func NewDeliverer(r deliveryRepo, tenants webhookTargets, client poster, cfg DelivererConfig) (*Deliverer, error) {
@@ -265,7 +274,7 @@ func NewDeliverer(r deliveryRepo, tenants webhookTargets, client poster, cfg Del
 	case cfg.Lease <= 0:
 		return nil, fmt.Errorf("lease %v is not positive", cfg.Lease)
 	}
-	return &Deliverer{repo: r, tenants: tenants, client: client, cfg: cfg}, nil
+	return &Deliverer{repo: r, tenants: tenants, client: client, cfg: cfg, retentionBatch: defaultRetentionBatch}, nil
 }
 
 func (d *Deliverer) Claim(ctx context.Context) (worker.Lease, bool, error) {
@@ -348,6 +357,38 @@ func (d *Deliverer) Reap(ctx context.Context) error {
 			"requeued", requeued, "failed", failed)
 	}
 	return nil
+}
+
+// DeleteDelivered deletes the deliveries delivered more than age ago, in batches, until a batch comes back short
+// or ctx is done, and returns how many it deleted. Queued, sending and failed deliveries are kept however old
+// they are. It covers every tenant: retention is maintenance of the whole table.
+func (d *Deliverer) DeleteDelivered(ctx context.Context, age time.Duration) (deleted int, err error) {
+	if age <= 0 {
+		return 0, fmt.Errorf("error deleting delivered deliveries: age %v is not positive", age)
+	}
+	batches := 0
+	defer func() {
+		if deleted > 0 {
+			logging.LoggerFromContext(ctx).InfoContext(ctx, "deleted delivered webhook deliveries past retention",
+				"deleted", deleted, "batches", batches, "age", age.String())
+		}
+	}()
+	var after deliveryCursor
+	for {
+		if err := ctx.Err(); err != nil {
+			return deleted, fmt.Errorf("error deleting delivered deliveries: %w", err)
+		}
+		n, next, full, err := d.repo.deleteDelivered(ctx, age, after, d.retentionBatch)
+		deleted += n
+		batches++
+		if err != nil {
+			return deleted, fmt.Errorf("error deleting delivered deliveries: %w", err)
+		}
+		if !full {
+			return deleted, nil
+		}
+		after = next
+	}
 }
 
 // toWorker passes on a repository error, matching worker.ErrLeaseLost if the lease was lost.

@@ -957,6 +957,152 @@ func TestDelivererReap(t *testing.T) {
 	}
 }
 
+const retention = 30 * 24 * time.Hour
+
+// retentionLog is a retention summary as logged.
+type retentionLog struct {
+	Level, Msg, Age string
+	Deleted         int
+	Batches         int
+}
+
+func (b *logBuffer) retentionLogs(t *testing.T) []retentionLog {
+	t.Helper()
+	var out []retentionLog
+	sc := bufio.NewScanner(bytes.NewReader(b.Bytes()))
+	for sc.Scan() {
+		var entry retentionLog
+		if err := json.Unmarshal(sc.Bytes(), &entry); err != nil {
+			t.Fatalf("error decoding log entry %s: %v", sc.Text(), err)
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func wantRetentionLogs(deleted, batches int) []retentionLog {
+	if deleted == 0 {
+		return nil
+	}
+	return []retentionLog{{Level: "INFO", Msg: "deleted delivered webhook deliveries past retention",
+		Age: "720h0m0s", Deleted: deleted, Batches: batches}}
+}
+
+// TestDeleteDelivered deletes in batches until one comes back short, each batch starting where the last stopped.
+func TestDeleteDelivered(t *testing.T) {
+	tests := []struct {
+		name        string
+		expired     int
+		batch       int
+		wantBatches int
+	}{
+		{"nothing expired", 0, 3, 1},
+		{"less than a batch", 2, 3, 1},
+		{"exactly a batch", 3, 3, 2},
+		{"several batches", 7, 3, 3},
+		{"several full batches", 9, 3, 4},
+		{"batches of one", 4, 1, 5},
+		{"the default batch", 1001, defaultRetentionBatch, 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			if f.d.retentionBatch != defaultRetentionBatch {
+				t.Fatalf("retention batch = %d, want %d", f.d.retentionBatch, defaultRetentionBatch)
+			}
+			f.d.retentionBatch = tc.batch
+			f.repo.expired = tc.expired
+			var logs logBuffer
+
+			deleted, err := f.d.DeleteDelivered(logs.ctx(t.Context()), retention)
+
+			if err != nil || deleted != tc.expired {
+				t.Errorf("DeleteDelivered() = %d, %v; want %d", deleted, err, tc.expired)
+			}
+			if len(f.repo.purges) != tc.wantBatches {
+				t.Fatalf("ran %d batches, want %d", len(f.repo.purges), tc.wantBatches)
+			}
+			var after deliveryCursor
+			for i, p := range f.repo.purges {
+				if want := (purgeArgs{retention, after, tc.batch}); p != want {
+					t.Errorf("batch %d got %+v, want %+v", i+1, p, want)
+				}
+				after = deliveryCursor{RunAfter: eventTime, ID: uint64(min((i+1)*tc.batch, tc.expired))}
+			}
+			if got, want := logs.retentionLogs(t), wantRetentionLogs(tc.expired, tc.wantBatches); !slices.Equal(got, want) {
+				t.Errorf("logs = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// TestDeleteDeliveredStops stops the loop on a done context, a failed batch or an age that isn't positive,
+// and reports and logs what the batches before deleted.
+func TestDeleteDeliveredStops(t *testing.T) {
+	// stopAt runs stop after batch n.
+	stopAt := func(n int, stop func(f *deliveryFixture, cancel context.CancelFunc)) func(*deliveryFixture, context.CancelFunc, int) {
+		return func(f *deliveryFixture, cancel context.CancelFunc, batch int) {
+			if batch == n {
+				stop(f, cancel)
+			}
+		}
+	}
+	cancelNow := func(_ *deliveryFixture, cancel context.CancelFunc) { cancel() }
+	failNext := func(f *deliveryFixture, _ context.CancelFunc) { f.repo.errs["deleteDelivered"] = errBoom }
+	tests := []struct {
+		name string
+		age  time.Duration
+		// stop runs after each batch, numbered from 1, and with 0 before the first.
+		stop        func(f *deliveryFixture, cancel context.CancelFunc, batch int)
+		wantDeleted int
+		wantBatches int
+		wantErr     error
+	}{
+		{name: "cancelled before the first batch", age: retention, stop: stopAt(0, cancelNow), wantErr: context.Canceled},
+		{
+			name: "cancelled after the second batch", age: retention, stop: stopAt(2, cancelNow),
+			wantDeleted: 6, wantBatches: 2, wantErr: context.Canceled,
+		},
+		{name: "the first batch fails", age: retention, stop: stopAt(0, failNext), wantBatches: 1, wantErr: errBoom},
+		{
+			name: "the third batch fails", age: retention, stop: stopAt(2, failNext),
+			wantDeleted: 6, wantBatches: 3, wantErr: errBoom,
+		},
+		{name: "zero age", age: 0},
+		{name: "negative age", age: -time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDeliveryFixture(t)
+			f.d.retentionBatch = 3
+			f.repo.expired = 10
+			var logs logBuffer
+			ctx, cancel := context.WithCancel(logs.ctx(t.Context()))
+			defer cancel()
+			if tc.stop != nil {
+				tc.stop(f, cancel, 0)
+				f.repo.afterPurge = func(batch int) { tc.stop(f, cancel, batch) }
+			}
+
+			deleted, err := f.d.DeleteDelivered(ctx, tc.age)
+
+			if deleted != tc.wantDeleted || err == nil || tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("DeleteDelivered() = %d, %v; want %d and an error matching %v",
+					deleted, err, tc.wantDeleted, tc.wantErr)
+			}
+			if err != nil && !strings.HasPrefix(err.Error(), "error deleting delivered deliveries: ") {
+				t.Errorf("error = %q, want it prefixed", err)
+			}
+			if len(f.repo.purges) != tc.wantBatches {
+				t.Errorf("ran %d batches, want %d", len(f.repo.purges), tc.wantBatches)
+			}
+			if got, want := logs.retentionLogs(t), wantRetentionLogs(tc.wantDeleted, tc.wantBatches); !slices.Equal(got, want) {
+				t.Errorf("logs = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 // TestDeliveryKeepsTheSecretOut drives deliveries through a worker pool, and checks that neither the tenant's secret
 // nor the signature made with it shows up in the logs or in what is stored as last_error.
 func TestDeliveryKeepsTheSecretOut(t *testing.T) {
