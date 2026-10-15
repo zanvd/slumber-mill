@@ -818,7 +818,7 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
   and a socket ping can report healthy too early. *(known trap)*
 - `migrate`: the `runtime` image, `command: migrate`, run once;
   the API and both pools depend on it with `condition: service_completed_successfully`.
-- `api`: `runtime`, `command: api`, port 8080.
+- `api`: `runtime`, `command: api`, port 8080, published on `127.0.0.1` only, so the local stack isn't open to the network.
 - `worker-encode`: `runtime-media`, `command: worker -pool encode`, `cpus: 2`,
   so `GOMAXPROCS` and the pool size follow the limit.
 - `worker-webhook`: `runtime`, `command: worker -pool webhook`.
@@ -827,6 +827,8 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
 - `dev`: the `dev` stage, with `./src` at `/src` (its working directory) and `./var/out` at `/out`,
   Go's caches in named volumes, and a DSN for an account that may create and drop databases.
   Its default command runs the whole suite, `go test -race -tags integration ./...`.
+  It sits in the `dev` profile, so `docker compose up` doesn't start the test suite;
+  `docker compose run` names it explicitly and starts it anyway.
 
 Everyday commands, which double as the README quick start:
 
