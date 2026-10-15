@@ -862,16 +862,16 @@ type soakEvent struct {
 
 // soakResult is what the checks found, for the report.
 type soakResult struct {
-	assets      map[string]*soakAsset
-	deliveries  map[string]*soakDelivery
-	events      map[string]*soakEvent
-	hits        map[string][]soakHit
-	hitTotal    int
+	assets        map[string]*soakAsset
+	deliveries    map[string]*soakDelivery
+	events        map[string]*soakEvent
+	hits          map[string][]soakHit
+	hitTotal      int
 	exhausted     int
 	rejectedLater int
-	downloads   int
-	problems    map[string][]string
-	invariantOK map[string]bool
+	downloads     int
+	problems      map[string][]string
+	invariantOK   map[string]bool
 }
 
 func (d *soakDriver) check(t *testing.T) {
