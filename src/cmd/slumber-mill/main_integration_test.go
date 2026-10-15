@@ -531,6 +531,29 @@ func (s *testStack) leaseState(t *testing.T, query string, args ...any) leaseSta
 	return st
 }
 
+// testEncodeLease differs from webhookLease, so the tests can tell which lease a process used.
+const testEncodeLease = 90 * time.Second
+
+// checkHeld checks that the row query selects, as locked_by and the microseconds left on its lease, is held by
+// the worker that logged started, on a lease claimed or renewed for lease moments ago.
+func (s *testStack) checkHeld(t *testing.T, started map[string]any, lease time.Duration, query string, args ...any) {
+	t.Helper()
+	const slack = 10 * time.Second
+	var lockedBy string
+	var micros int64
+	if err := s.pool.QueryRowContext(t.Context(), query, args...).Scan(&lockedBy, &micros); err != nil {
+		t.Fatalf("error running %q: %v", query, err)
+	}
+	worker, _ := started["worker"].(string)
+	left := time.Duration(micros) * time.Microsecond
+	if worker == "" || lockedBy != worker {
+		t.Errorf("held row is locked by %q, want the pool's worker %q", lockedBy, worker)
+	}
+	if left <= lease-slack || left > lease {
+		t.Errorf("held row's lease has %v left, want just under the pool's lease of %v", left, lease)
+	}
+}
+
 // openFIFO makes path a FIFO and returns a channel that is closed once a reader opens it.
 // Nothing is ever written to it, so the reader waits until it is killed.
 func openFIFO(t *testing.T, path string) <-chan struct{} {
@@ -611,7 +634,7 @@ func TestEncodeWorker(t *testing.T) {
 		envDSN:               dsn,
 		envDataDir:           dataDir,
 		envEncodeConcurrency: "1",
-		envEncodeLease:       "1m",
+		envEncodeLease:       testEncodeLease.String(),
 		envShutdownGrace:     grace.String(),
 	})
 	stderr, records := logRecords(t)
@@ -631,11 +654,11 @@ func TestEncodeWorker(t *testing.T) {
 	if v, _ := found["ffprobe"].(string); !strings.HasPrefix(v, "ffprobe version 6.1.1") {
 		t.Errorf("logged ffprobe build %q, want ffprobe version 6.1.1", v)
 	}
-	checkSwept(t, waitForLog(t, records, "swept temp files"), "1m0s", stale, fresh)
+	checkSwept(t, waitForLog(t, records, "swept temp files"), "1m30s", stale, fresh)
 	started := waitForLog(t, records, "worker pool started")
-	if started["pool"] != "encode" || started["concurrency"] != float64(1) || started["lease"] != "1m0s" ||
+	if started["pool"] != "encode" || started["concurrency"] != float64(1) || started["lease"] != "1m30s" ||
 		started["grace"] != "1s" {
-		t.Errorf("logged %v, want the encode pool with concurrency 1, lease 1m0s and grace 1s", started)
+		t.Errorf("logged %v, want the encode pool with concurrency 1, lease 1m30s and grace 1s", started)
 	}
 
 	finished := waitForLog(t, records, "work finished")
@@ -651,6 +674,9 @@ func TestEncodeWorker(t *testing.T) {
 	}
 
 	waitFor(t, probing, "the probe of the second asset")
+	s.checkHeld(t, started, testEncodeLease,
+		"SELECT locked_by, TIMESTAMPDIFF(MICROSECOND, NOW(6), lease_expires_at) FROM assets WHERE public_id = ?",
+		db.ID(inFlight.ID))
 	cancelled := time.Now()
 	cancel()
 	exitsWithinGrace(t, done, cancelled, grace)
@@ -685,11 +711,11 @@ func TestEncodeWorkerRecoversACrash(t *testing.T) {
 	s.exec(t, "UPDATE assets SET status = 'processing', attempts = 1, locked_by = 'dead:1', "+
 		"lease_expires_at = NOW(6) - INTERVAL 1 SECOND WHERE public_id = ?", db.ID(crashed.ID))
 	left := []string{
-		plantTempFile(t, dataDir, "part-1", time.Now().Add(-90*time.Second)),
-		plantTempFile(t, dataDir, "part-2", time.Now().Add(-90*time.Second)),
+		plantTempFile(t, dataDir, "part-1", time.Now().Add(-2*time.Minute)),
+		plantTempFile(t, dataDir, "part-2", time.Now().Add(-2*time.Minute)),
 	}
 
-	env := envFrom(map[string]string{envDSN: dsn, envDataDir: dataDir, envEncodeLease: "1m"})
+	env := envFrom(map[string]string{envDSN: dsn, envDataDir: dataDir, envEncodeLease: testEncodeLease.String()})
 	stderr, records := logRecords(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -826,7 +852,7 @@ func TestWebhookWorker(t *testing.T) {
 		envSecretKeys:          keys,
 		envWebhookAllowPrivate: "true",
 		envWebhookConcurrency:  "1",
-		envEncodeLease:         "1m",
+		envEncodeLease:         testEncodeLease.String(),
 		envShutdownGrace:       grace.String(),
 	})
 	stderr, logs := watchLog(t)
@@ -840,7 +866,7 @@ func TestWebhookWorker(t *testing.T) {
 	}()
 
 	sweptAt, swept := logs.wait(t, "swept temp files")
-	checkSwept(t, swept, "1m0s", stale, fresh)
+	checkSwept(t, swept, "1m30s", stale, fresh)
 	startedAt, started := logs.wait(t, "worker pool started")
 	if started["pool"] != "webhook" || started["concurrency"] != float64(1) || started["lease"] != "1m0s" ||
 		started["grace"] != "1s" {
@@ -862,6 +888,9 @@ func TestWebhookWorker(t *testing.T) {
 	logs.wait(t, "work finished", "outcome", "done")
 
 	waitFor(t, holding, "the second delivery")
+	s.checkHeld(t, started, webhookLease,
+		"SELECT locked_by, TIMESTAMPDIFF(MICROSECOND, NOW(6), lease_expires_at) FROM webhook_deliveries "+
+			"WHERE event_id = ?", db.ID(inFlight))
 	cancelled := time.Now()
 	cancel()
 	exitsWithinGrace(t, done, cancelled, grace)
