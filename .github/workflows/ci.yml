@@ -45,6 +45,19 @@ jobs:
             *.cache-from=type=gha,scope=dev
             *.cache-to=type=gha,scope=dev,mode=max
 
+      - name: Build the runtime images
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: compose.yaml
+          targets: migrate,worker-encode
+          set: |
+            *.cache-from=type=gha,scope=dev
+            *.cache-from=type=gha,scope=runtime
+            *.cache-from=type=gha,scope=runtime-media
+            migrate.cache-to=type=gha,scope=runtime,mode=max
+            worker-encode.cache-to=type=gha,scope=runtime-media,mode=max
+
       - name: Check formatting
         run: |
           unformatted="$(docker compose run --rm -T --no-deps dev gofmt -l .)"
