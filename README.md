@@ -16,7 +16,7 @@ under Compose while it is encoding:
    released. That's why `stop_grace_period` is longer than the grace.
 4. A second SIGTERM during the drain ends the worker at once.
 
-The script needs only bash and Docker, and takes about 8 minutes, mostly encoding and waiting out the lease.
+The script needs only bash and Docker, and takes 6–8 minutes, mostly encoding and waiting out the lease.
 It isn't run in CI. It works on its own Compose project, `COMPOSE_PROJECT_NAME` or `slumber-mill-process-checks`
 by default, which it builds, starts and **takes down with its volumes** when it ends, so don't point it at a project
 whose database you want to keep. It mounts `var/out/process-checks/data` as the data directory instead of `var/data`
