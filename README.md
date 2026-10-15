@@ -84,7 +84,7 @@ A tenant created with `-webhook-url` gets `asset.ready` and `asset.failed` event
 The request is a POST with `SlumberMill-Event-Id` and `SlumberMill-Signature: t=<unix>,v1=<hex>`, where `v1` is
 the HMAC-SHA256 of `<t>.<body>` under the tenant's webhook secret. Delivery is at-least-once and unordered,
 so receivers dedupe on the event ID. A 2xx is delivered, 410 Gone stops retrying, and anything else, redirects
-included, is retried up to 12 times with a backoff that starts at 30 seconds and caps at 6 hours.
+included, is retried until the delivery has had 12 attempts, with a backoff that starts at 30 seconds and caps at 6 hours.
 The Go package `webhook` exports `Verify` for receivers; it accepts several `v1` values so secrets can rotate.
 
 ## Operations
