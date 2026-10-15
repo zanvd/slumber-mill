@@ -250,7 +250,6 @@ func (e *e2e) asset(t *testing.T, id string) apiv1.Asset {
 	return decode[apiv1.Asset](t, body)
 }
 
-// waitStatus polls the asset until it has status.
 func (e *e2e) waitStatus(t *testing.T, id, status string) {
 	t.Helper()
 	deadline := time.NewTimer(waitTimeout)
@@ -278,14 +277,7 @@ func (e *e2e) nextHook(t *testing.T) apiv1.Event {
 
 func (e *e2e) nextHookWithin(t *testing.T, timeout time.Duration) apiv1.Event {
 	t.Helper()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	var h receivedHook
-	select {
-	case h = <-e.hooks:
-	case <-deadline.C:
-		t.Fatalf("no webhook arrived within %v", timeout)
-	}
+	h := waitForWithin(t, e.hooks, timeout, "a webhook")
 	if got := h.header.Get("Content-Type"); got != "application/json" {
 		t.Errorf("webhook Content-Type = %q, want application/json", got)
 	}

@@ -589,13 +589,18 @@ func openFIFO(t *testing.T, path string) <-chan struct{} {
 
 func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
-	timeout := time.NewTimer(waitTimeout)
-	defer timeout.Stop()
+	return waitForWithin(t, ch, waitTimeout, what)
+}
+
+func waitForWithin[T any](t *testing.T, ch <-chan T, timeout time.Duration, what string) T {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
 	select {
 	case v := <-ch:
 		return v
-	case <-timeout.C:
-		t.Fatalf("%s didn't happen within %v", what, waitTimeout)
+	case <-deadline.C:
+		t.Fatalf("%s didn't happen within %v", what, timeout)
 	}
 	var zero T
 	return zero
