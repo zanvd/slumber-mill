@@ -144,21 +144,21 @@ func TestProcessCommands(t *testing.T) {
 			" -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json /src.wav",
 		"ffmpeg " + common + " -i /src.wav -filter_complex " +
 			"[0:a:0]ebur128@input=framelog=info,asplit=2[p0][p1];" +
-			"[p0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4:LRA=50:print_format=json[m0];" +
-			"[p1]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4:LRA=50:print_format=json[m1] " +
+			"[p0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4.5:LRA=50:print_format=json[m0];" +
+			"[p1]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4.5:LRA=50:print_format=json[m1] " +
 			"-map [m0] -f null - -map [m1] -f null -",
 		"ffmpeg -y " + common + " -i /src.wav -filter_complex " +
 			"[0:a:0]asplit=2[s0][s1];" +
-			"[s0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4:LRA=50:measured_I=-17.69:measured_TP=-7.26:" +
+			"[s0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4.5:LRA=50:measured_I=-17.69:measured_TP=-7.26:" +
 			"measured_LRA=0.1:measured_thresh=-27.69:offset=-0.31:linear=true:print_format=json,aresample=48000[o0];" +
-			"[s1]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4:LRA=50:measured_I=-20.7:measured_TP=-6.59:" +
+			"[s1]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4.5:LRA=50:measured_I=-20.7:measured_TP=-6.59:" +
 			"measured_LRA=0.1:measured_thresh=-30.7:offset=0.07:linear=true:print_format=json,aresample=48000[o1] " +
 			"-map [o0] -map_metadata -1 -c:a aac -b:a 128k -cutoff 20000 -movflags +faststart -f mp4 /data/tmp/part-1 " +
 			"-map [o1] -map_metadata -1 -c:a aac -b:a 64k -movflags +faststart -f mp4 /data/tmp/part-2",
 		"ffmpeg " + common + " -i /data/tmp/part-1 -filter_complex " +
-			"[0:a:0]loudnorm@verify=I=-16:TP=-4:LRA=50:print_format=json[v] -map [v] -f null -",
+			"[0:a:0]loudnorm@verify=I=-16:TP=-4.5:LRA=50:print_format=json[v] -map [v] -f null -",
 		"ffmpeg " + common + " -i /data/tmp/part-2 -filter_complex " +
-			"[0:a:0]loudnorm@verify=I=-16:TP=-4:LRA=50:print_format=json[v] -map [v] -f null -",
+			"[0:a:0]loudnorm@verify=I=-16:TP=-4.5:LRA=50:print_format=json[v] -map [v] -f null -",
 	}
 	var got []string
 	for _, c := range run.calls {
@@ -189,7 +189,7 @@ func TestProcessLayouts(t *testing.T) {
 			name: "5.1 source", channels: 6,
 			measure: []string{
 				"asplit=3[p0][p1][p2];",
-				";[p2]loudnorm@source=I=-16:TP=-4:LRA=50:print_format=json[m2]",
+				";[p2]loudnorm@source=I=-16:TP=-4.5:LRA=50:print_format=json[m2]",
 				"-map [m2] -f null -",
 			},
 			render:       []string{"asplit=2[s0][s1];", ",aresample=48000[o0];", ",aresample=48000[o1]"},
@@ -582,10 +582,10 @@ func TestPredict(t *testing.T) {
 		want Normalization
 	}{
 		{"headroom to spare", Loudness{LUFS: -20, TruePeakDBTP: -10, LRALU: 5}, Linear},
-		{"peak lands exactly on TP", Loudness{LUFS: -20, TruePeakDBTP: -8, LRALU: 5}, Linear},
-		{"peak lands just above TP", Loudness{LUFS: -20, TruePeakDBTP: -7.99, LRALU: 5}, Dynamic},
+		{"peak lands exactly on TP", Loudness{LUFS: -20, TruePeakDBTP: -8.5, LRALU: 5}, Linear},
+		{"peak lands just above TP", Loudness{LUFS: -20, TruePeakDBTP: -8.49, LRALU: 5}, Dynamic},
 		{"under the ceiling but above TP", Loudness{LUFS: -20, TruePeakDBTP: -6, LRALU: 5}, Dynamic},
-		{"cut, not boosted", Loudness{LUFS: -10, TruePeakDBTP: 2, LRALU: 5}, Linear},
+		{"cut, not boosted", Loudness{LUFS: -10, TruePeakDBTP: 1.5, LRALU: 5}, Linear},
 		{"LRA of 0", Loudness{LUFS: -20, TruePeakDBTP: -10, LRALU: 0}, Linear},
 		{"LRA at loudnorm's maximum", Loudness{LUFS: -20, TruePeakDBTP: -10, LRALU: 50}, Linear},
 		{"LRA above it", Loudness{LUFS: -20, TruePeakDBTP: -10, LRALU: 50.01}, Dynamic},

@@ -18,7 +18,7 @@ const (
 	MinDuration = 3 * time.Second
 
 	// preEncodeTruePeakDBTP is the TP loudnorm aims for, leaving headroom for the peak the encoder adds.
-	preEncodeTruePeakDBTP = -4.0
+	preEncodeTruePeakDBTP = -4.5
 	// loudnormLRA is the largest LRA loudnorm accepts, so it never blocks linear mode.
 	loudnormLRA = 50.0
 	// minMeasuredLRA stands in for a measured LRA of 0, which loudnorm reads as unmeasured.
