@@ -294,7 +294,7 @@ func TestDeleteDeliveredUsesTheIndex(t *testing.T) {
 		case strings.HasPrefix(r.sql, "SELECT "):
 			reads++
 			if p["type"] != "range" || p["key"] != "ix_webhook_deliveries_claim" ||
-				!strings.Contains(p["Extra"], "Using index") || strings.Contains(p["Extra"], "filesort") {
+				!slices.Contains(strings.Split(p["Extra"], "; "), "Using index") || strings.Contains(p["Extra"], "filesort") {
 				t.Errorf("%s\nplan %v, want an index-only range scan of ix_webhook_deliveries_claim without a sort",
 					r.sql, p)
 			}

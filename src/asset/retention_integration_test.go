@@ -263,7 +263,7 @@ func TestDeleteRelayedEventsUsesTheIndex(t *testing.T) {
 		case strings.HasPrefix(r.sql, "SELECT "):
 			reads++
 			if p["type"] != "range" || p["key"] != "ix_asset_events_pending" ||
-				!strings.Contains(p["Extra"], "Using index") || strings.Contains(p["Extra"], "filesort") {
+				!slices.Contains(strings.Split(p["Extra"], "; "), "Using index") || strings.Contains(p["Extra"], "filesort") {
 				t.Errorf("%s\nplan %v, want an index-only range scan of ix_asset_events_pending without a sort", r.sql, p)
 			}
 		case strings.HasPrefix(r.sql, "DELETE "):
