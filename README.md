@@ -295,6 +295,11 @@ For a change that spans a deploy (not built, only written down here):
 - **AAC loop padding is left to the players.** AAC in MP4 isn't sample-accurate: a 480,000-sample tone decoded
   to 480,256 samples despite the MP4 edit list. A seamless soundscape can click at every seam unless the player
   honours gapless metadata or crossfades.
+- **A source louder than 0 LUFS isn't handled.** loudnorm's `measured_I` option accepts -99 to 0, so pass 2 is
+  expected to fail on such a source (from the notes of the audio pull request; not run since). The failure is a plain
+  ffmpeg exit, not a rejection: the processor retries it with backoff, and after three attempts the asset ends
+  `failed` with the generic message "processing failed after repeated attempts", not a tenant-specific one.
+  It's rare, and nothing checks for it up front.
 - **Re-sealing webhook secrets under a new key is documented, not built.** A new key can go first in the key ring,
   and older ciphertexts still open; re-sealing the old rows and then dropping the old key is manual.
 - **The webhook egress check and NAT64.** See "SSRF defences" above.
