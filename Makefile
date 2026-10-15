@@ -4,7 +4,7 @@ up:
 	docker compose up -d --build
 
 down:
-	docker compose down --remove-orphans
+	docker compose --profile dev down --remove-orphans
 
 tenant:
 	docker compose run --rm api tenant create -slug $(SLUG)
