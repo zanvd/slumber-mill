@@ -1,0 +1,22 @@
+# Used by process-checks.sh on top of compose.yaml: the checks get their own data directory, which the script
+# empties, and publish no port, so they can run beside a local stack.
+x-check-data: &check-data
+  type: bind
+  source: ./var/out/process-checks/data
+  target: /data
+  bind:
+    create_host_path: false
+
+services:
+  api:
+    ports: !reset []
+    volumes:
+      - *check-data
+
+  worker-encode:
+    volumes:
+      - *check-data
+
+  worker-webhook:
+    volumes:
+      - *check-data
