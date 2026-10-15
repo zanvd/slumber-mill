@@ -58,6 +58,11 @@ type Server struct {
 	draining       atomic.Bool
 }
 
+// ReleaseMode turns off Gin's debug mode, which writes to stdout. Call it before NewServer.
+func ReleaseMode() {
+	gin.SetMode(gin.ReleaseMode)
+}
+
 func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg Config) (*Server, error) {
 	if log == nil || tenants == nil || assets == nil || cfg.Readiness == nil {
 		return nil, errors.New("error creating HTTP server: logger, services and readiness check are required")

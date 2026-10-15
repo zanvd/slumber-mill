@@ -1,0 +1,264 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/zanvd/slumber-mill/src/asset"
+	"github.com/zanvd/slumber-mill/src/db"
+	"github.com/zanvd/slumber-mill/src/egress"
+	"github.com/zanvd/slumber-mill/src/httpsrv"
+	"github.com/zanvd/slumber-mill/src/logging"
+	"github.com/zanvd/slumber-mill/src/secret"
+	"github.com/zanvd/slumber-mill/src/storage"
+	"github.com/zanvd/slumber-mill/src/tenant"
+)
+
+const (
+	exitOK    = 0
+	exitError = 1
+	exitUsage = 2
+
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 2 * time.Minute
+
+	defaultTargetLUFS = -16
+)
+
+const usage = `usage:
+  slumber-mill migrate                          apply database migrations
+  slumber-mill api                              serve the HTTP API
+  slumber-mill worker -pool encode|webhook      run a worker pool
+  slumber-mill tenant create -slug S [-webhook-url U] [-target-lufs F]
+                                                create a tenant (-target-lufs defaults to -16) and print
+                                                its API key and webhook secret on stdout
+`
+
+type usageError struct {
+	msg string
+}
+
+func (e usageError) Error() string {
+	return e.msg
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// After the first signal, a second one ends the process at once.
+	context.AfterFunc(ctx, stop)
+	code := run(ctx, os.Args[1:], os.Getenv, os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
+}
+
+// run executes the command in args and returns the process's exit code.
+// Stdout carries nothing but tenant create's secrets; logs go to stderr as JSON.
+func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	ctx = logging.CtxWithLogger(ctx, log)
+
+	err := dispatch(ctx, log, args, getenv, stdout)
+	if err == nil {
+		return exitOK
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(stderr, usage)
+		return exitOK
+	}
+	if ue, ok := errors.AsType[usageError](err); ok {
+		fmt.Fprintf(stderr, "slumber-mill: %s\n%s", ue.msg, usage)
+		return exitUsage
+	}
+	log.ErrorContext(ctx, "command failed", "error", err)
+	return exitError
+}
+
+func dispatch(ctx context.Context, log *slog.Logger, args []string, getenv func(string) string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return usageError{"no command given"}
+	}
+	cmd, rest := args[0], args[1:]
+	switch cmd {
+	case "migrate":
+		if err := parseFlags(flag.NewFlagSet(cmd, flag.ContinueOnError), rest); err != nil {
+			return err
+		}
+		return runMigrate(ctx, log, getenv)
+	case "api":
+		if err := parseFlags(flag.NewFlagSet(cmd, flag.ContinueOnError), rest); err != nil {
+			return err
+		}
+		return runAPI(ctx, log, getenv)
+	case "worker":
+		return runWorker(rest)
+	case "tenant":
+		if len(rest) == 0 || rest[0] != "create" {
+			return usageError{"tenant: the only subcommand is create"}
+		}
+		return runTenantCreate(ctx, log, rest[1:], getenv, stdout)
+	case "help", "-h", "-help", "--help":
+		return flag.ErrHelp
+	default:
+		return usageError{fmt.Sprintf("unknown command %q", cmd)}
+	}
+}
+
+// parseFlags parses args into fs and refuses positional arguments. Errors are left for run to print.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return usageError{fs.Name() + ": " + err.Error()}
+	}
+	if fs.NArg() > 0 {
+		return usageError{fmt.Sprintf("%s: unexpected argument %q", fs.Name(), fs.Arg(0))}
+	}
+	return nil
+}
+
+func runMigrate(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	cfg, err := loadMigrateConfig(getenv)
+	if err != nil {
+		return err
+	}
+	applied, err := db.Migrate(ctx, cfg.DSN, log)
+	if err != nil {
+		return err
+	}
+	if len(applied) == 0 {
+		log.InfoContext(ctx, "database is up to date")
+		return nil
+	}
+	log.InfoContext(ctx, "migrations applied", "migrations", applied)
+	return nil
+}
+
+func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	httpsrv.ReleaseMode()
+	cfg, err := loadAPIConfig(getenv)
+	if err != nil {
+		return err
+	}
+
+	gdb, err := db.Open(cfg.DSN, log)
+	if err != nil {
+		return err
+	}
+	pool, err := gdb.DB()
+	if err != nil {
+		return fmt.Errorf("error getting the database pool: %w", err)
+	}
+	defer pool.Close()
+
+	tenants := tenant.NewService(tenant.NewRepository(gdb), nil, nil)
+	assets := asset.NewService(asset.NewRepository(gdb), storage.NewLocal(cfg.DataDir))
+	handler, err := httpsrv.NewServer(log, tenants, assets, httpsrv.Config{
+		TrustedProxies:      cfg.TrustedProxies,
+		Readiness:           pool,
+		MaxUploadBytes:      cfg.MaxUploadBytes,
+		MaxUploadsPerTenant: cfg.MaxUploadsPerTenant,
+	})
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler:           handler.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+	}
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("error listening on %s: %w", cfg.HTTPAddr, err)
+	}
+	log.InfoContext(ctx, "serving HTTP", "addr", ln.Addr().String())
+	return serve(ctx, log, srv, ln, handler, cfg.DrainDelay, cfg.ShutdownGrace)
+}
+
+func runWorker(args []string) error {
+	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
+	pool := fs.String("pool", "", "")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	switch *pool {
+	case "encode", "webhook":
+		return fmt.Errorf("worker -pool %s: not implemented yet", *pool)
+	case "":
+		return usageError{"worker: -pool is required"}
+	default:
+		return usageError{fmt.Sprintf("worker: unknown pool %q, want encode or webhook", *pool)}
+	}
+}
+
+func runTenantCreate(ctx context.Context, log *slog.Logger, args []string, getenv func(string) string,
+	stdout io.Writer) error {
+	fs := flag.NewFlagSet("tenant create", flag.ContinueOnError)
+	slug := fs.String("slug", "", "")
+	webhookURL := fs.String("webhook-url", "", "")
+	targetLUFS := fs.Float64("target-lufs", defaultTargetLUFS, "")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if *slug == "" {
+		return usageError{"tenant create: -slug is required"}
+	}
+	cfg, err := loadTenantCreateConfig(getenv)
+	if err != nil {
+		return err
+	}
+	box, err := secret.NewBox(string(cfg.SecretKeys.Bytes()))
+	if err != nil {
+		return fmt.Errorf("error loading %s: %w", envSecretKeys, err)
+	}
+
+	gdb, err := db.Open(cfg.DSN, log)
+	if err != nil {
+		return err
+	}
+	pool, err := gdb.DB()
+	if err != nil {
+		return fmt.Errorf("error getting the database pool: %w", err)
+	}
+	defer pool.Close()
+
+	tenants := tenant.NewService(tenant.NewRepository(gdb), box,
+		egress.NewHostChecker(cfg.WebhookAllowPrivate, net.DefaultResolver))
+	_, creds, err := tenants.Create(ctx, tenant.CreateParams{
+		Slug:       *slug,
+		WebhookURL: *webhookURL,
+		TargetLUFS: *targetLUFS,
+	})
+	if err != nil {
+		return fmt.Errorf("error creating tenant %q: %w", *slug, err)
+	}
+	if err := printCredentials(stdout, creds); err != nil {
+		return fmt.Errorf("tenant %q was created, but its credentials couldn't be printed: %w", *slug, err)
+	}
+	return nil
+}
+
+func printCredentials(w io.Writer, creds tenant.Credentials) error {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "api_key: %s\n", creds.APIKey.Bytes())
+	if s := creds.WebhookSecret.Bytes(); s != nil {
+		fmt.Fprintf(&b, "webhook_secret: %s\n", s)
+	}
+	_, err := w.Write(b.Bytes())
+	return err
+}
