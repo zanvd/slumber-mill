@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -240,6 +241,79 @@ func waitForLog(t *testing.T, records <-chan map[string]any, msg string) map[str
 			t.Fatalf("no %q logged within %v", msg, waitTimeout)
 		}
 	}
+}
+
+// logWatch keeps the JSON log records written to it, so a test can wait for a record whatever was logged around it,
+// as with loops that run side by side.
+type logWatch struct {
+	mu      sync.Mutex
+	records []map[string]any
+	ended   bool
+	// changed is closed, and replaced, whenever a record is added or the log ends.
+	changed chan struct{}
+}
+
+// watchLog returns a writer for JSON log lines, which the caller closes, and the watch that keeps them.
+func watchLog(t *testing.T) (io.WriteCloser, *logWatch) {
+	t.Helper()
+	r, w := io.Pipe()
+	lw := &logWatch{changed: make(chan struct{})}
+	go func() {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			var rec map[string]any
+			if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+				t.Errorf("stderr line isn't JSON: %q", sc.Text())
+				continue
+			}
+			lw.mu.Lock()
+			lw.records = append(lw.records, rec)
+			close(lw.changed)
+			lw.changed = make(chan struct{})
+			lw.mu.Unlock()
+		}
+		lw.mu.Lock()
+		lw.ended = true
+		close(lw.changed)
+		lw.mu.Unlock()
+	}()
+	return w, lw
+}
+
+// wait returns the first record with msg and the attributes in attrs, given as name and value pairs, and its index.
+func (lw *logWatch) wait(t *testing.T, msg string, attrs ...any) (int, map[string]any) {
+	t.Helper()
+	timeout := time.NewTimer(waitTimeout)
+	defer timeout.Stop()
+	for {
+		lw.mu.Lock()
+		for i, rec := range lw.records {
+			if rec["msg"] == msg && hasAttrs(rec, attrs) {
+				lw.mu.Unlock()
+				return i, rec
+			}
+		}
+		ended, changed := lw.ended, lw.changed
+		lw.mu.Unlock()
+		if ended {
+			t.Fatalf("the log ended without %q %v", msg, attrs)
+		}
+		select {
+		case <-changed:
+		case <-timeout.C:
+			t.Fatalf("no %q %v logged within %v", msg, attrs, waitTimeout)
+		}
+	}
+}
+
+func hasAttrs(rec map[string]any, attrs []any) bool {
+	for i := 0; i+1 < len(attrs); i += 2 {
+		name, _ := attrs[i].(string)
+		if rec[name] != attrs[i+1] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestAPIServesUntilDrained(t *testing.T) {
@@ -607,10 +681,39 @@ type receivedWebhook struct {
 	aborted bool
 }
 
+// retentionRows are a relayed event and a delivered delivery, which finished at the same time.
+type retentionRows struct {
+	eventID, deliveryEventID uuid.UUID
+}
+
+func (s *testStack) addFinished(t *testing.T, tenantID uint64, daysAgo int) retentionRows {
+	t.Helper()
+	rows := retentionRows{eventID: s.addEvent(t, tenantID, "Relayed "+strconv.Itoa(daysAgo)), deliveryEventID: uuid.NewV7()}
+	s.exec(t, "UPDATE asset_events SET relayed_at = NOW(6) - INTERVAL ? DAY WHERE event_id = ?",
+		daysAgo, db.ID(rows.eventID))
+	s.exec(t, "INSERT INTO webhook_deliveries (event_id, tenant_id, body, state, attempts, run_after, updated_at) "+
+		"VALUES (?, ?, '{}', 'delivered', 1, NOW(6) - INTERVAL ? DAY, NOW(6) - INTERVAL ? DAY)",
+		db.ID(rows.deliveryEventID), tenantID, daysAgo, daysAgo)
+	return rows
+}
+
+func (s *testStack) remaining(t *testing.T, rows retentionRows) (event, delivery bool) {
+	t.Helper()
+	count := func(query string, id uuid.UUID) bool {
+		var n int
+		if err := s.pool.QueryRowContext(t.Context(), query, db.ID(id)).Scan(&n); err != nil {
+			t.Fatalf("error running %q: %v", query, err)
+		}
+		return n > 0
+	}
+	return count("SELECT COUNT(*) FROM asset_events WHERE event_id = ?", rows.eventID),
+		count("SELECT COUNT(*) FROM webhook_deliveries WHERE event_id = ?", rows.deliveryEventID)
+}
+
 // TestWebhookWorker runs the webhook pool against a receiver that answers the first delivery and holds the second.
-// At startup the pool sweeps stale temp files and takes the relay lock; it relays both events and delivers the first,
-// signed; and when it is cancelled with the second in flight, it releases that delivery once the grace runs out,
-// gives up the relay lock and exits 0.
+// At startup the pool sweeps stale temp files, takes the relay lock and deletes what is past retention;
+// it relays both events and delivers the first, signed; and when it is cancelled with the second in flight,
+// it gives up the relay lock at once, releases that delivery once the grace runs out, and exits 0.
 func TestWebhookWorker(t *testing.T) {
 	const grace = time.Second
 	dsn := testutil.NewDatabase(t)
@@ -659,6 +762,8 @@ func TestWebhookWorker(t *testing.T) {
 	mu.Lock()
 	key, hold = []byte(webhookSecret), inFlight.String()
 	mu.Unlock()
+	// Retention is 30 days.
+	expired, kept := s.addFinished(t, tenantID, 31), s.addFinished(t, tenantID, 29)
 
 	env := envFrom(map[string]string{
 		envDSN:                 dsn,
@@ -669,7 +774,7 @@ func TestWebhookWorker(t *testing.T) {
 		envEncodeLease:         "1m",
 		envShutdownGrace:       grace.String(),
 	})
-	stderr, records := logRecords(t)
+	stderr, logs := watchLog(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var stdout bytes.Buffer
@@ -679,30 +784,47 @@ func TestWebhookWorker(t *testing.T) {
 		stderr.Close()
 	}()
 
-	checkSwept(t, waitForLog(t, records, "swept temp files"), "1m0s", stale, fresh)
-	started := waitForLog(t, records, "worker pool started")
+	sweptAt, swept := logs.wait(t, "swept temp files")
+	checkSwept(t, swept, "1m0s", stale, fresh)
+	startedAt, started := logs.wait(t, "worker pool started")
 	if started["pool"] != "webhook" || started["concurrency"] != float64(1) || started["lease"] != "1m0s" ||
 		started["grace"] != "1s" {
 		t.Errorf("logged %v, want the webhook pool with concurrency 1, lease 1m0s and grace 1s", started)
 	}
-	if locked := waitForLog(t, records, "took the relay lock"); locked["pool"] != "webhook" {
+	if sweptAt > startedAt {
+		t.Error("the pool started before the temp sweep")
+	}
+	if _, locked := logs.wait(t, "took the relay lock"); locked["pool"] != "webhook" {
 		t.Errorf("logged %v, want the relay's records to name the pool", locked)
 	}
-	if finished := waitForLog(t, records, "work finished"); finished["outcome"] != "done" {
-		t.Errorf("logged %v, want the first delivery done", finished)
+	for _, msg := range []string{
+		"deleted relayed asset events past retention", "deleted delivered webhook deliveries past retention",
+	} {
+		if _, rec := logs.wait(t, msg); rec["deleted"] != float64(1) || rec["age"] != "720h0m0s" || rec["pool"] != "webhook" {
+			t.Errorf("logged %v, want the webhook pool to have deleted 1 row past 720h0m0s", rec)
+		}
 	}
+	logs.wait(t, "work finished", "outcome", "done")
 
 	waitFor(t, holding, "the second delivery")
 	cancelled := time.Now()
 	cancel()
 	exitsWithinGrace(t, done, cancelled, grace)
+	unlockedAt, _ := logs.wait(t, "released the relay lock")
+	expiredAt, _ := logs.wait(t, "shutdown grace expired, cancelling the work")
+	releasedAt, _ := logs.wait(t, "work finished", "outcome", "released")
+	stoppedAt, _ := logs.wait(t, "worker pool stopped")
 	// The relay stops at once, while the delivery in flight has the grace.
-	waitForLog(t, records, "released the relay lock")
-	waitForLog(t, records, "shutdown grace expired, cancelling the work")
-	if released := waitForLog(t, records, "work finished"); released["outcome"] != "released" {
-		t.Errorf("logged %v, want the delivery in flight released", released)
+	if !(unlockedAt < expiredAt && expiredAt < releasedAt && releasedAt < stoppedAt) {
+		t.Errorf("logged the relay lock released at %d, the grace expired at %d, the delivery released at %d and "+
+			"the pool stopped at %d, want them in that order", unlockedAt, expiredAt, releasedAt, stoppedAt)
 	}
-	waitForLog(t, records, "worker pool stopped")
+	if event, delivery := s.remaining(t, expired); event || delivery {
+		t.Errorf("rows finished 31 days ago remain: event %t, delivery %t; want both deleted", event, delivery)
+	}
+	if event, delivery := s.remaining(t, kept); !event || !delivery {
+		t.Errorf("rows finished 29 days ago remain: event %t, delivery %t; want both kept", event, delivery)
+	}
 
 	mu.Lock()
 	got := slices.Clone(received)

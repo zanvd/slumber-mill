@@ -15,6 +15,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/zanvd/slumber-mill/src/logging"
 )
 
 // plantTempFile writes a temp file into dataDir as storage names them, last modified at modTime.
@@ -258,15 +260,17 @@ func TestRunWebhook(t *testing.T) {
 				go func() {
 					defer close(done)
 					runWebhook(ctx, fakeLoop{name: "relay", stopping: tt.relayStops, steps: steps},
-						fakeLoop{name: "deliveries", stopping: tt.poolStops, steps: steps}, fakeClient{steps: steps})
+						fakeLoop{name: "deliveries", stopping: tt.poolStops, steps: steps}, fakeClient{steps: steps},
+						fakeLoop{name: "retention", steps: steps}.Run)
 					steps.add("returned")
 				}()
 
 				time.Sleep(running)
 				synctest.Wait()
-				if got := steps.names(); len(got) != 2 || !slices.Contains(got, "relay started") ||
-					!slices.Contains(got, "deliveries started") {
-					t.Errorf("steps before the signal = %q, want the relay and the deliveries started", got)
+				got := steps.names()
+				slices.Sort(got)
+				if want := []string{"deliveries started", "relay started", "retention started"}; !slices.Equal(got, want) {
+					t.Errorf("steps before the signal = %q, want %q", got, want)
 				}
 				cancel()
 				<-done
@@ -275,6 +279,7 @@ func TestRunWebhook(t *testing.T) {
 					"relay stopped":           running + tt.relayStops,
 					"deliveries stopped":      running + tt.poolStops,
 					"idle connections closed": running + tt.poolStops,
+					"retention stopped":       running,
 					"returned":                running + max(tt.relayStops, tt.poolStops),
 				}
 				for name, at := range want {
@@ -290,6 +295,125 @@ func TestRunWebhook(t *testing.T) {
 				}
 				if returned != len(steps.names())-1 {
 					t.Errorf("runWebhook returned before every loop stopped; steps %q", steps.names())
+				}
+			})
+		})
+	}
+}
+
+// fakeDelete stands in for a retention delete: each call takes the next of took, then returns the next of errs,
+// or the context's error if the context ends first.
+type fakeDelete struct {
+	name  string
+	steps *recorder
+	took  []time.Duration
+	errs  []error
+	calls int
+}
+
+func (f *fakeDelete) delete(ctx context.Context, age time.Duration) (int, error) {
+	f.steps.add(f.name + " older than " + age.String())
+	i := f.calls
+	f.calls++
+	if i < len(f.took) {
+		select {
+		case <-ctx.Done():
+			return 0, errors.Join(errors.New(f.name+" interrupted"), ctx.Err())
+		case <-time.After(f.took[i]):
+		}
+	}
+	if i < len(f.errs) && f.errs[i] != nil {
+		return 0, f.errs[i]
+	}
+	return 1, nil
+}
+
+func TestRetain(t *testing.T) {
+	const (
+		age      = 30 * 24 * time.Hour
+		interval = time.Hour
+	)
+	tests := []struct {
+		name         string
+		events       fakeDelete
+		deliveries   fakeDelete
+		stopAt       time.Duration
+		wantSteps    []step
+		wantErrors   []string
+		wantReturnAt time.Duration
+	}{
+		{
+			name:       "at once, then an interval after each run ends",
+			events:     fakeDelete{name: "events", took: []time.Duration{10 * time.Minute, 5 * time.Minute}},
+			deliveries: fakeDelete{name: "deliveries"},
+			stopAt:     2*time.Hour + 30*time.Minute,
+			wantSteps: []step{
+				{"events older than 720h0m0s", 0},
+				{"deliveries older than 720h0m0s", 10 * time.Minute},
+				{"events older than 720h0m0s", time.Hour + 10*time.Minute},
+				{"deliveries older than 720h0m0s", time.Hour + 15*time.Minute},
+				{"events older than 720h0m0s", 2*time.Hour + 15*time.Minute},
+				{"deliveries older than 720h0m0s", 2*time.Hour + 15*time.Minute},
+			},
+			wantReturnAt: 2*time.Hour + 30*time.Minute,
+		},
+		{
+			name:       "an error doesn't stop the schedule",
+			events:     fakeDelete{name: "events", errs: []error{errors.New("lock wait timeout")}},
+			deliveries: fakeDelete{name: "deliveries"},
+			stopAt:     90 * time.Minute,
+			wantSteps: []step{
+				{"events older than 720h0m0s", 0},
+				{"deliveries older than 720h0m0s", 0},
+				{"events older than 720h0m0s", time.Hour},
+				{"deliveries older than 720h0m0s", time.Hour},
+			},
+			wantErrors:   []string{"lock wait timeout"},
+			wantReturnAt: 90 * time.Minute,
+		},
+		{
+			name:       "shutdown interrupts a run without an error",
+			events:     fakeDelete{name: "events", took: []time.Duration{time.Hour}},
+			deliveries: fakeDelete{name: "deliveries"},
+			stopAt:     20 * time.Minute,
+			wantSteps: []step{
+				{"events older than 720h0m0s", 0},
+			},
+			wantReturnAt: 20 * time.Minute,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				steps := newRecorder()
+				tt.events.steps, tt.deliveries.steps = steps, steps
+				var b bytes.Buffer
+				ctx, cancel := context.WithCancel(logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&b, nil))))
+				defer cancel()
+				time.AfterFunc(tt.stopAt, cancel)
+
+				retain(ctx, age, interval, tt.events.delete, tt.deliveries.delete)
+				returned := time.Since(steps.start)
+
+				steps.mu.Lock()
+				got := slices.Clone(steps.steps)
+				steps.mu.Unlock()
+				if !slices.Equal(got, tt.wantSteps) {
+					t.Errorf("deletes ran as %v, want %v", got, tt.wantSteps)
+				}
+				if returned != tt.wantReturnAt {
+					t.Errorf("retain() returned at %v, want %v", returned, tt.wantReturnAt)
+				}
+				var gotErrors []string
+				for _, line := range logLines(t, &b) {
+					if line["level"] != "ERROR" || line["msg"] != "retention failed" {
+						t.Errorf("logged %v, want only retention errors", line)
+					}
+					msg, _ := line["error"].(string)
+					gotErrors = append(gotErrors, msg)
+				}
+				if !slices.Equal(gotErrors, tt.wantErrors) {
+					t.Errorf("logged errors %q, want %q", gotErrors, tt.wantErrors)
 				}
 			})
 		})

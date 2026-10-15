@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/zanvd/slumber-mill/src/logging"
 )
 
 type versioner interface {
@@ -57,15 +59,42 @@ func sweepTemp(ctx context.Context, log *slog.Logger, files tempSweeper, age tim
 	log.InfoContext(ctx, "swept temp files", "older_than", age.String(), "removed", removed)
 }
 
-// runWebhook runs the relay and the delivery pool until ctx is done and both have stopped. The relay gives up
-// its lock as it stops, and the pool releases deliveries still in flight once the grace runs out.
+// runWebhook runs the relay, the delivery pool and retention until ctx is done and all of them have stopped.
+// The relay gives up its lock as it stops, and the pool releases deliveries still in flight once the grace runs out.
 // The client's idle connections are closed after the pool has stopped, when nothing can reuse them.
-func runWebhook(ctx context.Context, relay, deliveries runner, client idleCloser) {
+func runWebhook(ctx context.Context, relay, deliveries runner, client idleCloser, deleteOld func(context.Context)) {
 	var wg sync.WaitGroup
 	wg.Go(func() { relay.Run(ctx) })
 	wg.Go(func() {
 		deliveries.Run(ctx)
 		client.CloseIdleConnections()
 	})
+	wg.Go(func() { deleteOld(ctx) })
 	wg.Wait()
+}
+
+// retentionDelete deletes the rows older than age and returns how many it deleted.
+type retentionDelete func(ctx context.Context, age time.Duration) (int, error)
+
+// retain runs each delete with age at once, and again interval after each run ends, until ctx is done.
+// The deletes log what they delete. An error is logged unless ctx ending caused it.
+func retain(ctx context.Context, age, interval time.Duration, deletes ...retentionDelete) {
+	log := logging.LoggerFromContext(ctx)
+	for {
+		for _, del := range deletes {
+			if ctx.Err() != nil {
+				return
+			}
+			if _, err := del(ctx, age); err != nil && ctx.Err() == nil {
+				log.ErrorContext(ctx, "retention failed", "error", err)
+			}
+		}
+		wait := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+			return
+		case <-wait.C:
+		}
+	}
 }
