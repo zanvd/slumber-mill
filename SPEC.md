@@ -841,7 +841,8 @@ docker compose run --rm dev go vet -tags integration ./...
 docker compose run --rm dev go test -tags integration -coverprofile=/out/cover.out ./...
 ```
 
-A Makefile may wrap these, as long as each target stays a single `docker compose` command.
+A Makefile may wrap these, as long as each target stays a single `docker compose` command;
+the one exception is `process-checks`, which runs `bash scripts/process-checks.sh` (§13).
 
 ### Shutdown and crashes
 
