@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ func TestLoadAPIConfig(t *testing.T) {
 		DataDir:             "/data",
 		MaxUploadBytes:      2147483648,
 		MaxUploadsPerTenant: 4,
+		EncodeLease:         2 * time.Minute,
 		DrainDelay:          10 * time.Second,
 		ShutdownGrace:       30 * time.Second,
 	}
@@ -44,6 +46,7 @@ func TestLoadAPIConfig(t *testing.T) {
 				envMaxUploadBytes:      "1048576",
 				envMaxUploadsPerTenant: "2",
 				envTrustedProxies:      "10.0.0.0/8, 192.168.1.1,fd00::/8 ,2001:db8::1",
+				envEncodeLease:         "5m",
 				envDrainDelay:          "0s",
 				envShutdownGrace:       "1m30s",
 			},
@@ -54,9 +57,24 @@ func TestLoadAPIConfig(t *testing.T) {
 				MaxUploadBytes:      1 << 20,
 				MaxUploadsPerTenant: 2,
 				TrustedProxies:      []string{"10.0.0.0/8", "192.168.1.1", "fd00::/8", "2001:db8::1"},
+				EncodeLease:         5 * time.Minute,
 				DrainDelay:          0,
 				ShutdownGrace:       90 * time.Second,
 			},
+		},
+		{
+			name:    "encode lease below the minimum",
+			env:     map[string]string{envEncodeLease: "59s"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "59s"`},
+		},
+		{
+			name: "encode lease at the minimum",
+			env:  map[string]string{envEncodeLease: "1m"},
+			want: func() apiConfig {
+				c := defaults
+				c.EncodeLease = time.Minute
+				return c
+			}(),
 		},
 		{
 			name:    "upload limit not a number",
@@ -142,6 +160,218 @@ func TestLoadAPIConfig(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("loadAPIConfig() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadEncodeConfig(t *testing.T) {
+	defaults := encodeConfig{
+		DSN:           "slumber_mill:slumber_mill@tcp(mysql:3306)/slumber_mill",
+		DataDir:       "/data",
+		Concurrency:   runtime.GOMAXPROCS(0),
+		Lease:         2 * time.Minute,
+		ShutdownGrace: 30 * time.Second,
+	}
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    encodeConfig
+		wantErr []string
+	}{
+		{name: "defaults", want: defaults},
+		{
+			name: "blank values are unset",
+			env:  map[string]string{envEncodeConcurrency: " ", envEncodeLease: "", envShutdownGrace: "  "},
+			want: defaults,
+		},
+		{
+			name: "every variable set",
+			env: map[string]string{
+				envDSN:               "u:p@tcp(db:3306)/app",
+				envDataDir:           "/srv/data",
+				envEncodeConcurrency: "3",
+				envEncodeLease:       "10m",
+				envShutdownGrace:     "45s",
+				// Read by the other commands only.
+				envWebhookConcurrency: "x",
+				envSecretKeys:         "x",
+				envDrainDelay:         "x",
+			},
+			want: encodeConfig{
+				DSN:           "u:p@tcp(db:3306)/app",
+				DataDir:       "/srv/data",
+				Concurrency:   3,
+				Lease:         10 * time.Minute,
+				ShutdownGrace: 45 * time.Second,
+			},
+		},
+		{
+			name:    "concurrency zero",
+			env:     map[string]string{envEncodeConcurrency: "0"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_CONCURRENCY must be a positive integer, got "0"`},
+		},
+		{
+			name:    "lease without a unit",
+			env:     map[string]string{envEncodeLease: "120"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "120"`},
+		},
+		{
+			name:    "lease negative",
+			env:     map[string]string{envEncodeLease: "-2m"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "-2m"`},
+		},
+		{
+			name:    "lease below the minimum",
+			env:     map[string]string{envEncodeLease: "59s"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "59s"`},
+		},
+		{
+			name: "lease at the minimum",
+			env:  map[string]string{envEncodeLease: "1m"},
+			want: func() encodeConfig {
+				c := defaults
+				c.Lease = time.Minute
+				return c
+			}(),
+		},
+		{
+			name:    "every invalid variable is reported",
+			env:     map[string]string{envEncodeConcurrency: "all", envEncodeLease: "long", envShutdownGrace: "0"},
+			wantErr: []string{envEncodeConcurrency, envEncodeLease, envShutdownGrace},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := loadEncodeConfig(envFrom(tt.env))
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("loadEncodeConfig() error = nil, want one containing %q", tt.wantErr)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("loadEncodeConfig() error = %q, want it to contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadEncodeConfig() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("loadEncodeConfig() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadWebhookConfig(t *testing.T) {
+	// Parsed later, by secret.NewBox.
+	const keys = "1:not-parsed-here"
+	type plain struct {
+		DSN, DataDir        string
+		Concurrency         int
+		EncodeLease         time.Duration
+		ShutdownGrace       time.Duration
+		WebhookAllowPrivate bool
+	}
+	defaults := plain{
+		DSN:           "slumber_mill:slumber_mill@tcp(mysql:3306)/slumber_mill",
+		DataDir:       "/data",
+		Concurrency:   8,
+		EncodeLease:   2 * time.Minute,
+		ShutdownGrace: 30 * time.Second,
+	}
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    plain
+		wantErr []string
+	}{
+		{name: "defaults", env: map[string]string{envSecretKeys: keys}, want: defaults},
+		{
+			name: "every variable set",
+			env: map[string]string{
+				envSecretKeys:          keys,
+				envDSN:                 "u:p@tcp(db:3306)/app",
+				envDataDir:             "/srv/data",
+				envWebhookConcurrency:  "32",
+				envEncodeLease:         "90s",
+				envShutdownGrace:       "1m",
+				envWebhookAllowPrivate: "true",
+				// Read by the other commands only.
+				envEncodeConcurrency: "x",
+				envDrainDelay:        "x",
+			},
+			want: plain{
+				DSN:                 "u:p@tcp(db:3306)/app",
+				DataDir:             "/srv/data",
+				Concurrency:         32,
+				EncodeLease:         90 * time.Second,
+				ShutdownGrace:       time.Minute,
+				WebhookAllowPrivate: true,
+			},
+		},
+		{
+			name:    "key ring missing",
+			env:     map[string]string{},
+			wantErr: []string{"SLUMBER_MILL_SECRET_KEYS is required"},
+		},
+		{
+			name:    "concurrency negative",
+			env:     map[string]string{envSecretKeys: keys, envWebhookConcurrency: "-8"},
+			wantErr: []string{`SLUMBER_MILL_WEBHOOK_CONCURRENCY must be a positive integer, got "-8"`},
+		},
+		{
+			name:    "encode lease below the minimum",
+			env:     map[string]string{envSecretKeys: keys, envEncodeLease: "59s"},
+			wantErr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got "59s"`},
+		},
+		{
+			name: "encode lease at the minimum",
+			env:  map[string]string{envSecretKeys: keys, envEncodeLease: "1m"},
+			want: func() plain {
+				c := defaults
+				c.EncodeLease = time.Minute
+				return c
+			}(),
+		},
+		{
+			name: "every invalid variable is reported",
+			env: map[string]string{
+				envWebhookConcurrency: "many", envEncodeLease: "x", envShutdownGrace: "y", envWebhookAllowPrivate: "z",
+			},
+			wantErr: []string{
+				envWebhookConcurrency, envEncodeLease, envShutdownGrace, envWebhookAllowPrivate, envSecretKeys,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := loadWebhookConfig(envFrom(tt.env))
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatalf("loadWebhookConfig() error = nil, want one containing %q", tt.wantErr)
+				}
+				for _, want := range tt.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("loadWebhookConfig() error = %q, want it to contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadWebhookConfig() error = %v", err)
+			}
+			gotPlain := plain{
+				DSN: got.DSN, DataDir: got.DataDir, Concurrency: got.Concurrency, EncodeLease: got.EncodeLease,
+				ShutdownGrace: got.ShutdownGrace, WebhookAllowPrivate: got.WebhookAllowPrivate,
+			}
+			if gotPlain != tt.want {
+				t.Errorf("loadWebhookConfig() = %+v, want %+v", gotPlain, tt.want)
+			}
+			if string(got.SecretKeys.Bytes()) != keys {
+				t.Error("loadWebhookConfig().SecretKeys doesn't hold the key ring")
 			}
 		})
 	}

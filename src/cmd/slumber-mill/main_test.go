@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/tenant"
@@ -17,11 +19,15 @@ func TestRun(t *testing.T) {
 	const badDSN = "no-slash"
 	validKeys := "1:" + base64.StdEncoding.EncodeToString(make([]byte, 32))
 	shortKey := base64.StdEncoding.EncodeToString([]byte("sixteen-byte-key"))
+	// The API and the webhook pool sweep it before they open the database.
+	dataDir := t.TempDir()
 
 	tests := []struct {
-		name          string
-		args          []string
-		env           map[string]string
+		name string
+		args []string
+		env  map[string]string
+		// stopped runs the command on a context cancelled already, as when a signal arrives during startup.
+		stopped       bool
 		wantCode      int
 		wantStderr    []string
 		notWantStderr []string
@@ -47,7 +53,7 @@ func TestRun(t *testing.T) {
 			wantCode: exitError,
 			wantStderr: []string{`SLUMBER_MILL_SHUTDOWN_GRACE must be a positive duration, such as 30s, got \"soon\"`,
 				`SLUMBER_MILL_MAX_UPLOADS_PER_TENANT must be a positive integer, got \"many\"`}},
-		{name: "api with a bad DSN", args: []string{"api"}, env: map[string]string{envDSN: badDSN},
+		{name: "api with a bad DSN", args: []string{"api"}, env: map[string]string{envDSN: badDSN, envDataDir: dataDir},
 			wantCode: exitError, wantStderr: []string{"error parsing DSN"}},
 
 		{name: "worker without a pool", args: []string{"worker"}, wantCode: exitUsage,
@@ -56,10 +62,47 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{`worker: unknown pool "audio", want encode or webhook`}},
 		{name: "worker with an argument", args: []string{"worker", "-pool", "encode", "now"}, wantCode: exitUsage,
 			wantStderr: []string{`worker: unexpected argument "now"`}},
-		{name: "encode worker", args: []string{"worker", "-pool", "encode"}, wantCode: exitError,
-			wantStderr: []string{"worker -pool encode: not implemented yet"}},
-		{name: "webhook worker", args: []string{"worker", "-pool", "webhook"}, wantCode: exitError,
-			wantStderr: []string{"worker -pool webhook: not implemented yet"}},
+		{name: "worker help", args: []string{"worker", "-h"}, wantCode: exitOK, wantStderr: []string{"usage:"}},
+		{name: "encode worker with bad configuration", args: []string{"worker", "-pool", "encode"},
+			env:      map[string]string{envEncodeLease: "soon", envEncodeConcurrency: "0"},
+			wantCode: exitError,
+			wantStderr: []string{`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"soon\"`,
+				`SLUMBER_MILL_ENCODE_CONCURRENCY must be a positive integer, got \"0\"`}},
+		{name: "webhook worker with bad configuration", args: []string{"worker", "-pool", "webhook"},
+			env:      map[string]string{envWebhookConcurrency: "lots"},
+			wantCode: exitError,
+			wantStderr: []string{`SLUMBER_MILL_WEBHOOK_CONCURRENCY must be a positive integer, got \"lots\"`,
+				"SLUMBER_MILL_SECRET_KEYS is required"}},
+		{name: "webhook worker with a malformed key ring", args: []string{"worker", "-pool", "webhook"},
+			env:           map[string]string{envSecretKeys: "1:secret-material!"},
+			wantCode:      exitError,
+			wantStderr:    []string{"error loading SLUMBER_MILL_SECRET_KEYS: error parsing key ring entry 1"},
+			notWantStderr: []string{"secret-material"}},
+		{name: "webhook worker with a bad DSN", args: []string{"worker", "-pool", "webhook"},
+			env:      map[string]string{envSecretKeys: validKeys, envDSN: badDSN, envDataDir: dataDir},
+			wantCode: exitError, wantStderr: []string{"error parsing DSN"}, notWantStderr: []string{validKeys[2:]}},
+		{name: "api with an encode lease below the minimum", args: []string{"api"},
+			env:      map[string]string{envEncodeLease: "59s", envDataDir: dataDir},
+			wantCode: exitError,
+			wantStderr: []string{
+				`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"59s\"`}},
+		{name: "encode worker with an encode lease below the minimum", args: []string{"worker", "-pool", "encode"},
+			env:      map[string]string{envEncodeLease: "2ns", envDataDir: dataDir},
+			wantCode: exitError,
+			wantStderr: []string{
+				`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"2ns\"`},
+			notWantStderr: []string{"ffmpeg", "swept"}},
+		{name: "webhook worker with an encode lease below the minimum", args: []string{"worker", "-pool", "webhook"},
+			env:      map[string]string{envSecretKeys: validKeys, envEncodeLease: "59s", envDataDir: dataDir},
+			wantCode: exitError,
+			wantStderr: []string{
+				`SLUMBER_MILL_ENCODE_LEASE must be a duration of at least 1m0s, such as 2m0s, got \"59s\"`},
+			notWantStderr: []string{"swept"}},
+		// Whether or not ffmpeg is installed, the check fails on the cancelled context; a bad DSN would fail
+		// the command if startup went on.
+		{name: "encode worker stopped during the ffmpeg check", args: []string{"worker", "-pool", "encode"},
+			env: map[string]string{envDSN: badDSN, envDataDir: dataDir}, stopped: true, wantCode: exitOK,
+			notWantStderr: []string{"command failed", "ffmpeg", "DSN"}},
 
 		{name: "tenant without a subcommand", args: []string{"tenant"}, wantCode: exitUsage,
 			wantStderr: []string{"tenant: the only subcommand is create"}},
@@ -89,8 +132,13 @@ func TestRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.stopped {
+				cancel()
+			}
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), tt.args, envFrom(tt.env), &stdout, &stderr)
+			code := run(ctx, tt.args, envFrom(tt.env), &stdout, &stderr)
 			if code != tt.wantCode {
 				t.Errorf("run(%q) = %d, want %d; stderr:\n%s", tt.args, code, tt.wantCode, stderr.String())
 			}
@@ -115,6 +163,33 @@ func TestRun(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestEncodeWorkerChecksFFmpegFirst runs the encode pool with nothing on PATH: it stops with a clear error
+// before it sweeps temp files or reads its DSN.
+func TestEncodeWorkerChecksFFmpegFirst(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	dataDir := t.TempDir()
+	stale := plantTempFile(t, dataDir, "part-stale", time.Now().Add(-24*time.Hour))
+	var stdout, stderr bytes.Buffer
+	code := run(t.Context(), []string{"worker", "-pool", "encode"},
+		envFrom(map[string]string{envDSN: "no-slash", envDataDir: dataDir}), &stdout, &stderr)
+
+	if code != exitError {
+		t.Errorf("exit code %d, want %d; stderr:\n%s", code, exitError, stderr.String())
+	}
+	if want := "the encode pool needs ffmpeg and ffprobe: ffmpeg is not installed"; !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", stderr.String(), want)
+	}
+	if strings.Contains(stderr.String(), "DSN") || strings.Contains(stderr.String(), "swept") {
+		t.Errorf("stderr = %q, want it to stop before the sweep and the database", stderr.String())
+	}
+	if !exists(t, stale) {
+		t.Error("the stale temp file was swept, want the ffmpeg check first")
+	}
+	if stdout.Len() > 0 {
+		t.Errorf("wrote to stdout: %q", stdout.String())
 	}
 }
 

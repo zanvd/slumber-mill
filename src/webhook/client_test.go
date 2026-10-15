@@ -967,3 +967,37 @@ func TestPostCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestCloseIdleConnections(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var states []http.ConnState
+		srv := httptest.NewTestServer(t, respondStatus(http.StatusOK))
+		srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+			mu.Lock()
+			defer mu.Unlock()
+			states = append(states, s)
+		}
+		seen := func() []http.ConnState {
+			mu.Lock()
+			defer mu.Unlock()
+			return slices.Clone(states)
+		}
+		c := NewClient(false)
+		inMemory(t, c, srv)
+
+		status, err := c.Post(t.Context(), "http://"+testHost+testPath, testEventID, testSignature, testBody)
+		if err != nil || status != http.StatusOK {
+			t.Fatalf("Post() = %d, %v, want %d, nil", status, err, http.StatusOK)
+		}
+		synctest.Wait()
+		if got, want := seen(), []http.ConnState{http.StateNew, http.StateActive, http.StateIdle}; !slices.Equal(got, want) {
+			t.Fatalf("server saw connection states %v after the post, want %v", got, want)
+		}
+		c.CloseIdleConnections()
+		synctest.Wait()
+		if got := seen(); got[len(got)-1] != http.StateClosed {
+			t.Errorf("server saw connection states %v after CloseIdleConnections, want the connection closed", got)
+		}
+	})
+}
