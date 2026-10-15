@@ -878,11 +878,15 @@ A Makefile may wrap these, as long as each target stays a single `docker compose
 | `SLUMBER_MILL_MAX_UPLOADS_PER_TENANT` | `4` |
 | `SLUMBER_MILL_ENCODE_CONCURRENCY` | `runtime.GOMAXPROCS(0)` (follows the container's CPU limit) |
 | `SLUMBER_MILL_WEBHOOK_CONCURRENCY` | `8` |
+| `SLUMBER_MILL_ENCODE_LEASE` | `2m` (the encode pool's lease; heartbeats every lease/3) |
 | `SLUMBER_MILL_SHUTDOWN_GRACE` | `30s` |
 | `SLUMBER_MILL_DRAIN_DELAY` | `10s` (API: readiness fails, still serving) |
 | `SLUMBER_MILL_TRUSTED_PROXIES` | empty (trust none) |
 | `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` | `false` (`true` in the local Compose stack) |
 | `SLUMBER_MILL_SECRET_KEYS` | none; required by `tenant create` and the webhook pool (§8) |
+
+The temp refresh (every lease/3) and the startup temp sweep's age follow the encode lease,
+so `api` and both pools read `SLUMBER_MILL_ENCODE_LEASE`.
 
 ### Other process behaviour
 
