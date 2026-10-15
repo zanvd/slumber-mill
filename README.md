@@ -220,7 +220,7 @@ back to dynamic mode and lands 2-3 LU short.
   lock wait timeout in the services' logs, and on any ERROR line other than one known case. That case is GORM's
   `query failed` for the losing insert of two concurrent uploads with the same key, which the script counts.
 
-A run takes the duration plus about 10 minutes to build, start and drain. It uses about 4 of the host's CPUs for
+A run takes the duration plus 3-5 minutes to build, start and drain. It uses about 4 of the host's CPUs for
 the two encode workers. The project is `<name>-soak`, where `<name>` is `COMPOSE_PROJECT_NAME` or `slumber-mill`,
 with `var/out/soak/data` as its data directory, and it publishes no port. At the end the script takes the project
 down with its volumes and images. The driver's summary is left in `var/out/soak/summary.txt`, with its log in
