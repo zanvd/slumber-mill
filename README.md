@@ -186,8 +186,8 @@ encode lease is its 1 minute minimum. A driver, the `soak` service in `scripts/s
 `TestFullStackSoak` (build tag `soak`) from the `dev` image on the project's network. The script creates five
 tenants with `tenant create` in the `api` service. Four have webhooks pointing at the driver's receiver; the fifth
 has none, and their targets range from -16 to -23 LUFS. A higher target, such as -14, would get most of the noise
-fixtures rejected. Under the -4 dBTP pre-encode ceiling, loudnorm can't reach the target in linear mode, so it falls
-back to dynamic mode and lands 2-3 LU short.
+fixtures rejected. Under the -4.5 dBTP pre-encode peak, loudnorm can't reach the target in linear mode, so it falls
+back to dynamic mode and lands more than 1 LU short.
 
 - **Uploads.** Ten uploaders go through the API for `SLUMBER_MILL_SOAK_DURATION` (default `10m`), and pause while
   12 assets are unfinished. They send 5-20 second stereo, mono and 5.1 noise fixtures from fixed seeds, an

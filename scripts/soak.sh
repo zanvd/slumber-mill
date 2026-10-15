@@ -26,8 +26,8 @@ export SLUMBER_MILL_SOAK_DRAIN_TIMEOUT=${SLUMBER_MILL_SOAK_DRAIN_TIMEOUT:-15m}
 chaos_every=${SLUMBER_MILL_SOAK_CHAOS_EVERY:-45}
 
 # The tenants: slug, target loudness, and whether webhooks go to the driver's receiver. Targets above -16 LUFS are
-# left out: pink noise can't reach them under the -4 dBTP pre-encode ceiling, so loudnorm falls back to dynamic
-# mode, undershoots by 2-3 LU, and the encode pool rejects the renditions, as §7 says it should.
+# left out: pink noise can't reach them under the -4.5 dBTP pre-encode peak, so loudnorm falls back to dynamic
+# mode, undershoots by more than 1 LU, and the encode pool rejects the renditions, as §7 says it should.
 slugs=(soak-a soak-b soak-c soak-d soak-quiet)
 targets=(-16 -18 -20 -23 -16)
 hooked=(yes yes yes yes no)
