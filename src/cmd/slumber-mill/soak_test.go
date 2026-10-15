@@ -88,7 +88,7 @@ const (
 	invLeased     = "nothing is left leased"
 	invAttempts   = "every asset and delivery used 1 to its maximum attempts"
 	invAudio      = "every audio upload is ready with its measurements, or failed after its lease expired every time"
-	invRejected   = "every rejected upload failed on its first attempt with its tenant-safe message"
+	invRejected   = "every rejected upload failed with its tenant-safe message"
 	invInSpec     = "every rendition is in spec, and its file has the recorded size and hash"
 	invDownload   = "the API serves renditions whole and by range"
 	invSigned     = "every webhook the receiver got was signed and well-formed, for its own tenant"
@@ -867,7 +867,8 @@ type soakResult struct {
 	events      map[string]*soakEvent
 	hits        map[string][]soakHit
 	hitTotal    int
-	exhausted   int
+	exhausted     int
+	rejectedLater int
 	downloads   int
 	problems    map[string][]string
 	invariantOK map[string]bool
@@ -996,9 +997,14 @@ func (d *soakDriver) checkAssets(res *soakResult, add func(inv, format string, a
 			continue
 		}
 		if u.fixture.rejected != "" {
-			if a.status != "failed" || a.errorMsg != u.fixture.rejected || a.attempts != 1 {
-				add(invRejected, "asset %s (%s) is %s on attempt %d with error %q, want failed on attempt 1 with %q",
+			// An attempt killed with its worker is reaped and counts, so a rejection can come on a later attempt.
+			// soak.sh checks that every attempt beyond an asset's first follows a reap.
+			if a.status != "failed" || a.errorMsg != u.fixture.rejected {
+				add(invRejected, "asset %s (%s) is %s on attempt %d with error %q, want failed with %q",
 					id, u.fixture.name, a.status, a.attempts, a.errorMsg, u.fixture.rejected)
+			}
+			if a.attempts > 1 {
+				res.rejectedLater++
 			}
 			continue
 		}
@@ -1278,8 +1284,9 @@ func (d *soakDriver) report(t *testing.T, took, drained time.Duration) {
 			f.failed++
 		}
 	}
-	line("assets: %d (%s); failed with: %s; by attempts: %s; failed after every lease expired: %d",
-		len(res.assets), soakCounts(byStatus), soakCounts(byError), soakCounts(byAttempts), res.exhausted)
+	line("assets: %d (%s); failed with: %s; by attempts: %s; failed after every lease expired: %d; "+
+		"rejected on a later attempt: %d", len(res.assets), soakCounts(byStatus), soakCounts(byError),
+		soakCounts(byAttempts), res.exhausted, res.rejectedLater)
 	for _, f := range d.fixtures {
 		if c := byFixture[f.name]; c != nil {
 			line("  %-22s %4d assets, %4d ready, %4d failed", f.name, c.uploads, c.ready, c.failed)

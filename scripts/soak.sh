@@ -100,6 +100,10 @@ logged() {
   ((n >= ${3:-1}))
 }
 
+sql() {
+  compose exec -T -e MYSQL_PWD=slumber_mill mysql mysql -uslumber_mill -N -B slumber_mill -e "$1"
+}
+
 # containers SERVICE prints the names of SERVICE's containers in replica order.
 containers() {
   compose ps -a --format '{{.Name}}' "$1" | sort -V
@@ -278,6 +282,14 @@ check_logs() {
   echo "  ERROR lines from the losing insert of concurrent idempotent uploads: $expected"
   for n in "${!errors[@]}"; do echo "  unexplained ERROR lines, $n: ${errors[$n]}"; done | sort
 
+  # The soak never stops an encode worker gracefully and no encode fails but by rejection, so an attempt beyond an
+  # asset's first can only be a reaper's requeue after a SIGKILL. A third reap fails the asset instead.
+  local requeued=${reaped["reaped assets whose lease expired, requeued"]:-0}
+  if [[ $extra_attempts == "$requeued" ]]; then
+    record PASS "every encode attempt beyond an asset's first followed a reap ($extra_attempts in the database, $requeued requeued)"
+  else
+    record FAIL "every encode attempt beyond an asset's first followed a reap ($extra_attempts in the database, $requeued requeued)"
+  fi
   if ((deadlocks == 0 && lockwaits == 0)); then
     record PASS "no deadlocks or lock wait timeouts in any service's logs"
   else
@@ -317,6 +329,7 @@ main() {
   kill "$follower" 2>/dev/null || true
   follower=
   log "the driver exited with code $code"
+  extra_attempts=$(sql "SELECT COALESCE(SUM(attempts - 1), 0) FROM assets") || extra_attempts=unknown
 
   if [[ -z $stopped && -z $(not_running) ]]; then
     record PASS "no service container exited on its own"

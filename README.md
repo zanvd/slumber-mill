@@ -209,7 +209,9 @@ back to dynamic mode and lands 2-3 LU short.
   - nothing is left leased, and attempts stay within each table's maximum;
   - every rendition is within 1 LU of its target and at or below -1.5 dBTP, and its file has the recorded size
     and hash; a sample is also downloaded through the API, whole and by range;
-  - rejected uploads failed on their first attempt with the tenant-safe message;
+  - rejected uploads failed with the tenant-safe message;
+  - every encode attempt beyond an asset's first followed a reap: the script compares the extra attempts in the
+    database with the reapers' logged requeues;
   - every delivered event reached the receiver signed and was answered with a 2xx, and only events answered
     with a 410 failed;
   - every webhook's asset equals the API's final asset.
