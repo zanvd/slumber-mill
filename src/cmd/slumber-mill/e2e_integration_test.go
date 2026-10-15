@@ -250,10 +250,34 @@ func (e *e2e) asset(t *testing.T, id string) apiv1.Asset {
 	return decode[apiv1.Asset](t, body)
 }
 
+func (e *e2e) waitStatus(t *testing.T, id, status string) {
+	t.Helper()
+	deadline := time.NewTimer(waitTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		a := e.asset(t, id)
+		if a.Status == status {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatalf("asset %s is %s after %v, want %s", id, a.Status, waitTimeout, status)
+		}
+	}
+}
+
 // nextHook waits for the next webhook, checks its headers and signature, and returns its event.
 func (e *e2e) nextHook(t *testing.T) apiv1.Event {
 	t.Helper()
-	h := waitFor(t, e.hooks, "a webhook")
+	return e.nextHookWithin(t, waitTimeout)
+}
+
+func (e *e2e) nextHookWithin(t *testing.T, timeout time.Duration) apiv1.Event {
+	t.Helper()
+	h := waitForWithin(t, e.hooks, timeout, "a webhook")
 	if got := h.header.Get("Content-Type"); got != "application/json" {
 		t.Errorf("webhook Content-Type = %q, want application/json", got)
 	}
@@ -422,6 +446,62 @@ func TestEndToEndRejected(t *testing.T) {
 		t.Errorf("tenant has %d assets failed on the first attempt, want 1", n)
 	}
 	e.checkSingleDelivery(t)
+}
+
+// TestEndToEndShortBeforeLong runs two encodes side by side: a short asset uploaded while a long one is encoding
+// becomes ready, and its signed asset.ready arrives, while the long one is still processing.
+// Then the long one becomes ready and its own signed asset.ready arrives.
+func TestEndToEndShortBeforeLong(t *testing.T) {
+	const longSource = 2 * time.Minute
+	e := startE2E(t, e2eConfig{encodeConcurrency: 2})
+	long := e.upload(t, "Ocean, all night", testutil.PinkClip(t, longSource))
+	e.waitStatus(t, long.ID, "processing")
+	longStarted := time.Now()
+	short := e.upload(t, "Chime", testutil.MonoPink(t))
+
+	ev := e.nextHook(t)
+	if ev.Type != "asset.ready" || ev.Data.ID != short.ID {
+		t.Fatalf("first webhook is %s for asset %s, want asset.ready for the short asset %s",
+			ev.Type, ev.Data.ID, short.ID)
+	}
+	if got := e.asset(t, long.ID); got.Status != "processing" {
+		t.Fatalf("long asset is %s when the short asset's webhook arrived, want processing", got.Status)
+	}
+	t.Logf("short asset's webhook arrived %v after the long encode started", time.Since(longStarted).Round(time.Millisecond))
+	gotShort := e.asset(t, short.ID)
+	checkInSpec(t, gotShort, 1)
+	if !reflect.DeepEqual(ev.Data, gotShort) {
+		t.Errorf("the webhook's asset differs from the API's:\nwebhook: %+v\nAPI:     %+v", ev.Data, gotShort)
+	}
+
+	ev = e.nextHookWithin(t, 2*time.Minute)
+	if ev.Type != "asset.ready" || ev.Data.ID != long.ID {
+		t.Fatalf("second webhook is %s for asset %s, want asset.ready for the long asset %s",
+			ev.Type, ev.Data.ID, long.ID)
+	}
+	t.Logf("long asset's webhook arrived %v after its encode started", time.Since(longStarted).Round(time.Millisecond))
+	gotLong := e.asset(t, long.ID)
+	checkInSpec(t, gotLong, 1)
+	if !reflect.DeepEqual(ev.Data, gotLong) {
+		t.Errorf("the webhook's asset differs from the API's:\nwebhook: %+v\nAPI:     %+v", ev.Data, gotLong)
+	}
+
+	e.stop(t)
+	e.noMoreHooks(t)
+	if n := e.count(t, "SELECT COUNT(*) FROM assets WHERE tenant_id = ? AND status = 'ready' AND attempts = 1",
+		e.tenantID); n != 2 {
+		t.Errorf("tenant has %d assets ready on the first attempt, want 2", n)
+	}
+	if n := e.count(t, "SELECT COUNT(*) FROM asset_events WHERE tenant_id = ?", e.tenantID); n != 2 {
+		t.Errorf("tenant has %d asset events, want 2", n)
+	}
+	if n := e.count(t, "SELECT COUNT(*) FROM webhook_deliveries WHERE tenant_id = ? AND state = 'delivered' "+
+		"AND attempts = 1", e.tenantID); n != 2 {
+		t.Errorf("tenant has %d deliveries delivered on the first attempt, want 2", n)
+	}
+	if n := e.count(t, "SELECT COUNT(*) FROM webhook_deliveries WHERE tenant_id = ?", e.tenantID); n != 2 {
+		t.Errorf("tenant has %d deliveries, want 2", n)
+	}
 }
 
 // checkSingleDelivery checks, once the stack has stopped, that the tenant has one event and one delivery,
