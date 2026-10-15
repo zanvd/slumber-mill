@@ -17,11 +17,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/zanvd/slumber-mill/src/apiv1"
+	"github.com/zanvd/slumber-mill/src/audio"
 	"github.com/zanvd/slumber-mill/src/testutil"
 	"github.com/zanvd/slumber-mill/src/webhook"
 )
@@ -88,7 +90,11 @@ func startE2E(t *testing.T, cfg e2eConfig) *e2e {
 		if err != nil {
 			t.Errorf("error reading a webhook: %v", err)
 		}
-		e.hooks <- receivedHook{at: time.Now(), header: r.Header.Clone(), body: body}
+		select {
+		case e.hooks <- receivedHook{at: time.Now(), header: r.Header.Clone(), body: body}:
+		default:
+			t.Errorf("webhook receiver is full; dropped %s", body)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(receiver.Close)
@@ -378,15 +384,50 @@ func TestEndToEndReady(t *testing.T) {
 	}
 	got := e.asset(t, uploaded.ID)
 	checkInSpec(t, got, 2)
-	if len(ev.Data.Renditions) != len(got.Renditions) || ev.Data.Status != got.Status {
-		t.Errorf("the webhook's asset is %s with %d renditions, want it to match the API's: %s with %d",
-			ev.Data.Status, len(ev.Data.Renditions), got.Status, len(got.Renditions))
+	if !reflect.DeepEqual(ev.Data, got) {
+		t.Errorf("the webhook's asset differs from the API's:\nwebhook: %+v\nAPI:     %+v", ev.Data, got)
 	}
 	for _, r := range got.Renditions {
 		e.checkDownload(t, got.ID, r)
 	}
 
 	e.stop(t)
+	e.checkSingleDelivery(t)
+}
+
+// TestEndToEndRejected uploads a text file named like a WAV file: the asset fails on its first attempt with the
+// tenant-safe message and nothing else, and exactly one signed asset.failed arrives.
+func TestEndToEndRejected(t *testing.T) {
+	e := startE2E(t, e2eConfig{})
+	uploaded := e.upload(t, "Not audio", testutil.NotAudio(t))
+
+	ev := e.nextHook(t)
+	if ev.Type != "asset.failed" || ev.Data.ID != uploaded.ID {
+		t.Fatalf("got a %s webhook for asset %s, want asset.failed for %s", ev.Type, ev.Data.ID, uploaded.ID)
+	}
+	got := e.asset(t, uploaded.ID)
+	if got.Status != "failed" || got.Error == nil || *got.Error != audio.MessageNotAudio {
+		t.Errorf("asset is %s with error %v, want failed with %q", got.Status, got.Error, audio.MessageNotAudio)
+	}
+	if len(got.Renditions) != 0 {
+		t.Errorf("failed asset has %d renditions, want none", len(got.Renditions))
+	}
+	if !reflect.DeepEqual(ev.Data, got) {
+		t.Errorf("the webhook's asset differs from the API's:\nwebhook: %+v\nAPI:     %+v", ev.Data, got)
+	}
+
+	e.stop(t)
+	if n := e.count(t, "SELECT COUNT(*) FROM assets WHERE tenant_id = ? AND status = 'failed' AND attempts = 1",
+		e.tenantID); n != 1 {
+		t.Errorf("tenant has %d assets failed on the first attempt, want 1", n)
+	}
+	e.checkSingleDelivery(t)
+}
+
+// checkSingleDelivery checks, once the stack has stopped, that the tenant has one event and one delivery,
+// delivered on the first attempt, and that nothing else reached the receiver.
+func (e *e2e) checkSingleDelivery(t *testing.T) {
+	t.Helper()
 	e.noMoreHooks(t)
 	if n := e.count(t, "SELECT COUNT(*) FROM asset_events WHERE tenant_id = ?", e.tenantID); n != 1 {
 		t.Errorf("tenant has %d asset events, want 1", n)
