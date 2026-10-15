@@ -61,7 +61,6 @@ type receivedHook struct {
 	body   []byte
 }
 
-// e2eConfig holds what a scenario may change about the stack.
 type e2eConfig struct {
 	encodeConcurrency int
 }
@@ -279,7 +278,6 @@ func (e *e2e) noMoreHooks(t *testing.T) {
 	}
 }
 
-// count runs a COUNT(*) query.
 func (e *e2e) count(t *testing.T, query string, args ...any) int {
 	t.Helper()
 	var n int
