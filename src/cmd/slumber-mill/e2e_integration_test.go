@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -88,7 +89,11 @@ func startE2E(t *testing.T, cfg e2eConfig) *e2e {
 		if err != nil {
 			t.Errorf("error reading a webhook: %v", err)
 		}
-		e.hooks <- receivedHook{at: time.Now(), header: r.Header.Clone(), body: body}
+		select {
+		case e.hooks <- receivedHook{at: time.Now(), header: r.Header.Clone(), body: body}:
+		default:
+			t.Errorf("webhook receiver is full; dropped %s", body)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(receiver.Close)
@@ -378,9 +383,8 @@ func TestEndToEndReady(t *testing.T) {
 	}
 	got := e.asset(t, uploaded.ID)
 	checkInSpec(t, got, 2)
-	if len(ev.Data.Renditions) != len(got.Renditions) || ev.Data.Status != got.Status {
-		t.Errorf("the webhook's asset is %s with %d renditions, want it to match the API's: %s with %d",
-			ev.Data.Status, len(ev.Data.Renditions), got.Status, len(got.Renditions))
+	if !reflect.DeepEqual(ev.Data, got) {
+		t.Errorf("the webhook's asset differs from the API's:\nwebhook: %+v\nAPI:     %+v", ev.Data, got)
 	}
 	for _, r := range got.Renditions {
 		e.checkDownload(t, got.ID, r)
