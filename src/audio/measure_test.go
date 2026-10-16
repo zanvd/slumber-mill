@@ -55,6 +55,7 @@ var (
 	measureRetryTPMargin   = flag.Float64("retry-tp-margin", 0.3, "pipe: dB below the ceiling a corrective gain aims the true peak at, at most")
 	measureRetryLUFSMargin = flag.Float64("retry-lufs-margin", 0.3, "pipe: LU inside the tolerance the expected loudness must land")
 	measureRetryMaxGain    = flag.Float64("retry-max-gain", 2, "pipe: the largest corrective gain in dB, either way")
+	measureOffset          = flag.String("offset", "pass1", "pass 2's loudnorm offset: pass1, the target_offset pass 1 reported, or zero")
 	measureJobs            = flag.Int("jobs", 4, "verifications run at once")
 	measureKeep            = flag.Bool("keep", false, "keep the encoded renditions under <out>/renditions/<run>")
 )
@@ -129,6 +130,7 @@ func (p measurePass1) loudness() Loudness {
 
 type measurePass2 struct {
 	Command       []string          `json:"command"`
+	OffsetLU      float64           `json:"offset_lu"`
 	Report        map[string]string `json:"report"`
 	Normalization Normalization     `json:"normalization"`
 	Seconds       float64           `json:"seconds"`
@@ -260,6 +262,9 @@ func TestMeasure(t *testing.T) {
 	case "off", "fail", "all", "force":
 	default:
 		t.Fatalf("-retry is %q, want off, fail, all or force", *measureRetry)
+	}
+	if *measureOffset != "pass1" && *measureOffset != "zero" {
+		t.Fatalf("-offset is %q, want pass1 or zero", *measureOffset)
 	}
 	name := *measureName
 	if name == "" {
@@ -570,7 +575,10 @@ func measureRender(ctx context.Context, src string, targetLUFS float64, layouts 
 	measured := make([]Loudness, len(layouts))
 	offsets := make([]float64, len(layouts))
 	for i := range layouts {
-		measured[i], offsets[i] = p1[i].loudness(), p1[i].TargetOffsetLU
+		measured[i] = p1[i].loudness()
+		if *measureOffset == "pass1" {
+			offsets[i] = p1[i].TargetOffsetLU
+		}
 	}
 	args := measureRenderArgs(src, targetLUFS, layouts, measured, offsets, outs)
 	log, secs, err := measureRun(ctx, args, "")
@@ -588,7 +596,8 @@ func measureRender(ctx context.Context, src string, targetLUFS float64, layouts 
 			return nil, fmt.Errorf("pass 2 report from %s: %w", loudnormInstance(l), err)
 		}
 		out[i] = measurePass2{
-			Command: measureCommand(args), Report: report, Normalization: Normalization(report["normalization_type"]), Seconds: secs,
+			Command: measureCommand(args), OffsetLU: offsets[i], Report: report,
+			Normalization: Normalization(report["normalization_type"]), Seconds: secs,
 		}
 	}
 	return out, nil
@@ -740,13 +749,15 @@ func measureResults(t *testing.T, path string) (emit func(*testing.T, measureRow
 		if r.Retry != nil && r.Attempt == 1 {
 			verdict += fmt.Sprintf(" [%s %+.2f dB]", r.Retry.Decision, r.Retry.DeltaDB)
 		}
-		// p1 is pass 1's I/TP/LRA, offset and predicted mode, room the margin left for linear gain
-		// (positive is linear), and pre pass 2's loudnorm output I/TP before the encoder.
+		// p1 is pass 1's I/TP/LRA, its target offset and the one pass 2 applied, and the predicted mode;
+		// room is the margin left for linear gain (positive is linear), and pre pass 2's loudnorm output
+		// I/TP before the encoder.
 		room := r.PreEncodeTPDBTP - (r.Pass1.TruePeakDBTP + r.TargetLUFS - r.Pass1.LUFS)
-		s := fmt.Sprintf("%-14s %6s %-8s %-24s gain %+5.2f a%d p1 %6.2f/%6.2f/%5.2f off %+5.2f %-7s room %+6.2f "+
-			"pre %6s/%6s | %7.2f LUFS %6.2f dBTP LRA %5.2f %-7s %6.0f kB p2 %4.0f s v %3.0f s %s",
+		s := fmt.Sprintf("%-14s %6s %-8s %-24s gain %+5.2f a%d p1 %6.2f/%6.2f/%5.2f off %+5.2f/%+5.2f %-7s "+
+			"room %+6.2f pre %6s/%6s | %7.2f LUFS %6.2f dBTP LRA %5.2f %-7s %6.0f kB p2 %4.0f s v %3.0f s %s",
 			r.Source.Spec, num(r.TargetLUFS), r.Profile, r.Variant, r.GainDB, r.Attempt,
-			r.Pass1.LUFS, r.Pass1.TruePeakDBTP, r.Pass1.LRALU, r.Pass1.TargetOffsetLU, r.Pass1.Predicted, room,
+			r.Pass1.LUFS, r.Pass1.TruePeakDBTP, r.Pass1.LRALU, r.Pass1.TargetOffsetLU, r.Pass2.OffsetLU,
+			r.Pass1.Predicted, room,
 			r.Pass2.Report["output_i"], r.Pass2.Report["output_tp"],
 			r.Verify.LUFS, r.Verify.TruePeakDBTP, r.Verify.LRALU, r.Pass2.Normalization,
 			float64(r.Verify.Bytes)/1000, r.Pass2.Seconds, r.Verify.Seconds, verdict)
