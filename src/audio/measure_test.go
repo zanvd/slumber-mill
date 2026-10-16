@@ -42,7 +42,7 @@ var (
 	measureName       = flag.String("name", "", "results file <out>/results/<name>.jsonl; defaults to the experiment")
 	measureOut        = flag.String("out", "/out/audio-b", "directory for results/, the sources/ cache and kept renditions/")
 	measureSources    = flag.String("sources", "white-unc,pink-unc,pink-dm,white-dm,narration",
-		"comma-separated <kind>[@<seed>], kind one of white-unc, pink-unc, pink-dm, white-dm, narration")
+		"comma-separated <kind>[@<seed>], kind one of white-unc, pink-unc, pink-dm, white-dm, blue-unc, blue-dm, violet-unc, violet-dm, narration")
 	measureDuration = flag.Duration("duration", 10*time.Minute, "length of each source")
 	measureTargets  = flag.String("targets", "-16", "comma-separated integrated targets in LUFS")
 	measureProfile  = flag.String("profile", "aac_64k", "variants: the profile whose layout and encoder are varied")
@@ -72,17 +72,29 @@ const measureNarration = "The evening settles slowly over the valley, and the la
 	"The path is quiet, the birds are tucked into their branches, " +
 	"and the stars are coming out one by one, small and patient, keeping watch while you rest.\n"
 
-// measureNoise mirrors testutil's fixtures: the colour, amplitude and first seed of each kind.
+// measureNoise mirrors testutil's fixtures: the colour, amplitude and first seed of each kind, and a filter
+// applied after the channels are joined.
 var measureNoise = map[string]struct {
 	color     string
 	amplitude float64
 	seed      int
 	dualMono  bool
+	filter    string
 }{
-	"white-unc": {"white", 0.25, 3, false},
-	"pink-unc":  {"pink", 0.5, 1, false},
-	"pink-dm":   {"pink", 0.5, 1, true},
-	"white-dm":  {"white", 0.25, 3, true},
+	"white-unc": {"white", 0.25, 3, false, ""},
+	"pink-unc":  {"pink", 0.5, 1, false, ""},
+	"pink-dm":   {"pink", 0.5, 1, true, ""},
+	"white-dm":  {"white", 0.25, 3, true, ""},
+	// Candidates for short fixtures whose renditions miss the target, which testutil doesn't have yet.
+	"blue-unc":   {"blue", 0.25, 3, false, ""},
+	"blue-dm":    {"blue", 0.25, 3, true, ""},
+	"violet-unc": {"violet", 0.25, 3, false, ""},
+	"violet-dm":  {"violet", 0.25, 3, true, ""},
+	"shelf1-unc": {"white", 0.25, 3, false, "highshelf=g=1:f=12000"},
+	"shelf2-unc": {"white", 0.25, 3, false, "highshelf=g=2:f=12000"},
+	"shelf3-unc": {"white", 0.25, 3, false, "highshelf=g=3:f=12000"},
+	"shelf2-dm":  {"white", 0.25, 3, true, "highshelf=g=2:f=12000"},
+	"shelf3-dm":  {"white", 0.25, 3, true, "highshelf=g=3:f=12000"},
 }
 
 type measureSource struct {
@@ -830,12 +842,19 @@ func measurePrepareSource(t *testing.T, ctx context.Context, dir, spec string, d
 		}
 		if n.dualMono {
 			src.Seeds = []int{seed}
-			src.Commands = [][]string{{"-f", "lavfi", "-i", noise(seed), "-ac", "2",
-				"-c:a", "pcm_s16le", "-f", "wav", src.Path}}
+			cmd := []string{"-f", "lavfi", "-i", noise(seed), "-ac", "2"}
+			if n.filter != "" {
+				cmd = append(cmd, "-af", n.filter)
+			}
+			src.Commands = [][]string{append(cmd, "-c:a", "pcm_s16le", "-f", "wav", src.Path)}
 		} else {
 			src.Seeds = []int{seed, seed + 1}
+			graph := "[0:a][1:a]amerge=inputs=2"
+			if n.filter != "" {
+				graph += "," + n.filter
+			}
 			src.Commands = [][]string{{"-f", "lavfi", "-i", noise(seed), "-f", "lavfi", "-i", noise(seed + 1),
-				"-filter_complex", "[0:a][1:a]amerge=inputs=2", "-c:a", "pcm_s16le", "-f", "wav", src.Path}}
+				"-filter_complex", graph, "-c:a", "pcm_s16le", "-f", "wav", src.Path}}
 		}
 	}
 	for i := range src.Commands {
