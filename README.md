@@ -197,11 +197,14 @@ back to dynamic mode and lands more than 1 LU short.
 - **The receiver** verifies every signature. Its answer depends on the event ID: most events get a 2xx, some
   arrive slowly, and others get a 500 or a 302 once, two 503s, or a hang past the client's 15 second timeout.
   4% get a 410.
-- **Failures.** Every `SLUMBER_MILL_SOAK_CHAOS_EVERY` seconds (default 45) the script injects one of these in turn:
-  a SIGKILL of an encode worker, restarted 5-20 seconds later; a `docker stop` of a webhook worker; or a
-  `docker stop` of the API. Each stopped container is started again.
+- **Failures.** Every `SLUMBER_MILL_SOAK_CHAOS_EVERY` seconds (default 45) the script injects one failure, taking
+  them in turn. It sends SIGKILL to an encode worker or a webhook worker and restarts it 5-20 seconds later; that
+  leaves leases for the other replica to reap, and a killed webhook worker that holds the relay lock loses it with
+  its session. Or it runs `docker stop` on a webhook worker or the API, then starts it again.
 - **The checks.** When the uploads stop, the driver waits up to `SLUMBER_MILL_SOAK_DRAIN_TIMEOUT` (default `15m`)
   for every asset and delivery to finish and every event to be relayed. Then it checks these invariants:
+  - the run did enough for the rest to mean something: every kind of upload, a ready asset, a failure with each
+    rejection message, a download, a retried delivery and a delivery failed on a 410;
   - every asset is one of the soak's uploads, with one asset per idempotency key;
   - every finished asset has exactly one event matching its state, and every event has exactly one delivery,
     or none for the tenant without a webhook;
@@ -211,18 +214,20 @@ back to dynamic mode and lands more than 1 LU short.
     and hash; a sample is also downloaded through the API, whole and by range;
   - rejected uploads failed with the tenant-safe message;
   - every encode attempt beyond an asset's first followed a reap: the script compares the extra attempts in the
-    database with the reapers' logged requeues;
+    database with the reapers' logged requeues, and fails a run in which nothing was requeued;
   - every delivered event reached the receiver signed and was answered with a 2xx, and only events answered
     with a 410 failed;
   - every webhook's asset equals the API's final asset.
 
   The script also checks that each stopped container exited 0, or 137 after a SIGKILL. It fails on any deadlock or
   lock wait timeout in the services' logs, and on any ERROR line other than one known case. That case is GORM's
-  `query failed` for the losing insert of two concurrent uploads with the same key, which the script counts.
+  `query failed` for the losing insert of two racing uploads with the same key. Such lines may number no more than
+  the driver's concurrent pairs plus its retries after a connection error.
 
 A run takes the duration plus 3-5 minutes to build, start and drain. It uses about 4 of the host's CPUs for
-the two encode workers. The project is `<name>-soak`, where `<name>` is `COMPOSE_PROJECT_NAME` or `slumber-mill`,
-with `var/out/soak/data` as its data directory, and it publishes no port. At the end the script takes the project
+the two encode workers. The project is `<name>-soak`, where `<name>` is `COMPOSE_PROJECT_NAME` or, as Compose
+itself defaults it, the checkout's directory name in lower case. That keeps soaks run from two checkouts apart. The
+project uses `var/out/soak/data` as its data directory and publishes no port. At the end the script takes the project
 down with its volumes and images. The driver's summary is left in `var/out/soak/summary.txt`, with its log in
 `driver.log` and the services' logs in `compose.log`. Webhook delivery is at-least-once, so the summary counts the
 duplicates the receiver saw, but they don't fail the soak.

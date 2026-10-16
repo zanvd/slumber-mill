@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# The full-stack soak: the Compose stack with both pools scaled to two replicas, the real ffmpeg, and a driver that
-# uploads through the API as several tenants and receives their webhooks, while this script kills and restarts
-# workers and the API on a timer. When the uploads stop, the driver waits for everything to finish and checks the
-# invariants; then this script checks the services' logs and how the killed containers exited.
-#
-# Runs on its own Compose project, named <COMPOSE_PROJECT_NAME or slumber-mill>-soak: brings it up, and takes it down
-# with its volumes and images on exit. Needs only bash 5 and Docker. Generated files go to var/out/soak.
+# The full-stack soak; the README's "Full-stack soak" section describes what it does and checks.
 #
 #   SLUMBER_MILL_SOAK_DURATION       how long the driver uploads, a Go duration (default 10m)
 #   SLUMBER_MILL_SOAK_DRAIN_TIMEOUT  how long it then waits for everything to finish (default 15m)
@@ -17,7 +11,11 @@ set -euo pipefail
 }
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-project=${COMPOSE_PROJECT_NAME:-slumber-mill}-soak
+# Compose's own default, the checkout's directory name lower-cased and cleaned, keeps each checkout's soak apart:
+# prepare takes the project down with its volumes before it starts.
+base=${root##*/}
+base=${base,,}
+project=${COMPOSE_PROJECT_NAME:-${base//[^a-z0-9_-]/}}-soak
 work=$root/var/out/soak
 data=$work/data
 tenants=$work/tenants
@@ -27,18 +25,15 @@ chaos_every=${SLUMBER_MILL_SOAK_CHAOS_EVERY:-45}
 
 # The tenants: slug, target loudness, and whether webhooks go to the driver's receiver. Targets above -16 LUFS are
 # left out: pink noise can't reach them under the -4.5 dBTP pre-encode peak, so loudnorm falls back to dynamic
-# mode, undershoots by more than 1 LU, and the encode pool rejects the renditions, as §7 says it should.
+# mode, undershoots by more than 1 LU, and the encode pool rejects the renditions.
 slugs=(soak-a soak-b soak-c soak-d soak-quiet)
 targets=(-16 -18 -20 -23 -16)
 hooked=(yes yes yes yes no)
 
-# Error lines that the soak's own traffic explains, as extended regular expressions matched against a whole log line.
-# Anything else at ERROR level fails the soak.
-expected_errors=(
-  # The losing insert of two concurrent uploads with one idempotency key, which then replays the winner (§9).
-  # GORM's logger reports every failed query at ERROR.
-  '^api-[0-9]+ +\| .*"level":"ERROR","msg":"query failed","method":"POST","route":"/v1/assets",.*"error":"duplicated key not allowed","sql":"INSERT INTO `assets` '
-)
+# The one ERROR line the soak's own traffic explains: the losing insert of two racing uploads with one idempotency
+# key, which then replays the winner. GORM's logger reports every failed query at ERROR. Its count may not exceed
+# the races the driver could have caused, which it writes to duplicate-insert-bound. Any other ERROR fails the soak.
+expected_error='^api-[0-9]+ +\| .*"level":"ERROR","msg":"query failed","method":"POST","route":"/v1/assets",.*"error":"duplicated key not allowed","sql":"INSERT INTO `assets` '
 
 failures=0
 results=()
@@ -134,7 +129,8 @@ prepare() {
   log "starting from a clean project $project"
   compose --profile soak down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "${data:?}" "${tenants:?}"
-  rm -f "$work/summary.txt" "$work/compose.log" "$work/driver.log" "$work/tenant-create.log"
+  rm -f "$work/summary.txt" "$work/compose.log" "$work/driver.log" "$work/tenant-create.log" \
+    "$work/duplicate-insert-bound"
   mkdir -p "$data" "$tenants"
 
   log "building and starting the stack: api, two encode and two webhook workers"
@@ -160,11 +156,12 @@ prepare() {
   wait_for "the driver to start uploading" 600 logged soak "soak: uploading"
 }
 
-# kill_encode N sends SIGKILL to the Nth encode worker, which loses whatever it was encoding until the reaper of
-# the other one requeues it, and starts it again a few seconds later.
-kill_encode() {
+# crash SERVICE N sends SIGKILL to the Nth container of SERVICE and starts it again a few seconds later. Its work in
+# flight stays leased until the other replica's reaper requeues it, and a webhook worker holding the relay lock loses
+# it with its session.
+crash() {
   local cid st
-  cid=$(containers worker-encode | sed -n "${1}p")
+  cid=$(containers "$1" | sed -n "${2}p")
   log "chaos: SIGKILL $(name "$cid")"
   docker kill -s KILL "$cid" >/dev/null
   wait_for "$(name "$cid") to die" 30 dead "$cid" || true
@@ -206,7 +203,8 @@ check_exit() {
 # chaos injects a failure every chaos_every seconds until the driver's uploads have run for their duration.
 chaos() {
   local until=$(($1 + $(seconds "$SLUMBER_MILL_SOAK_DURATION"))) actions i=0
-  actions=("kill_encode 1" "stop worker-webhook 1" "kill_encode 2" "stop api 1" "stop worker-webhook 2")
+  actions=("crash worker-encode 1" "crash worker-webhook 1" "stop api 1" "crash worker-encode 2"
+    "stop worker-webhook 2" "crash worker-webhook 2" "stop worker-webhook 1")
   RANDOM=1
   while ((EPOCHSECONDS + chaos_every < until)); do
     sleep "$chaos_every"
@@ -235,7 +233,7 @@ not_running() {
 # check_logs fails the soak on deadlocks, lock wait timeouts and unexplained ERROR lines in the services' logs,
 # and counts what the pools logged.
 check_logs() {
-  local file=$work/services.log line svc json msg re pattern explained n
+  local file=$work/services.log line svc json msg re n bound
   compose logs --no-color api worker-encode worker-webhook migrate >"$file" 2>&1
   declare -A errors=() outcomes=() reaped=()
   local deadlocks=0 lockwaits=0 relay_locks=0 swept=0 expected=0
@@ -261,11 +259,7 @@ check_logs() {
       "swept temp files") [[ $json =~ \"removed\":([0-9]+) ]] && swept=$((swept + BASH_REMATCH[1])) ;;
     esac
     if [[ $json == *'"level":"ERROR"'* ]]; then
-      explained=
-      for pattern in "${expected_errors[@]}"; do
-        [[ $line =~ $pattern ]] && explained=yes
-      done
-      if [[ -n $explained ]]; then
+      if [[ $line =~ $expected_error ]]; then
         expected=$((expected + 1))
       else
         errors["${svc%-[0-9]*}: $msg"]=$((${errors["${svc%-[0-9]*}: $msg"]:-0} + 1))
@@ -279,16 +273,25 @@ check_logs() {
   for n in "${!reaped[@]}"; do echo "  $n: ${reaped[$n]}"; done | sort
   echo "  relay lock taken: $relay_locks times; temp files swept at startup: $swept"
   echo "  deadlocks: $deadlocks; lock wait timeouts: $lockwaits"
-  echo "  ERROR lines from the losing insert of concurrent idempotent uploads: $expected"
+  bound=$(cat "$work/duplicate-insert-bound" 2>/dev/null) || bound=
+  echo "  ERROR lines from the losing insert of racing idempotent uploads: $expected, of at most ${bound:-unknown}"
   for n in "${!errors[@]}"; do echo "  unexplained ERROR lines, $n: ${errors[$n]}"; done | sort
 
   # The soak never stops an encode worker gracefully and no encode fails but by rejection, so an attempt beyond an
-  # asset's first can only be a reaper's requeue after a SIGKILL. A third reap fails the asset instead.
+  # asset's first can only be a reaper's requeue after a SIGKILL. A third reap fails the asset instead. Every run
+  # that injects a failure SIGKILLs an encode worker first, so a run without a requeue proves nothing.
   local requeued=${reaped["reaped assets whose lease expired, requeued"]:-0}
-  if [[ $extra_attempts == "$requeued" ]]; then
-    record PASS "every encode attempt beyond an asset's first followed a reap ($extra_attempts in the database, $requeued requeued)"
+  local what="every encode attempt beyond an asset's first followed a reap ($extra_attempts in the database, $requeued requeued)"
+  if ((requeued > 0)) && [[ $extra_attempts == "$requeued" ]]; then
+    record PASS "$what"
   else
-    record FAIL "every encode attempt beyond an asset's first followed a reap ($extra_attempts in the database, $requeued requeued)"
+    record FAIL "$what"
+  fi
+  what="the duplicate-key ERROR lines number no more than the uploads that could race ($expected, at most ${bound:-unknown})"
+  if [[ $bound =~ ^[0-9]+$ ]] && ((expected <= bound)); then
+    record PASS "$what"
+  else
+    record FAIL "$what"
   fi
   if ((deadlocks == 0 && lockwaits == 0)); then
     record PASS "no deadlocks or lock wait timeouts in any service's logs"
