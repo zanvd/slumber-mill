@@ -9,6 +9,8 @@
 //	variants: one profile's layout, measured once and rendered once, with one encoded output per variant.
 //	pipe:     every profile as production renders it, with optional encoder overrides per profile
 //	          and an optional single corrective re-encode of a rendition with volume=<delta>dB.
+//	resample: every profile, once per -chains entry, with that chain in place of aresample=48000 after pass 2's
+//	          loudnorm, and a measuring loudnorm tapped off each layout's encoder input for its pre-encode level.
 //
 // Each rendition is one JSON line in <out>/results/<name>.jsonl. In the dev service:
 //
@@ -58,6 +60,8 @@ var (
 	measureOffset          = flag.String("offset", "pass1", "pass 2's loudnorm offset: pass1, the target_offset pass 1 reported, or zero")
 	measureJobs            = flag.Int("jobs", 4, "verifications run at once")
 	measureKeep            = flag.Bool("keep", false, "keep the encoded renditions under <out>/renditions/<run>")
+	measureChains          = flag.String("chains", "base=aresample=48000/soxr=aresample=48000:resampler=soxr:precision=28/none=",
+		"resample: slash-separated <name>=<filters> run after pass 2's loudnorm; empty filters measure without encoding")
 )
 
 const measureNarration = "The evening settles slowly over the valley, and the last light fades from the tops of the pines. " +
@@ -183,6 +187,16 @@ type measureRow struct {
 	Pass2           measurePass2      `json:"pass2"`
 	Verify          measureVerify     `json:"verify"`
 	Retry           *measureRetryPlan `json:"retry,omitempty"`
+	Chain           string            `json:"chain,omitempty"`
+	Pre             *measureLevel     `json:"pre,omitempty"`
+}
+
+// measureLevel is what the measuring loudnorm tapped off an encoder's input read.
+type measureLevel struct {
+	Filters      string  `json:"filters"`
+	LUFS         float64 `json:"lufs"`
+	TruePeakDBTP float64 `json:"true_peak_dbtp"`
+	LRALU        float64 `json:"lra_lu"`
 }
 
 // measureRenderArgs is renderArgs with a volume filter after aresample for outputs with a gain,
@@ -255,8 +269,8 @@ func TestMeasureMirrorsRenderArgs(t *testing.T) {
 
 func TestMeasure(t *testing.T) {
 	experiment := *measureExperiment
-	if experiment != "variants" && experiment != "pipe" {
-		t.Fatalf("-experiment is %q, want variants or pipe", experiment)
+	if experiment != "variants" && experiment != "pipe" && experiment != "resample" {
+		t.Fatalf("-experiment is %q, want variants, pipe or resample", experiment)
 	}
 	switch *measureRetry {
 	case "off", "fail", "all", "force":
@@ -305,10 +319,13 @@ func TestMeasure(t *testing.T) {
 					}
 					row := base
 					row.Source, row.TargetLUFS = src, target
-					if experiment == "variants" {
+					switch experiment {
+					case "variants":
 						measureVariantsRun(t, ctx, row, dir, emit)
-					} else {
+					case "pipe":
 						measurePipeRun(t, ctx, row, dir, emit)
+					default:
+						measureResampleRun(t, ctx, row, dir, emit)
 					}
 				})
 			}
@@ -444,6 +461,134 @@ func measurePipeRun(t *testing.T, ctx context.Context, row measureRow, dir strin
 		r2.Retry = &plan
 		emit(t, r2)
 	}
+}
+
+type measureChain struct{ name, filters string }
+
+func measureResampleRun(t *testing.T, ctx context.Context, row measureRow, dir string, emit func(*testing.T, measureRow)) {
+	var chains []measureChain
+	for _, s := range strings.Split(*measureChains, "/") {
+		name, filters, ok := strings.Cut(s, "=")
+		if !ok || name == "" {
+			t.Fatalf("-chains: %q is not <name>=<filters>", s)
+		}
+		chains = append(chains, measureChain{name, filters})
+	}
+	profiles := Profiles()
+	plain := make([]Output, len(profiles))
+	for i, p := range profiles {
+		plain[i] = Output{Profile: p}
+	}
+	layouts := planLayouts(row.Source.Channels, plain)
+	layoutOf := make([]int, len(profiles))
+	for li, l := range layouts {
+		for _, o := range l.outputs {
+			layoutOf[o] = li
+		}
+	}
+	native := slices.IndexFunc(layouts, func(l layout) bool { return l.channels == row.Source.Channels })
+	p1, err := measurePass(ctx, row.Source.Path, row.TargetLUFS, layouts, native < 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offsets := make([]float64, len(layouts))
+	for i := range layouts {
+		if *measureOffset == "pass1" {
+			offsets[i] = p1[i].TargetOffsetLU
+		}
+	}
+	for _, c := range chains {
+		var outs []measureOutput
+		if c.filters != "" {
+			for _, p := range profiles {
+				outs = append(outs, measureOutput{Output: Output{Profile: p, Path: filepath.Join(dir, c.name+"-"+p.Name+".m4a")}})
+			}
+		}
+		args := measureResampleArgs(row.Source.Path, row.TargetLUFS, layouts, p1, offsets, c.filters, outs)
+		log, secs, err := measureRun(ctx, args, "")
+		if err != nil {
+			t.Fatalf("pass 2 with %s: %v", c.name, err)
+		}
+		p2, err := measurePass2Reports(log, layouts, args, offsets, secs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pre := make([]measureLevel, len(layouts))
+		for i, l := range layouts {
+			m, _, err := log.loudnorm(measurePreInstance(l))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pre[i] = measureLevel{Filters: c.filters, LUFS: m.LUFS, TruePeakDBTP: m.TruePeakDBTP, LRALU: m.LRALU}
+		}
+		if outs == nil {
+			for li, l := range layouts {
+				r := row
+				o := measureOutput{Output: plain[l.outputs[0]]}
+				measureFill(&r, l, o, c.name, 1, p1[li], p2[li], measureVerify{})
+				r.Chain, r.Pre = c.name, &pre[li]
+				emit(t, r)
+			}
+			continue
+		}
+		verified, err := measureVerifyAll(ctx, outs, row.TargetLUFS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range outs {
+			li := layoutOf[i]
+			r := row
+			measureFill(&r, layouts[li], outs[i], c.name, 1, p1[li], p2[li], verified[i])
+			r.Chain, r.Pre = c.name, &pre[li]
+			emit(t, r)
+		}
+	}
+}
+
+func measurePreInstance(l layout) string { return "loudnorm@pre" + l.name }
+
+// measureResampleArgs is renderArgs with filters in place of aresample=48000, and each layout's encoder input
+// also split off to a measuring loudnorm. Without outputs it only measures.
+func measureResampleArgs(src string, targetLUFS float64, layouts []layout, p1 []measurePass1, offsets []float64,
+	filters string, outs []measureOutput,
+) []string {
+	var graph strings.Builder
+	fmt.Fprintf(&graph, "[0:a:0]asplit=%d", len(layouts))
+	for i := range layouts {
+		fmt.Fprintf(&graph, "[s%d]", i)
+	}
+	for i, l := range layouts {
+		m := p1[i].loudness()
+		fmt.Fprintf(&graph, ";[s%d]aformat=channel_layouts=%s,%s=%s:measured_I=%s:measured_TP=%s:measured_LRA=%s"+
+			":measured_thresh=%s:offset=%s:linear=true:print_format=json",
+			i, l.name, loudnormInstance(l), loudnormTargets(targetLUFS),
+			num(m.LUFS), num(m.TruePeakDBTP), num(measuredLRA(m)), num(m.ThresholdLUFS), num(offsets[i]))
+		if filters != "" {
+			graph.WriteString("," + filters)
+		}
+		if outs != nil {
+			fmt.Fprintf(&graph, ",asplit=%d", len(l.outputs)+1)
+			for _, o := range l.outputs {
+				fmt.Fprintf(&graph, "[o%d]", o)
+			}
+		}
+		fmt.Fprintf(&graph, "[t%d];[t%d]%s=%s:print_format=json[tm%d]",
+			i, i, measurePreInstance(l), loudnormTargets(targetLUFS), i)
+	}
+	args := append([]string{"-y"}, ffmpegArgs(src)...)
+	args = append(args, "-filter_complex", graph.String())
+	for i, o := range outs {
+		args = append(args, "-map", fmt.Sprintf("[o%d]", i), "-map_metadata", "-1",
+			"-c:a", "aac", "-b:a", fmt.Sprintf("%dk", o.Profile.BitrateKbps))
+		if o.Profile.CutoffHz > 0 {
+			args = append(args, "-cutoff", strconv.Itoa(o.Profile.CutoffHz))
+		}
+		args = append(args, "-movflags", "+faststart", "-f", "mp4", o.Path)
+	}
+	for i := range layouts {
+		args = append(args, "-map", fmt.Sprintf("[tm%d]", i), "-f", "null", "-")
+	}
+	return args
 }
 
 // measurePlanRetry aims a corrective gain at the target, lowered where it would put the true peak
@@ -585,6 +730,11 @@ func measureRender(ctx context.Context, src string, targetLUFS float64, layouts 
 	if err != nil {
 		return nil, fmt.Errorf("pass 2: %w", err)
 	}
+	return measurePass2Reports(log, layouts, args, offsets, secs)
+}
+
+func measurePass2Reports(log *ffmpegLog, layouts []layout, args []string, offsets []float64, secs float64,
+) ([]measurePass2, error) {
 	out := make([]measurePass2, len(layouts))
 	for i, l := range layouts {
 		block, ok := log.reports[loudnormInstance(l)]
@@ -746,6 +896,13 @@ func measureResults(t *testing.T, path string) (emit func(*testing.T, measureRow
 		if !r.Verify.InSpec {
 			verdict = "OUT OF SPEC"
 		}
+		preI, preTP := r.Pass2.Report["output_i"], r.Pass2.Report["output_tp"]
+		if r.Pre != nil {
+			preI, preTP = fmt.Sprintf("%.2f", r.Pre.LUFS), fmt.Sprintf("%.2f", r.Pre.TruePeakDBTP)
+			if r.Verify.Command == nil {
+				verdict = "tap only"
+			}
+		}
 		if r.Retry != nil && r.Attempt == 1 {
 			verdict += fmt.Sprintf(" [%s %+.2f dB]", r.Retry.Decision, r.Retry.DeltaDB)
 		}
@@ -758,7 +915,7 @@ func measureResults(t *testing.T, path string) (emit func(*testing.T, measureRow
 			r.Source.Spec, num(r.TargetLUFS), r.Profile, r.Variant, r.GainDB, r.Attempt,
 			r.Pass1.LUFS, r.Pass1.TruePeakDBTP, r.Pass1.LRALU, r.Pass1.TargetOffsetLU, r.Pass2.OffsetLU,
 			r.Pass1.Predicted, room,
-			r.Pass2.Report["output_i"], r.Pass2.Report["output_tp"],
+			preI, preTP,
 			r.Verify.LUFS, r.Verify.TruePeakDBTP, r.Verify.LRALU, r.Pass2.Normalization,
 			float64(r.Verify.Bytes)/1000, r.Pass2.Seconds, r.Verify.Seconds, verdict)
 		mu.Lock()
