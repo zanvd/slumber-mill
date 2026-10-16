@@ -1,10 +1,6 @@
 //go:build soak
 
-// The full-stack soak drives the Compose stack that scripts/soak.sh starts: the API and both pools, each pool with
-// two replicas, the real ffmpeg, and workers killed and restarted by the script while it runs. As several tenants
-// it uploads through the API for a while, receives their webhooks, and once everything has finished checks the
-// invariants over the database, the data directory, the API and what its receiver saw.
-// It runs only inside that stack, as the soak service; see scripts/soak.sh.
+// The full-stack soak's driver. It runs only as the soak service of scripts/soak.sh, which the README describes.
 package main
 
 import (
@@ -72,6 +68,7 @@ const (
 	soakHang = 20 * time.Second
 	// Every soakDownloadEvery-th ready asset is also downloaded through the API, whole and by range.
 	soakDownloadEvery = 10
+	soakErrorLogEvery = 30 * time.Second
 )
 
 // The invariants checked at the end. Problems found earlier, while uploading or receiving, are kept under the
@@ -95,12 +92,15 @@ const (
 	invReceived   = "every delivered event reached the receiver and was answered 2xx, and only 410s failed"
 	invUnknown    = "the receiver got no event without a delivery"
 	invPayload    = "every webhook's asset is the API's final asset, and its type matches the asset's status"
+	// The others hold vacuously for a run that did nothing, so this one fails unless the run did what they check.
+	invCoverage = "the run uploaded every kind of upload, made ready and rejected assets of every kind, downloaded, " +
+		"retried a delivery, and failed one on a 410"
 )
 
 var soakInvariants = []string{
-	invAccepted, invIdempotent, invUploaded, invFinished, invOneEvent, invRenditions, invDelivery, invDelivered,
-	invLeased, invAttempts, invAudio, invRejected, invInSpec, invDownload, invSigned, invReceived, invUnknown,
-	invPayload,
+	invCoverage, invAccepted, invIdempotent, invUploaded, invFinished, invOneEvent, invRenditions, invDelivery,
+	invDelivered, invLeased, invAttempts, invAudio, invRejected, invInSpec, invDownload, invSigned, invReceived,
+	invUnknown, invPayload,
 }
 
 type soakConfig struct {
@@ -238,6 +238,10 @@ type soakDriver struct {
 	samples  map[string]string // an example error for each kind of retried failure
 	problems map[string][]string
 	result   *soakResult
+	logf     func(format string, args ...any)
+
+	backlogErrors int
+	backlogLogged time.Time
 }
 
 func (d *soakDriver) problem(inv, format string, args ...any) {
@@ -259,6 +263,7 @@ func TestFullStackSoak(t *testing.T) {
 		statuses: map[string]int{},
 		samples:  map[string]string{},
 		problems: map[string][]string{},
+		logf:     t.Logf,
 	}
 
 	ln, err := net.Listen("tcp", cfg.listen)
@@ -404,17 +409,34 @@ func (d *soakDriver) uploader(ctx context.Context, tn *soakTenant, rng *rand.Ran
 }
 
 // waitBacklog waits until fewer than soakMaxBacklog assets are unfinished, and reports false once ctx is done.
+// A failing count keeps the uploader waiting; the errors are counted and logged at most every soakErrorLogEvery.
 func (d *soakDriver) waitBacklog(ctx context.Context) bool {
 	for ctx.Err() == nil {
 		var n int
 		err := d.pool.QueryRowContext(ctx, "SELECT COUNT(*) FROM assets WHERE status IN ('queued', 'processing')").
 			Scan(&n)
-		if err == nil && n < soakMaxBacklog {
+		switch {
+		case err == nil && n < soakMaxBacklog:
 			return true
+		case err != nil && ctx.Err() == nil:
+			d.backlogError(err)
 		}
 		soakPause(ctx, time.Second)
 	}
 	return false
+}
+
+func (d *soakDriver) backlogError(err error) {
+	d.mu.Lock()
+	d.backlogErrors++
+	n, log := d.backlogErrors, time.Since(d.backlogLogged) >= soakErrorLogEvery
+	if log {
+		d.backlogLogged = time.Now()
+	}
+	d.mu.Unlock()
+	if log {
+		d.logf("soak: error counting the unfinished assets (%d so far), so no upload starts: %v", n, err)
+	}
 }
 
 func (d *soakDriver) pick(rng *rand.Rand) *soakFixture {
@@ -936,6 +958,7 @@ func (d *soakDriver) check(t *testing.T) {
 	}
 	d.checkReceived(res, add)
 	d.checkPayloads(ctx, res, add)
+	d.checkCoverage(res, add)
 
 	res.invariantOK = map[string]bool{}
 	for _, inv := range soakInvariants {
@@ -1156,6 +1179,52 @@ func (d *soakDriver) loadDeliveries(t *testing.T) (map[string]*soakDelivery, map
 	return deliveries, events
 }
 
+func (d *soakDriver) checkCoverage(res *soakResult, add func(inv, format string, args ...any)) {
+	d.mu.Lock()
+	kinds := maps.Clone(d.kinds)
+	d.mu.Unlock()
+	for _, k := range []soakKind{kindSingle, kindReplay, kindConcurrent, kindReused} {
+		if kinds[string(k)] == 0 {
+			add(invCoverage, "no %s upload", k)
+		}
+	}
+	ready, failedWith := 0, map[string]int{}
+	for _, a := range res.assets {
+		switch a.status {
+		case "ready":
+			ready++
+		case "failed":
+			failedWith[a.errorMsg]++
+		}
+	}
+	if ready == 0 {
+		add(invCoverage, "no asset is ready")
+	}
+	for _, f := range d.fixtures {
+		if f.rejected != "" && failedWith[f.rejected] == 0 {
+			add(invCoverage, "no asset failed with %q", f.rejected)
+		}
+	}
+	if res.downloads == 0 {
+		add(invCoverage, "no rendition was downloaded through the API")
+	}
+	retried, gone := 0, 0
+	for id, dl := range res.deliveries {
+		if dl.attempts > 1 {
+			retried++
+		}
+		if dl.state == "failed" && soakAnswerFor(id) == answerGone {
+			gone++
+		}
+	}
+	if retried == 0 {
+		add(invCoverage, "no delivery was retried")
+	}
+	if gone == 0 {
+		add(invCoverage, "no delivery failed on a 410")
+	}
+}
+
 // checkReceived compares the deliveries with what the receiver saw and how it answered.
 func (d *soakDriver) checkReceived(res *soakResult, add func(inv, format string, args ...any)) {
 	for id, dl := range res.deliveries {
@@ -1242,7 +1311,16 @@ func (d *soakDriver) report(t *testing.T, took, drained time.Duration) {
 	d.mu.Lock()
 	uploads := maps.Clone(d.uploads)
 	logical, kinds, statuses, samples := d.logical, maps.Clone(d.kinds), maps.Clone(d.statuses), maps.Clone(d.samples)
+	backlogErrors := d.backlogErrors
 	d.mu.Unlock()
+
+	// Create looks a key up before it inserts, so only racing requests with one key reach the insert and lose it:
+	// the concurrent pairs, and a retry after a connection error racing its own first request.
+	bound := filepath.Join(d.cfg.out, "duplicate-insert-bound")
+	races := kinds[string(kindConcurrent)] + statuses["connection error"]
+	if err := os.WriteFile(bound, []byte(strconv.Itoa(races)+"\n"), 0o644); err != nil {
+		t.Errorf("error writing %s: %v", bound, err)
+	}
 	var lines []string
 	line := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 	hooked := 0
@@ -1254,7 +1332,8 @@ func (d *soakDriver) report(t *testing.T, took, drained time.Duration) {
 
 	line("soak of %v uploading, then %v to finish everything; %v in all", d.cfg.duration, drained, took)
 	line("tenants: %d, %d of them with a webhook", len(d.tenants), hooked)
-	line("uploads: %d (%s); requests answered: %s", logical, soakCounts(kinds), soakCounts(statuses))
+	line("uploads: %d (%s); requests answered: %s; failed backlog counts: %d", logical, soakCounts(kinds),
+		soakCounts(statuses), backlogErrors)
 	for status, sample := range samples {
 		line("  e.g. %s: %s", status, sample)
 	}
