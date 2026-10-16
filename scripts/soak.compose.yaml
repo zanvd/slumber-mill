@@ -1,0 +1,71 @@
+# Used by soak.sh on top of compose.yaml: both pools run two replicas, so two reapers per table, on the shortest
+# encode lease allowed, and the soak driver runs on the project's network beside them. The soak gets its own data
+# directory, which the script empties, and publishes no port, so it can run beside a local stack.
+x-soak-data: &soak-data
+  type: bind
+  source: ./var/out/soak/data
+  target: /data
+  bind:
+    create_host_path: false
+
+services:
+  api:
+    ports: !reset []
+    environment:
+      SLUMBER_MILL_ENCODE_LEASE: 1m
+    volumes:
+      - *soak-data
+
+  worker-encode:
+    scale: 2
+    environment:
+      SLUMBER_MILL_ENCODE_LEASE: 1m
+    volumes:
+      - *soak-data
+
+  worker-webhook:
+    scale: 2
+    environment:
+      SLUMBER_MILL_ENCODE_LEASE: 1m
+    volumes:
+      - *soak-data
+
+  # The driver uploads through the API, receives the webhooks at http://soak:8090/hooks/<slug>, and checks the
+  # invariants once everything has finished. It reads the database as the application's account and the data
+  # directory read-only, and gets no secret key: soak.sh creates the tenants with tenant create in the api service.
+  soak:
+    profiles: ["soak"]
+    build:
+      context: .
+      target: dev
+      args:
+        APP_UID: ${APP_UID:-1000}
+    volumes:
+      - type: bind
+        source: ./src
+        target: /src
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./var/out/soak
+        target: /out/soak
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./var/out/soak/data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - go-mod:/home/app/go/pkg/mod
+      - go-build:/home/app/.cache/go-build
+    environment:
+      SLUMBER_MILL_DSN: "slumber_mill:slumber_mill@tcp(mysql:3306)/slumber_mill"
+      SLUMBER_MILL_DATA_DIR: /data
+      SLUMBER_MILL_SOAK_DURATION: ${SLUMBER_MILL_SOAK_DURATION:-10m}
+      SLUMBER_MILL_SOAK_DRAIN_TIMEOUT: ${SLUMBER_MILL_SOAK_DRAIN_TIMEOUT:-15m}
+      SLUMBER_MILL_SOAK_API: http://api:8080
+      SLUMBER_MILL_SOAK_LISTEN: :8090
+      SLUMBER_MILL_SOAK_OUT: /out/soak
+    command: ["go", "test", "-race", "-tags", "soak", "-run", "^TestFullStackSoak$", "-count", "1", "-v",
+      "-timeout", "2h", "./cmd/slumber-mill/"]
