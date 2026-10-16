@@ -221,9 +221,9 @@ back to dynamic mode and lands more than 1 LU short.
   - every webhook's asset equals the API's final asset.
 
   The script also checks that each stopped container exited 0, or 137 after a SIGKILL. It fails on any deadlock or
-  lock wait timeout in the services' logs, and on any ERROR line other than one known case. That case is GORM's
-  `query failed` for the losing insert of two racing uploads with the same key. Such lines may number no more than
-  the driver's concurrent pairs plus its retries after a connection error.
+  lock wait timeout in the services' logs, and on any ERROR line. GORM logs the losing insert of two racing uploads
+  with the same key as a `query failed` WARN, which is normal. The script counts those lines, and they may number
+  no more than the driver's concurrent pairs plus its retries after a connection error.
 
 A run takes the duration plus 3-5 minutes to build, start and drain. It uses about 4 of the host's CPUs for
 the two encode workers. The project is `<name>-soak`, where `<name>` is `COMPOSE_PROJECT_NAME` or, as Compose

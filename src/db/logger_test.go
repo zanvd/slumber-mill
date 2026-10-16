@@ -33,6 +33,10 @@ func TestGormLoggerTrace(t *testing.T) {
 		wantMsg   string
 	}{
 		{"error", logger.Warn, fast, failure, "ERROR", "query failed"},
+		{"duplicate key", logger.Warn, fast, gorm.ErrDuplicatedKey, "WARN", "query failed"},
+		{"wrapped duplicate key", logger.Info, fast, fmt.Errorf("x: %w", gorm.ErrDuplicatedKey), "WARN", "query failed"},
+		{"duplicate key at error", logger.Error, fast, gorm.ErrDuplicatedKey, "", ""},
+		{"duplicate key when silent", logger.Silent, fast, gorm.ErrDuplicatedKey, "", ""},
 		{"wrapped record not found", logger.Info, fast, fmt.Errorf("x: %w", gorm.ErrRecordNotFound), "INFO", "query"},
 		{"record not found", logger.Warn, fast, gorm.ErrRecordNotFound, "", ""},
 		{"slow", logger.Warn, slow, nil, "WARN", "slow query"},
@@ -65,8 +69,8 @@ func TestGormLoggerTrace(t *testing.T) {
 			if rec["sql"] != tracedSQL || rec["rows"] != 1.0 || rec["took"] == nil {
 				t.Errorf("record %v lacks sql, rows or took", rec)
 			}
-			if tc.wantLevel == "ERROR" && rec["error"] != failure.Error() {
-				t.Errorf("error = %v, want %q", rec["error"], failure.Error())
+			if tc.wantMsg == "query failed" && rec["error"] != tc.err.Error() {
+				t.Errorf("error = %v, want %q", rec["error"], tc.err.Error())
 			}
 		})
 	}
