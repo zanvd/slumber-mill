@@ -457,13 +457,13 @@ func measurePlanRetry(v measureVerify, targetLUFS float64) measureRetryPlan {
 	if v.TruePeakDBTP+delta > CeilingDBTP-p.TPMarginDB {
 		delta = CeilingDBTP - p.TPMarginDB - v.TruePeakDBTP
 	}
-	delta = math.Round(delta*100) / 100
+	delta = measureHundredths(delta)
 	if math.Abs(delta) > p.MaxGainDB {
 		delta = math.Copysign(p.MaxGainDB, delta)
 		p.Decision = "skip: gain beyond the bound"
 	}
 	p.DeltaDB = delta
-	p.ExpectedLUFS, p.ExpectedTPDBTP = v.LUFS+delta, v.TruePeakDBTP+delta
+	p.ExpectedLUFS, p.ExpectedTPDBTP = measureHundredths(v.LUFS+delta), measureHundredths(v.TruePeakDBTP+delta)
 	switch {
 	case p.Decision != "":
 	case math.Abs(p.ExpectedLUFS-targetLUFS) > ToleranceLU-p.LUFSMarginLU:
@@ -531,6 +531,10 @@ func measureRun(ctx context.Context, args []string, ebur128 string) (*ffmpegLog,
 	return log, time.Since(start).Seconds(), err
 }
 
+func measureCommand(args []string) []string { return append([]string{"ffmpeg"}, args...) }
+
+func measureHundredths(v float64) float64 { return math.Round(v*100) / 100 }
+
 func measurePass(ctx context.Context, src string, targetLUFS float64, layouts []layout, withSource bool,
 ) ([]measurePass1, error) {
 	args := measureArgs(src, targetLUFS, layouts, withSource)
@@ -553,7 +557,7 @@ func measurePass(ctx context.Context, src string, targetLUFS float64, layouts []
 			return nil, fmt.Errorf("pass 1 %s target_offset: %w", l.name, err)
 		}
 		out[i] = measurePass1{
-			Command: args, LUFS: m.LUFS, TruePeakDBTP: m.TruePeakDBTP, LRALU: m.LRALU, ThresholdLUFS: m.ThresholdLUFS,
+			Command: measureCommand(args), LUFS: m.LUFS, TruePeakDBTP: m.TruePeakDBTP, LRALU: m.LRALU, ThresholdLUFS: m.ThresholdLUFS,
 			TargetOffsetLU: offset, MaxMomentaryLUFS: maxMomentary, Predicted: predict(m, targetLUFS), Seconds: secs,
 		}
 	}
@@ -584,7 +588,7 @@ func measureRender(ctx context.Context, src string, targetLUFS float64, layouts 
 			return nil, fmt.Errorf("pass 2 report from %s: %w", loudnormInstance(l), err)
 		}
 		out[i] = measurePass2{
-			Command: args, Report: report, Normalization: Normalization(report["normalization_type"]), Seconds: secs,
+			Command: measureCommand(args), Report: report, Normalization: Normalization(report["normalization_type"]), Seconds: secs,
 		}
 	}
 	return out, nil
@@ -617,9 +621,10 @@ func measureVerifyAll(ctx context.Context, outs []measureOutput, targetLUFS floa
 			}
 			msg := check(o.Profile.Name, l, targetLUFS)
 			res[i] = measureVerify{
-				Command: args, LUFS: l.LUFS, TruePeakDBTP: l.TruePeakDBTP, LRALU: l.LRALU,
-				ErrorLU: l.LUFS - targetLUFS, HeadroomDB: CeilingDBTP - l.TruePeakDBTP,
+				Command: measureCommand(args), LUFS: l.LUFS, TruePeakDBTP: l.TruePeakDBTP, LRALU: l.LRALU,
 				InSpec: msg == "", Check: msg, Bytes: info.Size(), Seconds: secs,
+				ErrorLU:    measureHundredths(l.LUFS - targetLUFS),
+				HeadroomDB: measureHundredths(CeilingDBTP - l.TruePeakDBTP),
 			}
 		})
 	}
