@@ -172,7 +172,8 @@ under Compose while it is encoding:
 
 The script needs only bash 5 and Docker, and takes 6-8 minutes, mostly encoding and waiting out the lease.
 It isn't run in CI. It works on a Compose project of its own, `<name>-process-checks`, where `<name>` is
-`COMPOSE_PROJECT_NAME` or `slumber-mill`, so it never touches your everyday stack. It builds and starts that project,
+`COMPOSE_PROJECT_NAME` or the checkout's directory name (lower-cased, anything outside `a-z0-9_-` removed), so it
+never touches your everyday stack or another checkout's. It builds and starts that project,
 and when it ends takes it down with its volumes and the images it built. It mounts `var/out/process-checks/data`
 as the data directory instead of `var/data` and publishes no port, so it can run beside a local stack.
 Uploads go through a pinned `curlimages/curl` container on the project's network. The containers' logs are left in

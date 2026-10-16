@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The process-level checks: how worker-encode stops, drains and crashes under Compose.
 #
-# Runs on its own Compose project, named <COMPOSE_PROJECT_NAME or slumber-mill>-process-checks: brings it up,
-# and takes it down with its volumes and images on exit. Needs only bash 5 and Docker; curl, mysql and ffmpeg
-# run in containers. Generated files go to var/out/process-checks.
+# Runs on its own Compose project, named <COMPOSE_PROJECT_NAME or the checkout's directory name>-process-checks:
+# brings it up, and takes it down with its volumes and images on exit. Needs only bash 5 and Docker; curl, mysql
+# and ffmpeg run in containers. Generated files go to var/out/process-checks.
 set -euo pipefail
 ((BASH_VERSINFO[0] >= 5)) || {
   echo "process-checks.sh needs bash 5 or later" >&2
@@ -11,7 +11,16 @@ set -euo pipefail
 }
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-project=${COMPOSE_PROJECT_NAME:-slumber-mill}-process-checks
+# Compose's own default, the checkout's directory name lower-cased and cleaned, keeps each checkout's stack apart:
+# the teardown removes the project's volumes.
+base=${root##*/}
+base=${base,,}
+base=${base//[^a-z0-9_-]/}
+[[ -n ${COMPOSE_PROJECT_NAME:-$base} ]] || {
+  echo "process-checks.sh: the directory name leaves nothing for a project name; set COMPOSE_PROJECT_NAME" >&2
+  exit 1
+}
+project=${COMPOSE_PROJECT_NAME:-$base}-process-checks
 work=$root/var/out/process-checks
 data=$work/data
 fixture=$work/fixture.wav
