@@ -30,10 +30,10 @@ slugs=(soak-a soak-b soak-c soak-d soak-quiet)
 targets=(-16 -18 -20 -23 -16)
 hooked=(yes yes yes yes no)
 
-# The one ERROR line the soak's own traffic explains: the losing insert of two racing uploads with one idempotency
-# key, which then replays the winner. GORM's logger reports every failed query at ERROR. Its count may not exceed
-# the races the driver could have caused, which it writes to duplicate-insert-bound. Any other ERROR fails the soak.
-expected_error='^api-[0-9]+ +\| .*"level":"ERROR","msg":"query failed","method":"POST","route":"/v1/assets",.*"error":"duplicated key not allowed","sql":"INSERT INTO `assets` '
+# The WARN line the soak's own traffic explains: the losing insert of two racing uploads with one idempotency key,
+# which then replays the winner. Its count may not exceed the races the driver could have caused, which it writes to
+# duplicate-insert-bound. Any ERROR line fails the soak.
+duplicate_key='^api-[0-9]+ +\| .*"level":"WARN","msg":"query failed","method":"POST","route":"/v1/assets",.*"error":"duplicated key not allowed","sql":"INSERT INTO `assets` '
 
 failures=0
 results=()
@@ -230,13 +230,13 @@ not_running() {
   return 0
 }
 
-# check_logs fails the soak on deadlocks, lock wait timeouts and unexplained ERROR lines in the services' logs,
+# check_logs fails the soak on deadlocks, lock wait timeouts and ERROR lines in the services' logs,
 # and counts what the pools logged.
 check_logs() {
   local file=$work/services.log line svc json msg re n bound
   compose logs --no-color api worker-encode worker-webhook migrate >"$file" 2>&1
   declare -A errors=() outcomes=() reaped=()
-  local deadlocks=0 lockwaits=0 relay_locks=0 swept=0 expected=0
+  local deadlocks=0 lockwaits=0 relay_locks=0 swept=0 duplicates=0 error_lines=0
   re='^([a-z-]+-[0-9]+) +\| (.*)$'
   while IFS= read -r line; do
     [[ $line =~ $re ]] || continue
@@ -259,12 +259,11 @@ check_logs() {
       "swept temp files") [[ $json =~ \"removed\":([0-9]+) ]] && swept=$((swept + BASH_REMATCH[1])) ;;
     esac
     if [[ $json == *'"level":"ERROR"'* ]]; then
-      if [[ $line =~ $expected_error ]]; then
-        expected=$((expected + 1))
-      else
-        errors["${svc%-[0-9]*}: $msg"]=$((${errors["${svc%-[0-9]*}: $msg"]:-0} + 1))
-        echo "unexplained ERROR: $line" >>"$work/errors.log"
-      fi
+      error_lines=$((error_lines + 1))
+      errors["${svc%-[0-9]*}: $msg"]=$((${errors["${svc%-[0-9]*}: $msg"]:-0} + 1))
+      echo "ERROR: $line" >>"$work/errors.log"
+    elif [[ $json == *'"level":"WARN"'* && $line =~ $duplicate_key ]]; then
+      duplicates=$((duplicates + 1))
     fi
   done <"$file"
 
@@ -274,8 +273,9 @@ check_logs() {
   echo "  relay lock taken: $relay_locks times; temp files swept at startup: $swept"
   echo "  deadlocks: $deadlocks; lock wait timeouts: $lockwaits"
   bound=$(cat "$work/duplicate-insert-bound" 2>/dev/null) || bound=
-  echo "  ERROR lines from the losing insert of racing idempotent uploads: $expected, of at most ${bound:-unknown}"
-  for n in "${!errors[@]}"; do echo "  unexplained ERROR lines, $n: ${errors[$n]}"; done | sort
+  echo "  duplicate-key WARN lines from the losing insert of racing idempotent uploads: $duplicates, of at most ${bound:-unknown}"
+  echo "  ERROR lines: $error_lines"
+  for n in "${!errors[@]}"; do echo "    $n: ${errors[$n]}"; done | sort
 
   # The soak never stops an encode worker gracefully and no encode fails but by rejection, so an attempt beyond an
   # asset's first can only be a reaper's requeue after a SIGKILL. A third reap fails the asset instead. Every run
@@ -287,8 +287,8 @@ check_logs() {
   else
     record FAIL "$what"
   fi
-  what="the duplicate-key ERROR lines number no more than the uploads that could race ($expected, at most ${bound:-unknown})"
-  if [[ $bound =~ ^[0-9]+$ ]] && ((expected <= bound)); then
+  what="the duplicate-key WARN lines number no more than the uploads that could race ($duplicates, at most ${bound:-unknown})"
+  if [[ $bound =~ ^[0-9]+$ ]] && ((duplicates <= bound)); then
     record PASS "$what"
   else
     record FAIL "$what"
@@ -299,9 +299,9 @@ check_logs() {
     record FAIL "no deadlocks or lock wait timeouts in any service's logs ($deadlocks deadlocks, $lockwaits lock waits)"
   fi
   if ((${#errors[@]} == 0)); then
-    record PASS "no ERROR lines in any service's logs that the injected failures don't explain"
+    record PASS "no ERROR lines in any service's logs"
   else
-    record FAIL "no ERROR lines in any service's logs that the injected failures don't explain (see $work/errors.log)"
+    record FAIL "no ERROR lines in any service's logs (see $work/errors.log)"
   fi
 }
 

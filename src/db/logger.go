@@ -16,7 +16,8 @@ import (
 const slowQueryThreshold = 200 * time.Millisecond
 
 // gormLogger writes GORM's logs through the context's logger, or log when the context carries none.
-// Queries are logged with their placeholders, never their values.
+// Queries are logged with their placeholders, never their values. A duplicate-key failure is logged at WARN, because
+// the repositories turn it into an outcome, such as the idempotent upload that lost its race.
 type gormLogger struct {
 	log   *slog.Logger
 	level logger.LogLevel
@@ -59,8 +60,11 @@ func (l gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (strin
 		return
 	}
 	took := time.Since(begin)
+	duplicate := errors.Is(err, gorm.ErrDuplicatedKey)
 	switch {
-	case err != nil && l.level >= logger.Error && !errors.Is(err, gorm.ErrRecordNotFound):
+	case duplicate && l.level >= logger.Warn:
+		l.trace(ctx, slog.LevelWarn, "query failed", took, fc, slog.String("error", err.Error()))
+	case err != nil && !duplicate && l.level >= logger.Error && !errors.Is(err, gorm.ErrRecordNotFound):
 		l.trace(ctx, slog.LevelError, "query failed", took, fc, slog.String("error", err.Error()))
 	case l.slow > 0 && took > l.slow && l.level >= logger.Warn:
 		l.trace(ctx, slog.LevelWarn, "slow query", took, fc)
