@@ -740,10 +740,16 @@ func measureResults(t *testing.T, path string) (emit func(*testing.T, measureRow
 		if r.Retry != nil && r.Attempt == 1 {
 			verdict += fmt.Sprintf(" [%s %+.2f dB]", r.Retry.Decision, r.Retry.DeltaDB)
 		}
-		s := fmt.Sprintf("%-14s %6s %-8s %-24s gain %+5.2f a%d %7.2f LUFS %6.2f dBTP LRA %5.2f %-7s %6.0f kB %s",
+		// p1 is pass 1's I/TP/LRA, offset and predicted mode, room the margin left for linear gain
+		// (positive is linear), and pre pass 2's loudnorm output I/TP before the encoder.
+		room := r.PreEncodeTPDBTP - (r.Pass1.TruePeakDBTP + r.TargetLUFS - r.Pass1.LUFS)
+		s := fmt.Sprintf("%-14s %6s %-8s %-24s gain %+5.2f a%d p1 %6.2f/%6.2f/%5.2f off %+5.2f %-7s room %+6.2f "+
+			"pre %6s/%6s | %7.2f LUFS %6.2f dBTP LRA %5.2f %-7s %6.0f kB p2 %4.0f s v %3.0f s %s",
 			r.Source.Spec, num(r.TargetLUFS), r.Profile, r.Variant, r.GainDB, r.Attempt,
+			r.Pass1.LUFS, r.Pass1.TruePeakDBTP, r.Pass1.LRALU, r.Pass1.TargetOffsetLU, r.Pass1.Predicted, room,
+			r.Pass2.Report["output_i"], r.Pass2.Report["output_tp"],
 			r.Verify.LUFS, r.Verify.TruePeakDBTP, r.Verify.LRALU, r.Pass2.Normalization,
-			float64(r.Verify.Bytes)/1000, verdict)
+			float64(r.Verify.Bytes)/1000, r.Pass2.Seconds, r.Verify.Seconds, verdict)
 		mu.Lock()
 		defer mu.Unlock()
 		if _, err := f.Write(append(line, '\n')); err != nil {
