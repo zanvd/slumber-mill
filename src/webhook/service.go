@@ -98,6 +98,8 @@ type Relay struct {
 	tenants webhookTenants
 	// lock is nil unless this relay holds the relay lock.
 	lock relayLock
+	// whileHeld runs in Run for as long as the relay holds the lock. It is nil unless set by WhileHeld.
+	whileHeld func(ctx context.Context)
 }
 
 func NewRelay(r relayRepo, events eventSource, tenants webhookTenants) (*Relay, error) {
@@ -112,10 +114,19 @@ func NewRelay(r relayRepo, events eventSource, tenants webhookTenants) (*Relay, 
 	return &Relay{repo: r, events: events, tenants: tenants}, nil
 }
 
+// WhileHeld sets f to run in its own goroutine from the moment Run finds the relay holding the lock until the lock
+// is lost or Run stops, when f's context is cancelled and Run waits for f to return. f starts afresh each time
+// the lock is taken. Call it before Run.
+func (r *Relay) WhileHeld(f func(ctx context.Context)) {
+	r.whileHeld = f
+}
+
 // Run calls Once, waiting a second after each call, until ctx is cancelled. Then it gives up the relay lock.
 func (r *Relay) Run(ctx context.Context) {
 	log := logging.LoggerFromContext(ctx)
+	var held heldTask
 	defer func() {
+		held.stop()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 		defer cancel()
 		if err := r.Close(ctx); err != nil {
@@ -123,11 +134,47 @@ func (r *Relay) Run(ctx context.Context) {
 		}
 	}()
 	for ctx.Err() == nil {
-		if _, _, err := r.Once(ctx); err != nil && ctx.Err() == nil {
+		isHeld, _, err := r.Once(ctx)
+		if err != nil && ctx.Err() == nil {
 			log.ErrorContext(ctx, "relay failed", "error", err)
+		}
+		if isHeld && ctx.Err() == nil {
+			held.start(ctx, r.whileHeld)
+		} else {
+			held.stop()
 		}
 		sleep(ctx, relayInterval)
 	}
+}
+
+// heldTask is a function running in a goroutine of its own that can be stopped.
+type heldTask struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// start runs f unless f is nil or a previous start is still running.
+func (h *heldTask) start(ctx context.Context, f func(ctx context.Context)) {
+	if f == nil || h.cancel != nil {
+		return
+	}
+	ctx, h.cancel = context.WithCancel(ctx)
+	done := make(chan struct{})
+	h.done = done
+	go func() {
+		defer close(done)
+		f(ctx)
+	}()
+}
+
+// stop cancels the function's context and waits for it to return. It does nothing if none is running.
+func (h *heldTask) stop() {
+	if h.cancel == nil {
+		return
+	}
+	h.cancel()
+	<-h.done
+	*h = heldTask{}
 }
 
 // Once takes the relay lock if neither this relay nor another holds it. Holding the lock, it relays batches of

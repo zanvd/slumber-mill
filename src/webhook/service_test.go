@@ -557,6 +557,81 @@ func TestRelayRunLogsFailures(t *testing.T) {
 	})
 }
 
+// TestRelayWhileHeld runs the function given to WhileHeld only while the relay holds the lock: it starts when the lock
+// is taken, ends when the lock is lost or Run stops, starts afresh when the lock is taken again, and never runs
+// while another relay holds the lock.
+func TestRelayWhileHeld(t *testing.T) {
+	const ms = time.Millisecond
+	tests := []struct {
+		name       string
+		busy       func(elapsed time.Duration) bool
+		lostAfter  []time.Duration
+		stopAt     time.Duration
+		wantStarts []time.Duration
+		wantEnds   []time.Duration
+	}{
+		{
+			name:       "holding the lock throughout",
+			stopAt:     3500 * ms,
+			wantStarts: []time.Duration{0},
+			wantEnds:   []time.Duration{3500 * ms},
+		},
+		{
+			name:   "another relay holds the lock throughout",
+			busy:   func(time.Duration) bool { return true },
+			stopAt: 5 * time.Second,
+		},
+		{
+			name:       "the lock is lost and taken again",
+			busy:       func(d time.Duration) bool { return 5*time.Second <= d && d < 20*time.Second },
+			lostAfter:  []time.Duration{5 * time.Second},
+			stopAt:     30500 * ms,
+			wantStarts: []time.Duration{0, 20 * time.Second},
+			wantEnds:   []time.Duration{5 * time.Second, 30500 * ms},
+		},
+		{
+			name:       "taking the lock late",
+			busy:       func(d time.Duration) bool { return d < 2500*ms },
+			stopAt:     4 * time.Second,
+			wantStarts: []time.Duration{3 * time.Second},
+			wantEnds:   []time.Duration{4 * time.Second},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newRelayFixture(t)
+				f.repo.busy, f.repo.lostAfter = tc.busy, tc.lostAfter
+				var starts, ends []time.Duration
+				unreleasedAtEnd := true
+				f.relay.WhileHeld(func(ctx context.Context) {
+					starts = append(starts, f.repo.elapsed())
+					<-ctx.Done()
+					ends = append(ends, f.repo.elapsed())
+					unreleasedAtEnd = unreleasedAtEnd && f.repo.locks[len(f.repo.locks)-1].releases == 0
+				})
+				ctx, cancel := context.WithCancel(f.logs.ctx(t.Context()))
+				done := make(chan struct{})
+
+				go func() {
+					defer close(done)
+					f.relay.Run(ctx)
+				}()
+				time.Sleep(tc.stopAt)
+				cancel()
+				<-done
+
+				if !slices.Equal(starts, tc.wantStarts) || !slices.Equal(ends, tc.wantEnds) {
+					t.Errorf("ran from %v to %v, want from %v to %v", starts, ends, tc.wantStarts, tc.wantEnds)
+				}
+				if !unreleasedAtEnd {
+					t.Error("the relay lock was released before the function returned")
+				}
+			})
+		})
+	}
+}
+
 // claimed is the lease the pool hands the deliverer in these tests.
 var claimed = worker.Lease{ID: 11, TenantID: hookTenant, Attempt: 2}
 
