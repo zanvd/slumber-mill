@@ -87,6 +87,20 @@ func Thunder(tb testing.TB) string {
 			"[rain][crack]amix=inputs=2:duration=first:normalize=0", (bed/2).Milliseconds()))
 }
 
+// Speech is d of dual-mono pink noise, band-limited to 100 Hz–5 kHz, under an envelope like narration's:
+// syllables at 4.3 a second, phrases of 2.9 s with 1.2 s gaps, a longer gap every 13.7 s,
+// a phrase level swinging from 0.4 to 1.0 over 29 s, and a room-tone floor.
+func Speech(tb testing.TB, d time.Duration) string {
+	tb.Helper()
+	const envelope = "0.002+(0.7+0.3*sin(2*PI*t/29))*pow(sin(PI*4.3*t),2)*lt(mod(t,4.1),2.9)*lt(mod(t,13.7),11.5)"
+	return audioFixture(tb, "speech.wav",
+		[]string{
+			noise("pink", 0.5, 41, d),
+			fmt.Sprintf("aevalsrc=exprs='%s':sample_rate=48000:duration=%s", envelope, seconds(d)),
+		},
+		"[0:a]highpass=f=100,lowpass=f=5000[n];[n][1:a]amultiply", "-ac", "2")
+}
+
 // PinkClip is mono pink noise lasting d.
 func PinkClip(tb testing.TB, d time.Duration) string {
 	tb.Helper()

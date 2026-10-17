@@ -218,6 +218,29 @@ func TestProcessCorrectsBrightContent(t *testing.T) {
 	}
 }
 
+// TestProcessSpeechAtTheDefaultTarget guards tenant create's default target: under loudnorm's dynamic mode, speech
+// can't reach the loudest target, but every rendition of it must verify at the default.
+func TestProcessSpeechAtTheDefaultTarget(t *testing.T) {
+	t.Parallel()
+	const defaultTargetLUFS = -20.0
+	res, err := New().Process(testContext(t), testutil.Speech(t, 10*time.Minute), defaultTargetLUFS, tempOutputs(t))
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	t.Logf("input %+v, warnings %v", res.Input, res.Warnings)
+	if len(res.Renditions) != len(Profiles()) {
+		t.Fatalf("got %d renditions, want %d", len(res.Renditions), len(Profiles()))
+	}
+	for _, r := range res.Renditions {
+		t.Logf("%s: rendered %s, verified %+v, flattened by %.2f LU",
+			r.Profile.Name, r.Normalization, r.Loudness, flattening(r))
+		if math.Abs(r.Loudness.LUFS-defaultTargetLUFS) > ToleranceLU || r.Loudness.TruePeakDBTP > CeilingDBTP {
+			t.Errorf("%s verified at %.2f LUFS and %.2f dBTP, want %.1f ± %.0f LU and at most %.1f dBTP",
+				r.Profile.Name, r.Loudness.LUFS, r.Loudness.TruePeakDBTP, defaultTargetLUFS, ToleranceLU, CeilingDBTP)
+		}
+	}
+}
+
 func TestProcessRejects(t *testing.T) {
 	tests := []struct {
 		name    string
