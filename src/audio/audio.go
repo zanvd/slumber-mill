@@ -35,6 +35,7 @@ const (
 	silentLUFS    = -70.0
 
 	suddenLoudEventLU = 10.0
+	flatteningLU      = 6.0
 	mayClipDBTP       = -0.5
 )
 
@@ -112,12 +113,13 @@ type Source struct {
 	Duration   time.Duration
 }
 
-// Loudness is a loudnorm measurement.
+// Loudness is a loudnorm measurement, with the highest momentary loudness ebur128 logged for the same signal.
 type Loudness struct {
-	LUFS          float64
-	TruePeakDBTP  float64
-	LRALU         float64
-	ThresholdLUFS float64
+	LUFS             float64
+	TruePeakDBTP     float64
+	LRALU            float64
+	ThresholdLUFS    float64
+	MaxMomentaryLUFS float64
 }
 
 // Input is the source measured in its own channel layout.
@@ -239,7 +241,7 @@ func warnings(in Input, renditions []Rendition) []Warning {
 		w = append(w, WarningSuddenLoudEvent)
 	}
 	for _, r := range renditions {
-		if r.Normalization == Dynamic {
+		if r.Normalization == Dynamic && hundredths(flattening(r)) > hundredths(flatteningLU) {
 			w = append(w, WarningDynamicNormalization)
 			break
 		}
@@ -248,6 +250,12 @@ func warnings(in Input, renditions []Rendition) []Warning {
 		w = append(w, WarningSourceMayClip)
 	}
 	return w
+}
+
+// flattening is how much less a rendition's loudest moment stands above its integrated loudness
+// than the same moment did in the downmix it was rendered from.
+func flattening(r Rendition) float64 {
+	return (r.Measured.MaxMomentaryLUFS - r.Measured.LUFS) - (r.Loudness.MaxMomentaryLUFS - r.Loudness.LUFS)
 }
 
 // hundredths rounds a level to the precision ffmpeg prints, so differences compare without float noise.

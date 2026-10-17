@@ -68,13 +68,11 @@ func TestProcessRoundTrip(t *testing.T) {
 		{
 			name: "dual-mono pink", fixture: testutil.DualMonoPink, channels: 2, duration: 10 * time.Second,
 			wantModes:     []Normalization{Linear, Dynamic},
-			wantWarnings:  []Warning{WarningDynamicNormalization},
 			wantDownmixLU: 0,
 		},
 		{
 			name: "uncorrelated pink", fixture: testutil.UncorrelatedPink, channels: 2, duration: 10 * time.Second,
 			wantModes:     []Normalization{Linear, Dynamic},
-			wantWarnings:  []Warning{WarningDynamicNormalization},
 			wantDownmixLU: 3,
 		},
 		{
@@ -85,13 +83,11 @@ func TestProcessRoundTrip(t *testing.T) {
 		{
 			name: "mono pink", fixture: testutil.MonoPink, channels: 1, duration: 10 * time.Second,
 			wantModes:     []Normalization{Dynamic, Dynamic},
-			wantWarnings:  []Warning{WarningDynamicNormalization},
 			wantDownmixLU: math.NaN(),
 		},
 		{
 			name: "5.1 pink", fixture: testutil.Surround, channels: 6, duration: 10 * time.Second,
 			wantModes:     []Normalization{Dynamic, Dynamic},
-			wantWarnings:  []Warning{WarningDynamicNormalization},
 			wantDownmixLU: math.NaN(),
 		},
 		{
@@ -125,8 +121,15 @@ func TestProcessRoundTrip(t *testing.T) {
 			}
 			measured := map[int]Loudness{}
 			for i, r := range res.Renditions {
-				t.Logf("%s: %d channels, measured %+v, predicted %s, rendered %s, verified %+v",
-					r.Profile.Name, r.Channels, r.Measured, r.Predicted, r.Normalization, r.Loudness)
+				t.Logf("%s: %d channels, measured %+v, predicted %s, rendered %s, verified %+v, flattened by %.2f LU",
+					r.Profile.Name, r.Channels, r.Measured, r.Predicted, r.Normalization, r.Loudness, flattening(r))
+				// A loudest moment under the integrated loudness would come from another signal than the one measured.
+				for _, m := range []Loudness{r.Measured, r.Loudness} {
+					if m.MaxMomentaryLUFS < m.LUFS-0.1 {
+						t.Errorf("%s has a max momentary loudness of %.1f LUFS under its %.2f LUFS integrated",
+							r.Profile.Name, m.MaxMomentaryLUFS, m.LUFS)
+					}
+				}
 				wantChannels := min(tc.channels, outputs[i].Profile.MaxChannels)
 				if r.Profile != outputs[i].Profile || r.Path != outputs[i].Path || r.Channels != wantChannels {
 					t.Errorf("rendition %d is %s at %s with %d channels, want %s at %s with %d",
