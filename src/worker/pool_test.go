@@ -87,6 +87,27 @@ func TestHeartbeat(t *testing.T) {
 	})
 }
 
+func TestClaimIsLogged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg, logs := testConfig(t)
+		src := newFakeSource(lease)
+		r := startPool(t, src, cfg)
+		synctest.Sleep(time.Minute)
+		r.stop()
+
+		got := logs.find(t, "work claimed")
+		if len(got) != 1 {
+			t.Fatalf("claim records = %v, want one", got)
+		}
+		rec := got[0]
+		if rec["level"] != "INFO" || rec["worker"] != "worker-1" || rec["pool"] != "test" ||
+			rec["id"] != float64(lease.ID) || rec["tenant_id"] != float64(lease.TenantID) ||
+			rec["attempt"] != float64(lease.Attempt) {
+			t.Errorf("claim record = %v, want INFO for worker-1 in pool test with lease %+v", rec, lease)
+		}
+	})
+}
+
 func TestHeartbeatLostLeaseCancelsTheWork(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg, logs := testConfig(t)
