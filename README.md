@@ -135,7 +135,8 @@ webhook_secret: whsec_...
 
 The `webhook_secret` line appears only when the tenant has a `-webhook-url`. Only hashes and ciphertext are stored,
 so if you lose them, they are gone. Logs go to stderr as JSON.
-`-target-lufs` defaults to -16, which is also the loudest allowed, and must be from -70 to -16.
+`-target-lufs` defaults to -20 and must be from -70 to -16, the loudest allowed. Tenants created before the
+default changed keep their stored target.
 The command refuses a webhook URL whose host isn't public.
 
 Exit codes, for every subcommand: 0 for success or help, 1 for a runtime or configuration error,
@@ -330,7 +331,7 @@ Each with its trade-off.
   and peak.
   A listener asleep with the volume set for one story notices a quiet or sudden file, so the encode pool measures
   each output channel layout after the downmix, normalises each with its own two-pass `loudnorm`, then re-measures
-  every encoded file. Each must be within 1 LU of the tenant's target (default -16 LUFS) with a true peak at or below
+  every encoded file. Each must be within 1 LU of the tenant's target (default -20 LUFS) with a true peak at or below
   -1.5 dBTP, or the asset is rejected with the numbers. Each rendition stores its own figures.
   `loudnorm` can silently fall back to dynamic mode, which lifts a quiet rain bed when a thunder crack arrives,
   so the pool publishes a `dynamic_normalization` warning when dynamic mode flattened the file's loud moments
@@ -433,6 +434,9 @@ For a change that spans a deploy (not built, only written down here):
 - **Targets louder than -16 LUFS aren't supported.** loudnorm's limiter can't lift dense content past about -16,
   so `tenant create` refuses them, and an asset of a tenant created before the cap is rejected with
   "target loudness must be from -70 to -16 LUFS".
+- **Expressive mono narration can't reach -16 or -17 LUFS.** On speech, loudnorm's dynamic mode saturates at about
+  -17.9 LUFS, so such narration is rejected at those targets. Speech tenants should use -18 or lower; -20 is the
+  default.
 - **Re-sealing webhook secrets under a new key is documented, not built.** A new key can go first in the key ring,
   and older ciphertexts still open; re-sealing the old rows and then dropping the old key is manual.
 - **The webhook egress check and NAT64.** See "SSRF defences" above.

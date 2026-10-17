@@ -36,7 +36,7 @@ const (
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 2 * time.Minute
 
-	defaultTargetLUFS = -16
+	defaultTargetLUFS = -20
 
 	// pollInterval is how long an idle slot waits, give or take half, before it claims again.
 	pollInterval = time.Second
@@ -53,7 +53,7 @@ const usage = `usage:
   slumber-mill api                              serve the HTTP API
   slumber-mill worker -pool encode|webhook      run a worker pool
   slumber-mill tenant create -slug S [-webhook-url U] [-target-lufs F]
-                                                create a tenant (-target-lufs defaults to -16) and print
+                                                create a tenant (-target-lufs defaults to -20) and print
                                                 its API key and webhook secret on stdout
 `
 

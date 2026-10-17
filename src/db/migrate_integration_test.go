@@ -109,6 +109,57 @@ func TestMigrateAgain(t *testing.T) {
 	}
 }
 
+// TestMigrateTargetDefault applies 0002 to a database whose tenants were created under 0001's default, twice.
+func TestMigrateTargetDefault(t *testing.T) {
+	dsn := testutil.NewDatabase(t)
+	gdb := open(t, dsn).WithContext(t.Context())
+	if got := targetDefault(t, gdb); got != "-20.0" {
+		t.Errorf("target_lufs defaults to %s after migrating, want -20.0", got)
+	}
+	if err := gdb.Exec("ALTER TABLE tenants ALTER COLUMN target_lufs SET DEFAULT -16.0").Error; err != nil {
+		t.Fatalf("error restoring 0001's default: %v", err)
+	}
+	existing := createTenant(t, gdb, "before-0002")
+
+	for _, run := range []string{"first run", "second run"} {
+		if err := gdb.Exec("DELETE FROM schema_migrations WHERE version = 2").Error; err != nil {
+			t.Fatalf("%s: error forgetting migration 2: %v", run, err)
+		}
+		applied, err := db.Migrate(t.Context(), dsn, testutil.Logger(t))
+		if err != nil {
+			t.Fatalf("%s: Migrate() error = %v", run, err)
+		}
+		if want := []string{"0002_tenant_target_default.sql"}; !slices.Equal(applied, want) {
+			t.Errorf("%s: Migrate() applied %v, want %v", run, applied, want)
+		}
+		if got := targetDefault(t, gdb); got != "-20.0" {
+			t.Errorf("%s: target_lufs defaults to %s, want -20.0", run, got)
+		}
+	}
+
+	created := createTenant(t, gdb, "after-0002")
+	for id, want := range map[uint64]float64{existing: -16, created: -20} {
+		var got float64
+		if err := gdb.Raw("SELECT target_lufs FROM tenants WHERE id = ?", id).Scan(&got).Error; err != nil {
+			t.Fatalf("error reading tenant %d: %v", id, err)
+		}
+		if got != want {
+			t.Errorf("tenant %d has target_lufs %v, want %v", id, got, want)
+		}
+	}
+}
+
+func targetDefault(t *testing.T, gdb *gorm.DB) string {
+	t.Helper()
+	var def string
+	err := gdb.Raw("SELECT column_default FROM information_schema.columns " +
+		"WHERE table_schema = DATABASE() AND table_name = 'tenants' AND column_name = 'target_lufs'").Scan(&def).Error
+	if err != nil {
+		t.Fatalf("error reading the target_lufs default: %v", err)
+	}
+	return def
+}
+
 func recordedMigrations(t *testing.T, gdb *gorm.DB) []schemaMigration {
 	t.Helper()
 	var rows []schemaMigration

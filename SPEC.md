@@ -135,7 +135,7 @@ Each domain package owns its tables, and every transaction stays inside one repo
 src/                         the Go module: go.mod, go.sum and all Go code
   cmd/slumber-mill/main.go   composition root: env config, wiring, subcommands, signal handling
   db/                        Open (GORM config), lease SQL, Migrate (embedded SQL), ID, Clip, GORM logger
-  db/migrations/             0001_init.sql
+  db/migrations/             0001_init.sql, 0002_tenant_target_default.sql
   worker/                    pool runtime: polling, heartbeats, grace, release, backoff, panics
   tenant/                    repository.go, service.go (create, authenticate, webhook target)
   asset/                     repository.go, service.go (upload, get, list, renditions, events), processor.go
@@ -214,7 +214,7 @@ CREATE TABLE tenants (
     api_key_hash       BINARY(32)      NOT NULL,
     webhook_url        VARCHAR(2048)   NULL,
     webhook_secret_enc VARBINARY(128)  NULL,  -- key ID, nonce, AES-256-GCM ciphertext and tag
-    target_lufs        DECIMAL(4, 1)   NOT NULL DEFAULT -16.0,
+    target_lufs        DECIMAL(4, 1)   NOT NULL DEFAULT -20.0,
     created_at         DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
     UNIQUE KEY uq_tenants_slug (slug),
@@ -518,8 +518,9 @@ with `,volume=<g>dB:precision=double` after `aresample=48000`.
 | `aac_64k` | 64 kbps | 1 | Offline downloads on small or full phones |
 
 Both outputs are 48 kHz MP4/AAC with `+faststart`.
-The integrated target comes from the tenant (default −16 LUFS, also the loudest allowed; pitfall 34)
+The integrated target comes from the tenant (default −20 LUFS; the loudest allowed is −16, pitfall 34)
 and is snapshotted onto the asset at upload.
+Under dynamic mode real mono narration can't reach above about −18 LUFS, so at louder targets it's rejected.
 The published ceiling is −1.5 dBTP. loudnorm gets a pre-encode `TP` of −4.5 dBTP, 3 dB of headroom below it,
 because resampling and the encoder add true peak (pitfall 17), and `LRA=50`, its maximum in 6.1.1:
 it never blocks linear mode, and lower values pull dynamic renders off target.
@@ -785,6 +786,7 @@ object storage, presigned uploads, signed CDN URLs, and the same write-then-comm
 | Append a member to a SET (up to 8 members) | `ALGORITHM=INSTANT` ✓ |
 | Grow a SET past 8 members (1 → 2 bytes) | ✗ table rebuild required |
 | Add a secondary index | `ALGORITHM=INPLACE, LOCK=NONE` ✓ |
+| Change a column default | `ALGORITHM=INSTANT, LOCK=DEFAULT` ✓; MySQL 8.4 refuses INSTANT with `LOCK=NONE`, `SHARED` or `EXCLUSIVE` |
 | Change collation of an indexed column (even within utf8mb4) | ✗ `ALGORITHM=COPY` only (blocks writes) |
 
 ### README section: zero-downtime migrations (written, not built)
@@ -972,6 +974,8 @@ What the tests must show:
   every rendition lands within 1 LU of target and under the ceiling;
   high-shelved white noise misses the target in its first 64k encode and passes after the corrective re-encode,
   and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers;
+  a speech-like fixture (pink noise band-limited to 100 Hz–5 kHz under a speech envelope, fixed seed)
+  passes verification in both renditions at the default −20 LUFS target;
   a target louder than −16 LUFS is a rejection before ffmpeg runs; a text file is "not audio",
   a missing file is retryable, clips of 0.3 s and 2 s are "too short", a source just over 10 h is "too long"
   at the probe and one of exactly 10 h is accepted, and the thunder fixture is predicted dynamic
@@ -1068,8 +1072,10 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     (−17.19 dBTP and −15.83 LUFS for white noise normalised to −16 LUFS), so only the verification pass's figures are stored.
     Under the −4.5 dBTP pre-encode peak, dense content rarely gets linear mode: at −16 LUFS every pink-noise and
     narration mono rendition rendered dynamic, so the mode alone says little.
-    On pink noise, narration and speech at −16 and −23 the flattening stayed under 2.1 LU;
-    on thunder in rain and quiet beds with loud events it was 10.3–19.9 LU.
+    On pink noise, synthesised narration and the speech fixture at −16 and −23 the flattening stayed under 2.1 LU
+    (0.36–1.37 for the speech fixture); on thunder in rain and quiet beds with loud events it was 10.3–19.9 LU.
+    Real narration flattens more: a male LibriVox reader measured 1.38–3.71 LU, and a female one
+    5.84 at −20, 6.93 at −18, 7.29 at −17 and 7.47 at −16, so `dynamic_normalization` fires for her at −18 and louder.
 19. **LRA doesn't detect sudden loud events:** 0.1 LU for the thunder file.
     Max momentary minus integrated does: 21.6 LU, against 0.4 for steady rain.
 20. **Very short clips measure as `-inf`:** a 0.3 s clip reads as silent.
@@ -1116,7 +1122,7 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 
 ### Loudness targets
 
-34. **loudnorm's limiter can't lift dense content much past −16 LUFS, and the target offset makes it worse.**
+34. **loudnorm's limiter can't lift dense content much past −16 LUFS, and the target offset changes how far it gets.**
     Mono pink noise already rendered dynamic at −16.
     Its 64k rendition collapsed at −15 (uncorrelated) and −14.5 (dual-mono), to about −19 LUFS at −14.
     Pass 1 reports the shortfall as `target_offset`. Passed to pass 2 as `offset`, it adds gain ahead of the limiter
@@ -1125,6 +1131,15 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     Offsets of 0.6 LU or more made the result worse, and smaller ones helped by 0.1–0.2 LU.
     At 60 minutes, −16 verified on the first attempt and −15.5 needed the corrective re-encode for dual-mono pink.
     Hence the −16 LUFS cap (§5).
+    Real mono narration saturates sooner. Two 10-minute LibriVox readings rendered losslessly at −16
+    reached only −17.89 and −17.84 LUFS, and raising loudnorm's `I` to about −14.1 gained under 0.1 LU.
+    At −16 every rendition of both missed by 1.87–1.95 LU and was rejected with no corrective re-encode:
+    the gain it needed was over 1.5 dB, or the true peak over the ceiling.
+    They were rejected at −17 too, verified within 0.8 LU at −18 and within 0.3 at −20.
+    On this speech the offset helped: without it the results were 0.2–0.6 LU worse.
+    As dual-mono sources, their 128k stereo renditions passed at −16 (−16.51 and −16.12) and every mono one failed:
+    the stereo layout carries 3 dB less true peak than mono at the same loudness.
+    Hence the −20 LUFS default (§7).
 
 ## 15. Build order
 
