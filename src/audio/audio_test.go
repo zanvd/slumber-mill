@@ -68,47 +68,61 @@ func reportWithOffset(instance string, m Loudness, mode Normalization, offset st
 		instance, m.LUFS, m.TruePeakDBTP, m.LRALU, m.ThresholdLUFS, mode, offset)
 }
 
-func frames(momentary ...float64) string {
+// frames is what the ebur128 instance logs for frames of the given momentary loudness.
+func frames(instance string, momentary ...float64) string {
 	var b strings.Builder
 	for i, m := range momentary {
-		fmt.Fprintf(&b, "[ebur128@input @ 0x5582] t: %.1f  TARGET:-23 LUFS    M:%6.1f S:-120.7     I: -70.0 LUFS\n",
-			float64(i+1)/10, m)
+		fmt.Fprintf(&b, "[%s @ 0x5582] t: %.1f  TARGET:-23 LUFS    M:%6.1f S:-120.7     I: -70.0 LUFS\n",
+			instance, float64(i+1)/10, m)
 	}
 	return b.String()
 }
 
+// measurement is pass 1 on a stereo source whose downmixes measure as stereo and mono:
+// ebur128's frames for the source and each downmix, then the loudnorm reports.
+func measurement(stereo, mono Loudness, stereoOffset, monoOffset string) string {
+	return frames(inputInstance, -120.7, -17.6, -17.8) +
+		frames("ebur128@stereo", -120.7, stereo.MaxMomentaryLUFS) + frames("ebur128@mono", -120.7, mono.MaxMomentaryLUFS) +
+		reportWithOffset("loudnorm@mono", mono, Dynamic, monoOffset) +
+		reportWithOffset("loudnorm@stereo", stereo, Dynamic, stereoOffset)
+}
+
+// verification is the verification of a rendition that measures as m.
+func verification(m Loudness) string {
+	return frames(verifyMomentaryInstance, -120.7, m.MaxMomentaryLUFS) + report(verifyInstance, m, Dynamic)
+}
+
 var (
-	stereoMeasured = Loudness{LUFS: -17.69, TruePeakDBTP: -7.26, LRALU: 0.1, ThresholdLUFS: -27.69}
-	monoMeasured   = Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7}
-	stereoEncoded  = Loudness{LUFS: -16.02, TruePeakDBTP: -5.41, LRALU: 0.3, ThresholdLUFS: -26.02}
-	monoEncoded    = Loudness{LUFS: -15.85, TruePeakDBTP: -2.99, LRALU: 0.5, ThresholdLUFS: -25.85}
+	stereoMeasured = Loudness{LUFS: -17.69, TruePeakDBTP: -7.26, LRALU: 0.1, ThresholdLUFS: -27.69, MaxMomentaryLUFS: -17.6}
+	monoMeasured   = Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7, MaxMomentaryLUFS: -20.6}
+	stereoEncoded  = Loudness{LUFS: -16.02, TruePeakDBTP: -5.41, LRALU: 0.3, ThresholdLUFS: -26.02, MaxMomentaryLUFS: -15.8}
+	monoEncoded    = Loudness{LUFS: -15.85, TruePeakDBTP: -2.99, LRALU: 0.5, ThresholdLUFS: -25.85, MaxMomentaryLUFS: -15.4}
 )
 
 // stereoScript is a successful run on a stereo source: probe, pass 1, pass 2 and two verifications.
 func stereoScript() []fakeResponse {
 	return []fakeResponse{
 		{stdout: probeJSON(2, "10.000000")},
-		{stderr: frames(-120.7, -17.6, -17.8) + reportWithOffset("loudnorm@mono", monoMeasured, Dynamic, "0.07") +
-			reportWithOffset("loudnorm@stereo", stereoMeasured, Dynamic, "-0.31")},
+		{stderr: measurement(stereoMeasured, monoMeasured, "-0.31", "0.07")},
 		{stderr: report("loudnorm@mono", monoEncoded, Dynamic) + report("loudnorm@stereo", stereoEncoded, Linear)},
-		{stderr: report(verifyInstance, stereoEncoded, Dynamic)},
-		{stderr: report(verifyInstance, monoEncoded, Dynamic)},
+		{stderr: verification(stereoEncoded)},
+		{stderr: verification(monoEncoded)},
 	}
 }
 
 var (
-	monoShort     = Loudness{LUFS: -17.3, TruePeakDBTP: -6.79, LRALU: 0.4, ThresholdLUFS: -27.3}
-	monoCorrected = Loudness{LUFS: -15.98, TruePeakDBTP: -5.47, LRALU: 0.4, ThresholdLUFS: -25.98}
+	monoShort     = Loudness{LUFS: -17.3, TruePeakDBTP: -6.79, LRALU: 0.4, ThresholdLUFS: -27.3, MaxMomentaryLUFS: -16.9}
+	monoCorrected = Loudness{LUFS: -15.98, TruePeakDBTP: -5.47, LRALU: 0.4, ThresholdLUFS: -25.98, MaxMomentaryLUFS: -15.6}
 )
 
 // correctiveScript is stereoScript with a 64k rendition that verifies 1.3 LU short of the target,
 // then its corrective re-encode and second verification.
 func correctiveScript() []fakeResponse {
 	s := stereoScript()
-	s[4].stderr = report(verifyInstance, monoShort, Dynamic)
+	s[4].stderr = verification(monoShort)
 	return append(s,
 		fakeResponse{stderr: report("loudnorm@mono", monoEncoded, Dynamic)},
-		fakeResponse{stderr: report(verifyInstance, monoCorrected, Dynamic)},
+		fakeResponse{stderr: verification(monoCorrected)},
 	)
 }
 
@@ -124,9 +138,8 @@ func TestProcess(t *testing.T) {
 	}
 
 	want := Result{
-		Source:   Source{Codec: "pcm_s16le", SampleRate: 48000, Channels: 2, Duration: 10 * time.Second},
-		Input:    Input{LUFS: -17.69, TruePeakDBTP: -7.26, LRALU: 0.1, MaxMomentaryLUFS: -17.6},
-		Warnings: []Warning{WarningDynamicNormalization},
+		Source: Source{Codec: "pcm_s16le", SampleRate: 48000, Channels: 2, Duration: 10 * time.Second},
+		Input:  Input{LUFS: -17.69, TruePeakDBTP: -7.26, LRALU: 0.1, MaxMomentaryLUFS: -17.6},
 		Renditions: []Rendition{
 			{
 				Profile: Profiles()[0], Path: "/data/tmp/part-1", Channels: 2, Measured: stereoMeasured,
@@ -163,8 +176,10 @@ func TestProcessCommands(t *testing.T) {
 			" -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json /src.wav",
 		"ffmpeg " + common + " -i /src.wav -filter_complex " +
 			"[0:a:0]ebur128@input=framelog=info,asplit=2[p0][p1];" +
-			"[p0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4.5:LRA=50:print_format=json[m0];" +
-			"[p1]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4.5:LRA=50:print_format=json[m1] " +
+			"[p0]aformat=channel_layouts=stereo,ebur128@stereo=framelog=info," +
+			"loudnorm@stereo=I=-16:TP=-4.5:LRA=50:print_format=json[m0];" +
+			"[p1]aformat=channel_layouts=mono,ebur128@mono=framelog=info," +
+			"loudnorm@mono=I=-16:TP=-4.5:LRA=50:print_format=json[m1] " +
 			"-map [m0] -f null - -map [m1] -f null -",
 		"ffmpeg -y " + common + " -i /src.wav -filter_complex " +
 			"[0:a:0]asplit=2[s0][s1];" +
@@ -175,9 +190,9 @@ func TestProcessCommands(t *testing.T) {
 			"-map [o0] -map_metadata -1 -c:a aac -b:a 128k -cutoff 20000 -movflags +faststart -f mp4 /data/tmp/part-1 " +
 			"-map [o1] -map_metadata -1 -c:a aac -b:a 64k -movflags +faststart -f mp4 /data/tmp/part-2",
 		"ffmpeg " + common + " -i /data/tmp/part-1 -filter_complex " +
-			"[0:a:0]loudnorm@verify=I=-16:TP=-4.5:LRA=50:print_format=json[v] -map [v] -f null -",
+			"[0:a:0]ebur128@verify=framelog=info,loudnorm@verify=I=-16:TP=-4.5:LRA=50:print_format=json[v] -map [v] -f null -",
 		"ffmpeg " + common + " -i /data/tmp/part-2 -filter_complex " +
-			"[0:a:0]loudnorm@verify=I=-16:TP=-4.5:LRA=50:print_format=json[v] -map [v] -f null -",
+			"[0:a:0]ebur128@verify=framelog=info,loudnorm@verify=I=-16:TP=-4.5:LRA=50:print_format=json[v] -map [v] -f null -",
 	}
 	var got []string
 	for _, c := range run.calls {
@@ -199,8 +214,8 @@ func TestProcessLayouts(t *testing.T) {
 	}{
 		{
 			name: "mono source", channels: 1,
-			measure:      []string{"asplit=1[p0];[p0]aformat=channel_layouts=mono,loudnorm@mono="},
-			measureNot:   []string{"loudnorm@stereo", "loudnorm@source"},
+			measure:      []string{"asplit=1[p0];[p0]aformat=channel_layouts=mono,ebur128@mono=framelog=info,loudnorm@mono="},
+			measureNot:   []string{"loudnorm@stereo", "loudnorm@source", "ebur128@stereo"},
 			render:       []string{"asplit=1[s0];[s0]aformat=channel_layouts=mono,", ",aresample=48000,asplit=2[o0][o1]"},
 			wantChannels: []int{1, 1},
 		},
@@ -208,6 +223,8 @@ func TestProcessLayouts(t *testing.T) {
 			name: "5.1 source", channels: 6,
 			measure: []string{
 				"asplit=3[p0][p1][p2];",
+				";[p0]aformat=channel_layouts=stereo,ebur128@stereo=framelog=info,loudnorm@stereo=",
+				";[p1]aformat=channel_layouts=mono,ebur128@mono=framelog=info,loudnorm@mono=",
 				";[p2]loudnorm@source=I=-16:TP=-4.5:LRA=50:print_format=json[m2]",
 				"-map [m2] -f null -",
 			},
@@ -217,13 +234,14 @@ func TestProcessLayouts(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pass1 := frames(-20.5)
+			pass1 := frames(inputInstance, -20.5) + frames("ebur128@mono", -20.6)
 			pass2 := ""
 			if tc.channels == 1 {
 				pass1 += report("loudnorm@mono", monoMeasured, Dynamic)
 				pass2 = report("loudnorm@mono", monoEncoded, Dynamic)
 			} else {
-				pass1 += report("loudnorm@stereo", stereoMeasured, Dynamic) + report("loudnorm@mono", monoMeasured, Dynamic) +
+				pass1 += frames("ebur128@stereo", -19.0) +
+					report("loudnorm@stereo", stereoMeasured, Dynamic) + report("loudnorm@mono", monoMeasured, Dynamic) +
 					report("loudnorm@source", Loudness{LUFS: -17.49, TruePeakDBTP: -9.92, LRALU: 0.1, ThresholdLUFS: -27.49}, Dynamic)
 				pass2 = report("loudnorm@stereo", stereoEncoded, Linear) + report("loudnorm@mono", monoEncoded, Dynamic)
 			}
@@ -231,8 +249,8 @@ func TestProcessLayouts(t *testing.T) {
 				{stdout: probeJSON(tc.channels, "10.0")},
 				{stderr: pass1},
 				{stderr: pass2},
-				{stderr: report(verifyInstance, stereoEncoded, Dynamic)},
-				{stderr: report(verifyInstance, monoEncoded, Dynamic)},
+				{stderr: verification(stereoEncoded)},
+				{stderr: verification(monoEncoded)},
 			}}
 			res, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs())
 			if err != nil {
@@ -267,8 +285,8 @@ func TestProcessLayouts(t *testing.T) {
 }
 
 func TestProcessCorrectsARendition(t *testing.T) {
-	stereoLoud := Loudness{LUFS: -14.99, TruePeakDBTP: -3, LRALU: 0.3, ThresholdLUFS: -24.99}
-	stereoCorrected := Loudness{LUFS: -16.01, TruePeakDBTP: -4.02, LRALU: 0.3, ThresholdLUFS: -26.01}
+	stereoLoud := Loudness{LUFS: -14.99, TruePeakDBTP: -3, LRALU: 0.3, ThresholdLUFS: -24.99, MaxMomentaryLUFS: -14.8}
+	stereoCorrected := Loudness{LUFS: -16.01, TruePeakDBTP: -4.02, LRALU: 0.3, ThresholdLUFS: -26.01, MaxMomentaryLUFS: -15.8}
 	tests := []struct {
 		name string
 		// failing is the index of the rendition that fails its first verification.
@@ -297,10 +315,10 @@ func TestProcessCorrectsARendition(t *testing.T) {
 			name: "aac_128k over the target", failing: 0,
 			script: func() []fakeResponse {
 				s := stereoScript()
-				s[3].stderr = report(verifyInstance, stereoLoud, Linear)
+				s[3].stderr = verification(stereoLoud)
 				return append(s,
 					fakeResponse{stderr: report("loudnorm@stereo", stereoEncoded, Dynamic)},
-					fakeResponse{stderr: report(verifyInstance, stereoCorrected, Linear)},
+					fakeResponse{stderr: verification(stereoCorrected)},
 				)
 			}(),
 			retry: "ffmpeg -y " + common + " -i /src.wav -filter_complex " +
@@ -409,7 +427,8 @@ func TestProcessRejectsFromReports(t *testing.T) {
 		{
 			name: "silent",
 			script: func(s []fakeResponse) []fakeResponse {
-				s[1].stderr = frames(-120.7) + reportWithOffset("loudnorm@stereo", silent, Dynamic, "inf") +
+				s[1].stderr = frames(inputInstance, -120.7) + frames("ebur128@stereo", -120.7) + frames("ebur128@mono", -120.7) +
+					reportWithOffset("loudnorm@stereo", silent, Dynamic, "inf") +
 					reportWithOffset("loudnorm@mono", silent, Dynamic, "inf")
 				return s
 			},
@@ -418,7 +437,7 @@ func TestProcessRejectsFromReports(t *testing.T) {
 		{
 			name: "mono rendition out of spec",
 			script: func(s []fakeResponse) []fakeResponse {
-				s[4].stderr = report(verifyInstance, quiet, Dynamic)
+				s[4].stderr = verification(quiet)
 				return s
 			},
 			want: "aac_64k rendition out of spec: -19.50 LUFS against a target of -16.0 ± 1 LU, " +
@@ -428,7 +447,7 @@ func TestProcessRejectsFromReports(t *testing.T) {
 		{
 			name: "retry skipped",
 			script: func(s []fakeResponse) []fakeResponse {
-				s[4].stderr = report(verifyInstance, Loudness{LUFS: -17.6, TruePeakDBTP: -6}, Dynamic)
+				s[4].stderr = verification(Loudness{LUFS: -17.6, TruePeakDBTP: -6})
 				return s
 			},
 			want: "aac_64k rendition out of spec: -17.60 LUFS against a target of -16.0 ± 1 LU, " +
@@ -439,7 +458,7 @@ func TestProcessRejectsFromReports(t *testing.T) {
 			name: "retry fails again",
 			script: func([]fakeResponse) []fakeResponse {
 				s := correctiveScript()
-				s[6].stderr = report(verifyInstance, Loudness{LUFS: -17.1, TruePeakDBTP: -5.6}, Dynamic)
+				s[6].stderr = verification(Loudness{LUFS: -17.1, TruePeakDBTP: -5.6})
 				return s
 			},
 			want: "aac_64k rendition out of spec: -17.10 LUFS against a target of -16.0 ± 1 LU, " +
@@ -449,13 +468,13 @@ func TestProcessRejectsFromReports(t *testing.T) {
 		{
 			name: "both renditions out of spec",
 			script: func(s []fakeResponse) []fakeResponse {
-				s[3].stderr = report(verifyInstance, Loudness{LUFS: -14.99, TruePeakDBTP: -3}, Linear)
-				s[4].stderr = report(verifyInstance, Loudness{LUFS: -16, TruePeakDBTP: -1.49}, Linear)
+				s[3].stderr = verification(Loudness{LUFS: -14.99, TruePeakDBTP: -3})
+				s[4].stderr = verification(Loudness{LUFS: -16, TruePeakDBTP: -1.49})
 				return append(s,
 					fakeResponse{stderr: report("loudnorm@stereo", stereoEncoded, Linear)},
-					fakeResponse{stderr: report(verifyInstance, Loudness{LUFS: -17.01, TruePeakDBTP: -4.01}, Linear)},
+					fakeResponse{stderr: verification(Loudness{LUFS: -17.01, TruePeakDBTP: -4.01})},
 					fakeResponse{stderr: report("loudnorm@mono", monoEncoded, Dynamic)},
-					fakeResponse{stderr: report(verifyInstance, Loudness{LUFS: -16.51, TruePeakDBTP: -1.49}, Linear)},
+					fakeResponse{stderr: verification(Loudness{LUFS: -16.51, TruePeakDBTP: -1.49})},
 				)
 			},
 			want: "aac_128k rendition out of spec: -17.01 LUFS against a target of -16.0 ± 1 LU, " +
@@ -490,8 +509,7 @@ func TestProcessRefusesUnusableOffsets(t *testing.T) {
 	for _, offset := range []string{"inf", "-inf", "nan", "99.01", "", "loud"} {
 		t.Run(offset, func(t *testing.T) {
 			script := stereoScript()
-			script[1].stderr = frames(-17.6) + reportWithOffset("loudnorm@stereo", stereoMeasured, Dynamic, offset) +
-				report("loudnorm@mono", monoMeasured, Dynamic)
+			script[1].stderr = measurement(stereoMeasured, monoMeasured, offset, "0.00")
 			run := &fakeRunner{responses: script}
 			_, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs())
 			if err == nil || !strings.Contains(err.Error(), "target_offset") {
@@ -507,8 +525,7 @@ func TestProcessRefusesUnusableOffsets(t *testing.T) {
 	}
 	t.Run("loudnorm's limit", func(t *testing.T) {
 		script := stereoScript()
-		script[1].stderr = frames(-17.6) + reportWithOffset("loudnorm@stereo", stereoMeasured, Dynamic, "-99.00") +
-			report("loudnorm@mono", monoMeasured, Dynamic)
+		script[1].stderr = measurement(stereoMeasured, monoMeasured, "-99.00", "0.00")
 		run := &fakeRunner{responses: script}
 		if _, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs()); err != nil {
 			t.Fatalf("Process() error = %v", err)
@@ -540,6 +557,132 @@ func TestProcessMissingReport(t *testing.T) {
 			}
 			if _, ok := errors.AsType[*Rejection](err); ok {
 				t.Errorf("Process() error = %v, want it not to be a rejection", err)
+			}
+		})
+	}
+}
+
+func TestProcessMissingMomentary(t *testing.T) {
+	tests := []struct {
+		name     string
+		stage    int
+		instance string
+	}{
+		{"pass 1, the source", 1, inputInstance},
+		{"pass 1, the stereo downmix", 1, "ebur128@stereo"},
+		{"pass 1, the mono downmix", 1, "ebur128@mono"},
+		{"verification", 3, verifyMomentaryInstance},
+		{"verification after the re-encode", 6, verifyMomentaryInstance},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			script := correctiveScript()
+			script[tc.stage].stderr = strings.ReplaceAll(script[tc.stage].stderr, "["+tc.instance+" @", "[Parsed_ebur128_0 @")
+			run := &fakeRunner{responses: script}
+			_, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs())
+			if err == nil || !strings.Contains(err.Error(), "no momentary loudness from "+tc.instance) {
+				t.Errorf("Process() error = %v, want no momentary loudness from %s", err, tc.instance)
+			}
+			if _, ok := errors.AsType[*Rejection](err); ok {
+				t.Errorf("Process() error = %v, want it not to be a rejection", err)
+			}
+			if len(run.calls) != tc.stage+1 {
+				t.Errorf("Process() ran %d commands, want it to stop after the one missing its output (%d)",
+					len(run.calls), tc.stage+1)
+			}
+		})
+	}
+}
+
+func TestProcessWarnsOnFlattening(t *testing.T) {
+	// thunder is how the Thunder fixture's mono downmix measured in pass 1.
+	thunder := Loudness{LUFS: -38.85, TruePeakDBTP: -1.26, LRALU: 0.1, ThresholdLUFS: -48.85, MaxMomentaryLUFS: -24.6}
+	encoded := func(lufs, maxMomentary float64) Loudness {
+		return Loudness{LUFS: lufs, TruePeakDBTP: -2.99, LRALU: 0.5, ThresholdLUFS: lufs - 10, MaxMomentaryLUFS: maxMomentary}
+	}
+	short := func(maxMomentary float64) Loudness {
+		return Loudness{LUFS: -17.3, TruePeakDBTP: -6.79, LRALU: 0.4, ThresholdLUFS: -27.3, MaxMomentaryLUFS: maxMomentary}
+	}
+	tests := []struct {
+		name string
+		// measured is the mono downmix in pass 1, and mode what pass 2 reports for it, also when re-encoding.
+		measured Loudness
+		mode     Normalization
+		// first is the 64k rendition's first verification, and corrected the one after its re-encode, if any.
+		first     Loudness
+		corrected *Loudness
+		want      []Warning
+	}{
+		{
+			name:     "dynamic, flattened by 13.82 LU",
+			measured: thunder, mode: Dynamic, first: encoded(-15.83, -15.4),
+			want: []Warning{WarningDynamicNormalization},
+		},
+		{
+			name:     "dynamic, flattened by 6.01 LU",
+			measured: Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7, MaxMomentaryLUFS: -14.6},
+			mode:     Dynamic, first: encoded(-15.89, -15.8),
+			want: []Warning{WarningDynamicNormalization},
+		},
+		{
+			// In float64 the difference comes out a little over 6.
+			name:     "dynamic, flattened by exactly 6 LU",
+			measured: Loudness{LUFS: -24, TruePeakDBTP: -10.59, LRALU: 0.1, ThresholdLUFS: -34, MaxMomentaryLUFS: -17.9},
+			mode:     Dynamic, first: encoded(-15.5, -15.4),
+		},
+		{
+			name:     "dynamic, flattened by 5.99 LU",
+			measured: Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7, MaxMomentaryLUFS: -14.6},
+			mode:     Dynamic, first: encoded(-15.91, -15.8),
+		},
+		{
+			name:     "dynamic, not flattened",
+			measured: monoMeasured, mode: Dynamic, first: monoEncoded,
+		},
+		{
+			name:     "linear, flattened by 13.82 LU",
+			measured: thunder, mode: Linear, first: encoded(-15.83, -15.4),
+		},
+		{
+			name:     "flattened only by the corrective re-encode",
+			measured: Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7, MaxMomentaryLUFS: -14.6},
+			mode:     Dynamic, first: short(-17.0), corrected: new(encoded(-15.98, -15.9)),
+			want: []Warning{WarningDynamicNormalization},
+		},
+		{
+			name:     "flattened only before the corrective re-encode",
+			measured: Loudness{LUFS: -20.7, TruePeakDBTP: -6.59, LRALU: 0.1, ThresholdLUFS: -30.7, MaxMomentaryLUFS: -14.6},
+			mode:     Dynamic, first: short(-17.3), corrected: new(encoded(-15.98, -15.6)),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			script := []fakeResponse{
+				{stdout: probeJSON(2, "10.000000")},
+				{stderr: measurement(stereoMeasured, tc.measured, "-0.31", "0.07")},
+				{stderr: report("loudnorm@mono", monoEncoded, tc.mode) + report("loudnorm@stereo", stereoEncoded, Linear)},
+				{stderr: verification(stereoEncoded)},
+				{stderr: verification(tc.first)},
+			}
+			if tc.corrected != nil {
+				script = append(script,
+					fakeResponse{stderr: report("loudnorm@mono", monoEncoded, tc.mode)},
+					fakeResponse{stderr: verification(*tc.corrected)},
+				)
+			}
+			run := &fakeRunner{responses: script}
+			res, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs())
+			if err != nil {
+				t.Fatalf("Process() error = %v", err)
+			}
+			if len(run.responses) != 0 {
+				t.Fatalf("Process() left %d commands unrun", len(run.responses))
+			}
+			if r := res.Renditions[1]; r.Measured != tc.measured || r.Normalization != tc.mode {
+				t.Errorf("aac_64k measured %+v and rendered %s, want %+v and %s", r.Measured, r.Normalization, tc.measured, tc.mode)
+			}
+			if !slices.Equal(res.Warnings, tc.want) {
+				t.Errorf("Warnings = %v, want %v", res.Warnings, tc.want)
 			}
 		})
 	}
@@ -787,7 +930,17 @@ func TestMeasuredLRA(t *testing.T) {
 }
 
 func TestWarnings(t *testing.T) {
-	linear := []Rendition{{Normalization: Linear}, {Normalization: Linear}}
+	// rendition is rendered in mode from a downmix whose loudest moment stood measuredAbove LU above its
+	// integrated loudness of -20.7 LUFS, and its loudest moment stands encodedAbove LU above -16.
+	rendition := func(mode Normalization, measuredAbove, encodedAbove float64) Rendition {
+		return Rendition{
+			Measured:      Loudness{LUFS: -20.7, MaxMomentaryLUFS: -20.7 + measuredAbove},
+			Normalization: mode,
+			Loudness:      Loudness{LUFS: -16, MaxMomentaryLUFS: -16 + encodedAbove},
+		}
+	}
+	steady := rendition(Dynamic, 0.1, 0.45)
+	linear := []Rendition{rendition(Linear, 0.1, 0.2), rendition(Linear, 0.1, 0.45)}
 	tests := []struct {
 		name       string
 		in         Input
@@ -798,13 +951,32 @@ func TestWarnings(t *testing.T) {
 		{"momentary exactly 10 LU above", Input{LUFS: -38.7, TruePeakDBTP: -3, MaxMomentaryLUFS: -28.7}, linear, nil},
 		{"momentary just over 10 LU above", Input{LUFS: -38.7, TruePeakDBTP: -3, MaxMomentaryLUFS: -28.6}, linear,
 			[]Warning{WarningSuddenLoudEvent}},
-		{"one dynamic rendition", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
-			[]Rendition{{Normalization: Linear}, {Normalization: Dynamic}}, []Warning{WarningDynamicNormalization}},
+		{"dynamic, not flattened", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{linear[0], steady}, nil},
+		{"dynamic, flattened by 6.01 LU", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{linear[0], rendition(Dynamic, 6.1, 0.09)}, []Warning{WarningDynamicNormalization}},
+		{"dynamic, flattened by 6 LU", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{linear[0], rendition(Dynamic, 6.1, 0.1)}, nil},
+		{
+			// In float64 the difference comes out a little over 6.
+			"dynamic, flattened by exactly 6 LU in float64", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{linear[0], {
+				Measured:      Loudness{LUFS: -24, MaxMomentaryLUFS: -17.9},
+				Normalization: Dynamic,
+				Loudness:      Loudness{LUFS: -15.5, MaxMomentaryLUFS: -15.4},
+			}}, nil,
+		},
+		{"linear, flattened by 14 LU", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{rendition(Linear, 14.2, 0.2), steady}, nil},
+		{"the first of two flattened", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{rendition(Dynamic, 14.2, 0.2), steady}, []Warning{WarningDynamicNormalization}},
+		{"both flattened", Input{LUFS: -20, TruePeakDBTP: -3, MaxMomentaryLUFS: -15},
+			[]Rendition{rendition(Dynamic, 14.2, 0.2), rendition(Dynamic, 14.2, 0.4)}, []Warning{WarningDynamicNormalization}},
 		{"peak exactly -0.5", Input{LUFS: -20, TruePeakDBTP: -0.5, MaxMomentaryLUFS: -15}, linear, nil},
 		{"peak above -0.5", Input{LUFS: -20, TruePeakDBTP: -0.49, MaxMomentaryLUFS: -15}, linear,
 			[]Warning{WarningSourceMayClip}},
 		{"all", Input{LUFS: -38.7, TruePeakDBTP: 0.2, MaxMomentaryLUFS: -24.3},
-			[]Rendition{{Normalization: Dynamic}, {Normalization: Dynamic}},
+			[]Rendition{rendition(Dynamic, 14.2, 0.2), rendition(Dynamic, 14.2, 0.4)},
 			[]Warning{WarningSuddenLoudEvent, WarningDynamicNormalization, WarningSourceMayClip}},
 	}
 	for _, tc := range tests {

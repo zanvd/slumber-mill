@@ -10,23 +10,20 @@ import (
 )
 
 // ffmpegLog reads ffmpeg's stderr as it streams and keeps what named filter instances report:
-// each loudnorm's JSON block, and the highest momentary loudness the ebur128 instance logs.
+// each loudnorm's JSON block, and the highest momentary loudness each ebur128 logs.
 // Callers check ffmpeg's exit status before reading any of it: an interrupted ffmpeg still prints reports.
 type ffmpegLog struct {
-	lines   lineWriter
-	ebur128 string
+	lines lineWriter
 
 	collecting string
 	block      []string
 	reports    map[string]string
 
-	momentary        bool
-	maxMomentaryLUFS float64
+	maxMomentaryLUFS map[string]float64
 }
 
-// newFFmpegLog returns a log that also follows the ebur128 instance with the given name, if it isn't empty.
-func newFFmpegLog(ebur128 string) *ffmpegLog {
-	l := &ffmpegLog{ebur128: ebur128, reports: map[string]string{}}
+func newFFmpegLog() *ffmpegLog {
+	l := &ffmpegLog{reports: map[string]string{}, maxMomentaryLUFS: map[string]float64{}}
 	l.lines.fn = l.line
 	return l
 }
@@ -44,8 +41,8 @@ func (l *ffmpegLog) line(s string) {
 		switch {
 		case strings.HasPrefix(name, "loudnorm@") && rest == "":
 			l.collecting, l.block = name, l.block[:0]
-		case l.ebur128 != "" && name == l.ebur128 && strings.HasPrefix(rest, "t:"):
-			l.frame(rest)
+		case strings.HasPrefix(name, "ebur128@") && strings.HasPrefix(rest, "t:"):
+			l.frame(name, rest)
 		}
 		return
 	}
@@ -76,7 +73,7 @@ func cutInstance(s string) (name, rest string, ok bool) {
 }
 
 // frame reads the momentary loudness from one of ebur128's frame lines, "t: 0.1 TARGET:-23 LUFS M:-120.7 S:...".
-func (l *ffmpegLog) frame(rest string) {
+func (l *ffmpegLog) frame(name, rest string) {
 	_, after, ok := strings.Cut(rest, " M:")
 	if !ok {
 		return
@@ -86,16 +83,17 @@ func (l *ffmpegLog) frame(rest string) {
 	if err != nil {
 		return
 	}
-	if !l.momentary || m > l.maxMomentaryLUFS {
-		l.momentary, l.maxMomentaryLUFS = true, m
+	if highest, ok := l.maxMomentaryLUFS[name]; !ok || m > highest {
+		l.maxMomentaryLUFS[name] = m
 	}
 }
 
-func (l *ffmpegLog) maxMomentary() (float64, error) {
-	if !l.momentary {
-		return 0, fmt.Errorf("error reading ffmpeg's output: no momentary loudness from %s", l.ebur128)
+func (l *ffmpegLog) maxMomentary(name string) (float64, error) {
+	m, ok := l.maxMomentaryLUFS[name]
+	if !ok {
+		return 0, fmt.Errorf("error reading ffmpeg's output: no momentary loudness from %s", name)
 	}
-	return l.maxMomentaryLUFS, nil
+	return m, nil
 }
 
 type loudnormReport struct {

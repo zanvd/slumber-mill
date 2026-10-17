@@ -290,7 +290,8 @@ Each with its trade-off.
   -1.5 dBTP, or the asset is rejected with the numbers. A rendition that misses gets one corrective re-encode with a
   small gain (at most 1.5 dB), logged as a warning, before it's rejected. Each rendition stores its own figures.
   `loudnorm` can silently fall back to dynamic mode, which lifts a quiet rain bed when a thunder crack arrives,
-  so the pool predicts the mode and publishes a `dynamic_normalization` warning. It also warns about
+  so the pool publishes a `dynamic_normalization` warning when dynamic mode flattened the file's loud moments
+  by more than 6 LU. It also warns about
   `sudden_loud_event` (max momentary loudness more than 10 LU above integrated) and `source_may_clip`.
   Silent and shorter-than-3-second files are rejected. The cost is CPU: two measurement passes, a render and a
   verification pass per upload.

@@ -8,14 +8,24 @@ import (
 
 // pass1Stderr is trimmed from a real pass 1 on the uncorrelated pink fixture, without the trailing spaces
 // ffmpeg prints after a prefix that starts a multi-line message (withTrailingSpaces puts them back).
-// loudnorm prints its reports while the graph is freed, so mono comes before stereo.
+// The ebur128 instances log their frames interleaved; the stereo downmix's frame at 1.5 s is left out,
+// so each instance's loudest frame differs. loudnorm prints its reports while the graph is freed,
+// so mono comes before stereo.
 const pass1Stderr = `[aist#0:0/pcm_s16le @ 0x55b9c1bcae40] Guessed Channel Layout: stereo
 Input #0, wav, from 'up.wav':
   Duration: 00:00:10.00, bitrate: 1536 kb/s
   Stream #0:0: Audio: pcm_s16le ([1][0][0][0] / 0x0001), 48000 Hz, 2 channels, s16, 1536 kb/s
-[ebur128@input @ 0x55b9c1b6c680] t: 0.0999948  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU
-[ebur128@input @ 0x55b9c1b6c680] t: 0.399995   TARGET:-23 LUFS    M: -17.6 S:-120.7     I: -17.6 LUFS       LRA:   0.0 LU
-[ebur128@input @ 0x55b9c1b6c680] t: 0.499995   TARGET:-23 LUFS    M: -17.8 S:-120.7     I: -17.7 LUFS       LRA:   0.0 LU
+[ebur128@input @ 0x5635cb52cac0] t: 0.0999948  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU
+[ebur128@stereo @ 0x5635cb52d740] t: 0.0999948  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU
+[ebur128@mono @ 0x5635cb561c00] t: 0.0999948  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:   0.0 LU
+[ebur128@input @ 0x5635cb52cac0] t: 0.399995   TARGET:-23 LUFS    M: -17.7 S:-120.7     I: -17.7 LUFS       LRA:   0.0 LU
+[ebur128@stereo @ 0x5635cb52d740] t: 0.399995   TARGET:-23 LUFS    M: -17.7 S:-120.7     I: -17.7 LUFS       LRA:   0.0 LU
+[ebur128@mono @ 0x5635cb561c00] t: 0.399995   TARGET:-23 LUFS    M: -20.7 S:-120.7     I: -20.7 LUFS       LRA:   0.0 LU
+[ebur128@input @ 0x5635cb52cac0] t: 0.499995   TARGET:-23 LUFS    M: -17.8 S:-120.7     I: -17.7 LUFS       LRA:   0.0 LU
+[ebur128@stereo @ 0x5635cb52d740] t: 0.499995   TARGET:-23 LUFS    M: -17.8 S:-120.7     I: -17.7 LUFS       LRA:   0.0 LU
+[ebur128@mono @ 0x5635cb561c00] t: 0.499995   TARGET:-23 LUFS    M: -20.8 S:-120.7     I: -20.7 LUFS       LRA:   0.0 LU
+[ebur128@input @ 0x5635cb52cac0] t: 1.49999    TARGET:-23 LUFS    M: -17.6 S:-120.7     I: -17.7 LUFS       LRA:   0.0 LU
+[ebur128@mono @ 0x5635cb561c00] t: 1.49999    TARGET:-23 LUFS    M: -20.6 S:-120.7     I: -20.7 LUFS       LRA:   0.0 LU
 [out#0/null @ 0x55b9c1b9c880] video:0kB audio:7500kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: unknown
 size=N/A time=00:00:07.10 bitrate=N/A speed=12.7x
 [ebur128@input @ 0x55b9c1b6c680] Summary:
@@ -36,6 +46,11 @@ size=N/A time=00:00:07.10 bitrate=N/A speed=12.7x
 	"normalization_type" : "dynamic",
 	"target_offset" : "0.07"
 }
+[ebur128@mono @ 0x5635cb561c00] Summary:
+
+  Integrated loudness:
+    I:         -20.7 LUFS
+    Threshold: -30.7 LUFS
 [loudnorm@stereo @ 0x55b9c1b6d0c0]
 {
 	"input_i" : "-17.69",
@@ -49,10 +64,15 @@ size=N/A time=00:00:07.10 bitrate=N/A speed=12.7x
 	"normalization_type" : "linear",
 	"target_offset" : "-0.00"
 }
+[ebur128@stereo @ 0x5635cb52d740] Summary:
+
+  Integrated loudness:
+    I:         -17.7 LUFS
+    Threshold: -27.7 LUFS
 `
 
-func parseLog(ebur128, stderr string, chunk int) *ffmpegLog {
-	l := newFFmpegLog(ebur128)
+func parseLog(stderr string, chunk int) *ffmpegLog {
+	l := newFFmpegLog()
 	for len(stderr) > 0 {
 		n := min(chunk, len(stderr))
 		l.Write([]byte(stderr[:n]))
@@ -83,7 +103,7 @@ func TestFFmpegLogReadsReportsByName(t *testing.T) {
 	}
 	for _, chunk := range chunks {
 		t.Run(chunk.name, func(t *testing.T) {
-			l := parseLog(inputInstance, withTrailingSpaces(pass1Stderr), chunk.size)
+			l := parseLog(withTrailingSpaces(pass1Stderr), chunk.size)
 			for _, want := range reports {
 				t.Run(want.instance, func(t *testing.T) {
 					m, report, err := l.loudnorm(want.instance)
@@ -96,8 +116,17 @@ func TestFFmpegLogReadsReportsByName(t *testing.T) {
 					}
 				})
 			}
-			if got, err := l.maxMomentary(); err != nil || got != -17.6 {
-				t.Errorf("maxMomentary() = %v, %v, want -17.6", got, err)
+			for _, want := range []struct {
+				instance string
+				lufs     float64
+			}{
+				{inputInstance, -17.6},
+				{"ebur128@stereo", -17.7},
+				{"ebur128@mono", -20.6},
+			} {
+				if got, err := l.maxMomentary(want.instance); err != nil || got != want.lufs {
+					t.Errorf("maxMomentary(%q) = %v, %v, want %v", want.instance, got, err, want.lufs)
+				}
 			}
 		})
 	}
@@ -114,7 +143,7 @@ func TestFFmpegLogReadsSilence(t *testing.T) {
 	"target_offset" : "inf"
 }
 `
-	m, _, err := parseLog("", withTrailingSpaces(stderr), 64).loudnorm("loudnorm@stereo")
+	m, _, err := parseLog(withTrailingSpaces(stderr), 64).loudnorm("loudnorm@stereo")
 	if err != nil {
 		t.Fatalf("loudnorm() error = %v", err)
 	}
@@ -142,7 +171,7 @@ func TestFFmpegLogRefusesBadReports(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if m, _, err := parseLog("", tc.stderr, 5).loudnorm("loudnorm@stereo"); err == nil {
+			if m, _, err := parseLog(tc.stderr, 5).loudnorm("loudnorm@stereo"); err == nil {
 				t.Errorf("loudnorm() = %+v, want an error", m)
 			}
 		})
@@ -151,23 +180,27 @@ func TestFFmpegLogRefusesBadReports(t *testing.T) {
 
 func TestFFmpegLogMomentary(t *testing.T) {
 	tests := []struct {
-		name    string
-		ebur128 string
-		stderr  string
-		want    float64
-		wantErr bool
+		name     string
+		instance string
+		stderr   string
+		want     float64
+		wantErr  bool
 	}{
 		{"highest", inputInstance, pass1Stderr, -17.6, false},
+		{"stereo downmix", "ebur128@stereo", pass1Stderr, -17.7, false},
+		{"mono downmix", "ebur128@mono", pass1Stderr, -20.6, false},
 		{"silence", inputInstance, "[ebur128@input @ 0x1] t: 0.1 TARGET:-23 LUFS M:-120.7 S:-120.7\n", -120.7, false},
 		{"another instance", "ebur128@other", pass1Stderr, 0, true},
+		{"an unnamed instance", "Parsed_ebur128_0",
+			"[Parsed_ebur128_0 @ 0x1] t: 0.1 TARGET:-23 LUFS M: -20.0 S:-120.7\n", 0, true},
 		{"no frames", inputInstance, "[ebur128@input @ 0x1] Summary:\n", 0, true},
 		{"unreadable frames", inputInstance, "[ebur128@input @ 0x1] t: 0.1 M:loud\n[ebur128@input @ 0x1] t: 0.2\n", 0, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseLog(tc.ebur128, tc.stderr, 3).maxMomentary()
+			got, err := parseLog(tc.stderr, 3).maxMomentary(tc.instance)
 			if (err != nil) != tc.wantErr || got != tc.want {
-				t.Errorf("maxMomentary() = %v, %v, want %v and an error: %t", got, err, tc.want, tc.wantErr)
+				t.Errorf("maxMomentary(%q) = %v, %v, want %v and an error: %t", tc.instance, got, err, tc.want, tc.wantErr)
 			}
 		})
 	}

@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	inputInstance  = "ebur128@input"
-	sourceInstance = "loudnorm@source"
-	verifyInstance = "loudnorm@verify"
+	inputInstance           = "ebur128@input"
+	sourceInstance          = "loudnorm@source"
+	verifyInstance          = "loudnorm@verify"
+	verifyMomentaryInstance = "ebur128@verify"
 	// ffprobeInvalid is ffprobe's exit status when it can't read the input.
 	ffprobeInvalid = 1
 	// maxOffsetLU is the largest gain offset loudnorm accepts.
@@ -191,13 +192,13 @@ func (f *FFmpeg) probe(ctx context.Context, src string) (Source, error) {
 	return Source{Codec: stream.CodecName, SampleRate: sampleRate, Channels: stream.Channels, Duration: duration}, nil
 }
 
-// measure runs pass 1: ebur128 on the source as it is, for its momentary loudness, and loudnorm on each
-// layout's downmix and on the source as it is, unless one of the layouts already is.
+// measure runs pass 1: ebur128 on the source as it is and on each layout's downmix, for their momentary loudness,
+// and loudnorm on each layout's downmix and on the source as it is, unless one of the layouts already is.
 // It returns each layout's measurement and the target offset its loudnorm reported, for pass 2.
 func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetLUFS float64, layouts []layout,
 ) (Input, []Loudness, []float64, error) {
 	native := slices.IndexFunc(layouts, func(l layout) bool { return l.channels == source.Channels })
-	log := newFFmpegLog(inputInstance)
+	log := newFFmpegLog()
 	err := f.run.Run(ctx, "ffmpeg", measureArgs(src, targetLUFS, layouts, native < 0), nil, log)
 	log.flush()
 	if err != nil {
@@ -219,6 +220,9 @@ func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetL
 			return Input{}, nil, nil, fmt.Errorf("error reading the report from %s: target_offset %q is unusable",
 				loudnormInstance(l), report.TargetOffset)
 		}
+		if m.MaxMomentaryLUFS, err = log.maxMomentary(ebur128Instance(l)); err != nil {
+			return Input{}, nil, nil, err
+		}
 		measured[i], offsets[i] = m, offset
 	}
 	var in Loudness
@@ -227,7 +231,7 @@ func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetL
 	} else if in, _, err = log.loudnorm(sourceInstance); err != nil {
 		return Input{}, nil, nil, err
 	}
-	maxMomentary, err := log.maxMomentary()
+	maxMomentary, err := log.maxMomentary(inputInstance)
 	if err != nil {
 		return Input{}, nil, nil, err
 	}
@@ -239,7 +243,7 @@ func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetL
 func (f *FFmpeg) render(ctx context.Context, src string, targetLUFS float64, layouts []layout,
 	measured []Loudness, offsets []float64, gainDB float64, outputs []Output,
 ) ([]Normalization, error) {
-	log := newFFmpegLog("")
+	log := newFFmpegLog()
 	err := f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, offsets, gainDB, outputs), nil, log)
 	log.flush()
 	if err != nil {
@@ -288,17 +292,25 @@ func (f *FFmpeg) correct(ctx context.Context, src string, targetLUFS float64, l 
 
 // verify measures an encoded rendition as it is.
 func (f *FFmpeg) verify(ctx context.Context, path string, targetLUFS float64) (Loudness, error) {
-	log := newFFmpegLog("")
+	log := newFFmpegLog()
 	err := f.run.Run(ctx, "ffmpeg", verifyArgs(path, targetLUFS), nil, log)
 	log.flush()
 	if err != nil {
 		return Loudness{}, err
 	}
 	m, _, err := log.loudnorm(verifyInstance)
-	return m, err
+	if err != nil {
+		return Loudness{}, err
+	}
+	if m.MaxMomentaryLUFS, err = log.maxMomentary(verifyMomentaryInstance); err != nil {
+		return Loudness{}, err
+	}
+	return m, nil
 }
 
 func loudnormInstance(l layout) string { return "loudnorm@" + l.name }
+
+func ebur128Instance(l layout) string { return "ebur128@" + l.name }
 
 // inputOptions let ffmpeg and ffprobe open an input only as a local file in one of the allowed containers.
 // They apply to the input that follows them; after it they would be ignored.
@@ -335,8 +347,8 @@ func measureArgs(src string, targetLUFS float64, layouts []layout, measureSource
 		fmt.Fprintf(&graph, "[p%d]", i)
 	}
 	for i, l := range layouts {
-		fmt.Fprintf(&graph, ";[p%d]aformat=channel_layouts=%s,%s=%s:print_format=json[m%d]",
-			i, l.name, loudnormInstance(l), loudnormTargets(targetLUFS), i)
+		fmt.Fprintf(&graph, ";[p%d]aformat=channel_layouts=%s,%s=framelog=info,%s=%s:print_format=json[m%d]",
+			i, l.name, ebur128Instance(l), loudnormInstance(l), loudnormTargets(targetLUFS), i)
 	}
 	if measureSource {
 		fmt.Fprintf(&graph, ";[p%d]%s=%s:print_format=json[m%d]",
@@ -388,7 +400,8 @@ func renderArgs(src string, targetLUFS float64, layouts []layout, measured []Lou
 }
 
 func verifyArgs(path string, targetLUFS float64) []string {
-	graph := fmt.Sprintf("[0:a:0]%s=%s:print_format=json[v]", verifyInstance, loudnormTargets(targetLUFS))
+	graph := fmt.Sprintf("[0:a:0]%s=framelog=info,%s=%s:print_format=json[v]",
+		verifyMomentaryInstance, verifyInstance, loudnormTargets(targetLUFS))
 	return append(ffmpegArgs(path), "-filter_complex", graph, "-map", "[v]", "-f", "null", "-")
 }
 
