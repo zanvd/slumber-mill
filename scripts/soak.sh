@@ -45,6 +45,7 @@ results=()
 follower=
 webhook_kills=0
 idle_kills=0
+uploads_end=0
 
 compose() {
   docker compose --project-directory "$root" -p "$project" --progress quiet \
@@ -163,14 +164,11 @@ prepare() {
   wait_for "the driver to start uploading" 600 logged soak "soak: uploading"
 }
 
-# delivery_in_flight HOSTNAME succeeds when the webhook worker with that hostname has held a delivery for 2 to 10
-# seconds. The receiver answers an immediate status or after 2-4 seconds, except that some events hang until the
-# client's 15 second timeout, so a delivery held this long is almost always a hanging one, which a SIGKILL a second
-# or two later is sure to catch in flight. It can't be a 410, which the receiver answers at once.
+# delivery_in_flight HOSTNAME succeeds when that webhook worker holds a delivery the receiver is hanging on.
 delivery_in_flight() {
   local n
   n=$(sql "SELECT COUNT(*) FROM webhook_deliveries WHERE state = 'sending' AND locked_by LIKE '$1:%' \
-AND updated_at BETWEEN NOW(6) - INTERVAL 10 SECOND AND NOW(6) - INTERVAL 2 SECOND") || return 1
+AND updated_at BETWEEN NOW(6) - INTERVAL 12 SECOND AND NOW(6) - INTERVAL 5 SECOND") || return 1
   ((n > 0))
 }
 
@@ -178,12 +176,17 @@ AND updated_at BETWEEN NOW(6) - INTERVAL 10 SECOND AND NOW(6) - INTERVAL 2 SECON
 # flight stays leased until a reaper requeues it, and a webhook worker holding the relay lock loses it with its
 # session. A webhook worker is killed only once it has a delivery in flight, so that the kill leaves one to reap.
 crash() {
-  local cid st
+  local cid st waited=$EPOCHSECONDS patience=$((uploads_end - EPOCHSECONDS))
   cid=$(containers "$1" | sed -n "${2}p")
   if [[ $1 == worker-webhook ]]; then
     webhook_kills=$((webhook_kills + 1))
-    wait_for "$(name "$cid") to hold a delivery" 180 delivery_in_flight "$(docker inspect -f '{{.Config.Hostname}}' "$cid")" ||
+    ((patience > 180)) && patience=180
+    if wait_for "$(name "$cid") to hold a delivery" "$patience" delivery_in_flight \
+      "$(docker inspect -f '{{.Config.Hostname}}' "$cid")"; then
+      log "chaos: $(name "$cid") held a delivery after $((EPOCHSECONDS - waited))s"
+    else
       idle_kills=$((idle_kills + 1))
+    fi
   fi
   log "chaos: SIGKILL $(name "$cid")"
   docker kill -s KILL "$cid" >/dev/null
@@ -226,6 +229,7 @@ check_exit() {
 # chaos injects a failure every chaos_every seconds until the driver's uploads have run for their duration.
 chaos() {
   local until=$(($1 + $(seconds "$SLUMBER_MILL_SOAK_DURATION"))) actions i=0
+  uploads_end=$until
   actions=("crash worker-encode 1" "crash worker-webhook 1" "stop api 1" "crash worker-encode 2"
     "stop worker-webhook 2" "crash worker-webhook 2" "stop worker-webhook 1")
   RANDOM=1
