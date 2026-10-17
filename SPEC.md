@@ -442,12 +442,20 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 
 ## 7. Audio processing (encode pool)
 
-Three attempts, backoff from 30 s to 10 min, a 4 h timeout.
-Under `cpus: 2` one stereo encode took about 93 s per 10 minutes of audio on a warm 10-minute file
+Three attempts, backoff from 30 s to 10 min, a 5 h timeout.
+Under `cpus: 2` the prototype's stereo encode took about 93 s per 10 minutes of audio on a warm 10-minute file
 and 119 s on a 60-minute file; with two 60-minute encodes sharing two cores, 126 s and 151 s
-(about 160–175 s while fully overlapped), so a 10-hour soundscape needs roughly 2–3 hours (pitfall 23),
-and size the timeout, the lease and the pool's CPU limit with that in mind.
-A corrective re-encode (step 6) adds about 20–32 s per 10 minutes for the rendition it corrects.
+(about 160–175 s while fully overlapped; pitfall 23).
+Measured on the implementation under `cpus: 2`, with stereo pink noise at −23 LUFS:
+one encode alone took about 104 s per 10 minutes at 60 minutes and 102 s at 120 minutes, so the rate is flat with length,
+and two 60-minute encodes together about 149 s per 10 minutes each.
+A corrective re-encode (step 6) added, alone, 35 s per 10 minutes for the 128k stereo rendition and 21 s for the 64k mono one,
+and 51 s and 29 s overlapped with another encode; about 60% of that is the verify pass.
+For a 10-hour source with two encodes overlapping, that projects to about 2.5 h with no correction,
+3.0 h with the 64k corrected, 3.3 h with the 128k corrected and 3.8 h with both,
+and about 4.0 h with the 128k corrected under heavy host contention.
+That is why the timeout is 5 h and sources over 10 h are rejected (step 2).
+Size the lease and the pool's CPU limit with that in mind.
 
 ### Steps
 
@@ -455,7 +463,8 @@ A corrective re-encode (step 6) adds about 20–32 s per 10 minutes for the rend
 2. **Probe** the source, with the input whitelists from "ffmpeg execution":
    `ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json`.
    A missing file is retryable (a storage blip). A file ffprobe can't parse or may not open, or with no audio stream,
-   is a **rejection** ("not audio"); so is anything **shorter than 3 s** ("too short", pitfall 20).
+   is a **rejection** ("not audio"); so is anything **shorter than 3 s** ("too short", pitfall 20)
+   or **longer than 10 h** ("too long: the limit is 10 hours"), before any loudness pass.
 3. **Measure each output layout (pass 1).** For every distinct channel layout among the profiles,
    measure the downmixed signal: `-af aformat=channel_layouts=<layout>,loudnorm=...:print_format=json` (pitfall 15).
    Run `ebur128` once on the source for max momentary loudness, and once on each layout's downmix.
@@ -964,7 +973,8 @@ What the tests must show:
   high-shelved white noise misses the target in its first 64k encode and passes after the corrective re-encode,
   and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers;
   a target louder than −16 LUFS is a rejection before ffmpeg runs; a text file is "not audio",
-  a missing file is retryable, clips of 0.3 s and 2 s are "too short", and the thunder fixture is predicted dynamic
+  a missing file is retryable, clips of 0.3 s and 2 s are "too short", a source just over 10 h is "too long"
+  at the probe and one of exactly 10 h is accepted, and the thunder fixture is predicted dynamic
   and warned about; `dynamic_normalization` fires for the thunder fixture and not for steady pink noise
   rendered dynamic; a non-zero ffmpeg exit is an error even when a report was printed.
 - **Webhooks:** verification accepts rotation and rejects tampering, a wrong secret,

@@ -100,6 +100,28 @@ func Silence(tb testing.TB) string {
 		"-t", seconds(noiseDuration))
 }
 
+// LongWAV is d of 1 Hz 8-bit mono silence in a WAV file, which ffprobe reads like any other WAV file
+// but takes a few dozen kilobytes per ten hours.
+func LongWAV(tb testing.TB, d time.Duration) string {
+	tb.Helper()
+	const rate = 1
+	size := uint32(d.Seconds() * rate)
+	h := []byte("RIFF")
+	h = binary.LittleEndian.AppendUint32(h, 36+size)
+	h = append(h, "WAVEfmt "...)
+	h = binary.LittleEndian.AppendUint32(h, 16)
+	h = binary.LittleEndian.AppendUint16(h, 1)
+	h = binary.LittleEndian.AppendUint16(h, 1)
+	h = binary.LittleEndian.AppendUint32(h, rate)
+	h = binary.LittleEndian.AppendUint32(h, rate)
+	h = binary.LittleEndian.AppendUint16(h, 1)
+	h = binary.LittleEndian.AppendUint16(h, 8)
+	h = append(h, "data"...)
+	h = binary.LittleEndian.AppendUint32(h, size)
+	silence := slices.Repeat([]byte{0x80}, int(size))
+	return writeFixture(tb, filepath.Join(tb.TempDir(), "long.wav"), string(append(h, silence...)))
+}
+
 // NotAudio is a text file named like a WAV file.
 func NotAudio(tb testing.TB) string {
 	tb.Helper()
