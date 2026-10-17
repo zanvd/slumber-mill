@@ -34,6 +34,24 @@ func TestPermanent(t *testing.T) {
 	}
 }
 
+func TestLeaseLost(t *testing.T) {
+	if err := LeaseLost(nil); err != nil {
+		t.Errorf("LeaseLost(nil) = %v, want nil", err)
+	}
+
+	cause := errors.New("lease lost on delivery 7")
+	err := fmt.Errorf("error extending: %w", LeaseLost(cause))
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("errors.Is(%v, ErrLeaseLost) = false, want true", err)
+	}
+	if got, want := LeaseLost(cause).Error(), cause.Error(); got != want {
+		t.Errorf("LeaseLost(cause).Error() = %q, want %q", got, want)
+	}
+	if IsPermanent(LeaseLost(cause)) {
+		t.Error("a lost lease is permanent")
+	}
+}
+
 func TestPermanentKeepsTheCause(t *testing.T) {
 	cause := errors.New("not audio")
 	err := Permanent(cause)

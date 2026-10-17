@@ -394,15 +394,10 @@ func (d *Deliverer) DeleteDelivered(ctx context.Context, age time.Duration) (del
 // toWorker passes on a repository error, matching worker.ErrLeaseLost if the lease was lost.
 func toWorker(err error) error {
 	if errors.Is(err, errLeaseLost) {
-		return &leaseLostError{err: err}
+		return worker.LeaseLost(err)
 	}
 	return err
 }
-
-type leaseLostError struct{ err error }
-
-func (e *leaseLostError) Error() string { return e.err.Error() }
-func (e *leaseLostError) Unwrap() error { return worker.ErrLeaseLost }
 
 func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)
