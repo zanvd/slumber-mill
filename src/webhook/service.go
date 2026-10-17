@@ -97,8 +97,7 @@ type Relay struct {
 	events  eventSource
 	tenants webhookTenants
 	// lock is nil unless this relay holds the relay lock.
-	lock relayLock
-	// whileHeld runs in Run for as long as the relay holds the lock. It is nil unless set by WhileHeld.
+	lock      relayLock
 	whileHeld func(ctx context.Context)
 }
 
@@ -114,9 +113,8 @@ func NewRelay(r relayRepo, events eventSource, tenants webhookTenants) (*Relay, 
 	return &Relay{repo: r, events: events, tenants: tenants}, nil
 }
 
-// WhileHeld sets f to run in its own goroutine from the moment Run finds the relay holding the lock until the lock
-// is lost or Run stops, when f's context is cancelled and Run waits for f to return. f starts afresh each time
-// the lock is taken. Call it before Run.
+// WhileHeld sets f to run in Run, in its own goroutine, for as long as the relay holds the lock.
+// Call it before Run.
 func (r *Relay) WhileHeld(f func(ctx context.Context)) {
 	r.whileHeld = f
 }
@@ -147,13 +145,11 @@ func (r *Relay) Run(ctx context.Context) {
 	}
 }
 
-// heldTask is a function running in a goroutine of its own that can be stopped.
 type heldTask struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-// start runs f unless f is nil or a previous start is still running.
 func (h *heldTask) start(ctx context.Context, f func(ctx context.Context)) {
 	if f == nil || h.cancel != nil {
 		return
@@ -167,7 +163,6 @@ func (h *heldTask) start(ctx context.Context, f func(ctx context.Context)) {
 	}()
 }
 
-// stop cancels the function's context and waits for it to return. It does nothing if none is running.
 func (h *heldTask) stop() {
 	if h.cancel == nil {
 		return

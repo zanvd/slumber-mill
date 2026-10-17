@@ -557,9 +557,6 @@ func TestRelayRunLogsFailures(t *testing.T) {
 	})
 }
 
-// TestRelayWhileHeld runs the function given to WhileHeld only while the relay holds the lock: it starts when the lock
-// is taken, ends when the lock is lost or Run stops, starts afresh when the lock is taken again, and never runs
-// while another relay holds the lock.
 func TestRelayWhileHeld(t *testing.T) {
 	const ms = time.Millisecond
 	tests := []struct {
