@@ -261,8 +261,7 @@ func (f *FFmpeg) render(ctx context.Context, src string, targetLUFS float64, lay
 	return modes, nil
 }
 
-// correct gives a rendition that failed verification one corrective re-encode, if correction finds a gain for it:
-// pass 2 again for its layout and its output alone, with the gain after the resampler, and a new verification.
+// correct gives a rendition that failed verification one corrective re-encode, if correction finds a gain for it.
 func (f *FFmpeg) correct(ctx context.Context, src string, targetLUFS float64, l layout, offset float64, r *Rendition,
 ) error {
 	gain, ok := correction(r.Loudness, targetLUFS)
