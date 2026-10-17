@@ -275,7 +275,7 @@ at the same time while the test suite runs against the same server:
 | `api`, `worker-encode` and `worker-webhook`, 25 each | 75 |
 | `migrate`, which holds one connection and exits before the others start | 1 |
 | `docker compose run api tenant create`, a one-off process with its own pool | 25 |
-| The `dev` suite: 5 packages run MySQL tests in parallel, each with 2 pools of 25 and 1 admin connection | 260 |
+| The `dev` suite: 5 packages in parallel, each 2 × (25 + 1): two pools of 25, each with an admin connection | 260 |
 | The healthcheck's `mysqladmin ping` | 1 |
 | Total | 362 |
 
