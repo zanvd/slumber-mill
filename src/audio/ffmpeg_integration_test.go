@@ -5,9 +5,11 @@ package audio
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -162,16 +164,70 @@ func TestProcessRoundTrip(t *testing.T) {
 	}
 }
 
+// correctionLog is the warning a corrective re-encode logs.
+type correctionLog struct {
+	Level             string  `json:"level"`
+	Msg               string  `json:"msg"`
+	Profile           string  `json:"profile"`
+	GainDB            float64 `json:"gain_db"`
+	FirstLUFS         float64 `json:"first_lufs"`
+	FirstTruePeakDBTP float64 `json:"first_true_peak_dbtp"`
+	LUFS              float64 `json:"lufs"`
+	TruePeakDBTP      float64 `json:"true_peak_dbtp"`
+}
+
+func TestProcessCorrectsBrightContent(t *testing.T) {
+	var logs bytes.Buffer
+	ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(io.MultiWriter(&logs, t.Output()), nil)))
+	res, err := New().Process(ctx, testutil.BrightWhite(t), testTargetLUFS, tempOutputs(t))
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	for _, r := range res.Renditions {
+		t.Logf("%s: rendered %s, verified %+v", r.Profile.Name, r.Normalization, r.Loudness)
+		if math.Abs(r.Loudness.LUFS-testTargetLUFS) > ToleranceLU || r.Loudness.TruePeakDBTP > CeilingDBTP {
+			t.Errorf("%s verified at %.2f LUFS and %.2f dBTP, want %.1f ± %.0f LU and at most %.1f dBTP",
+				r.Profile.Name, r.Loudness.LUFS, r.Loudness.TruePeakDBTP, testTargetLUFS, ToleranceLU, CeilingDBTP)
+		}
+	}
+
+	var corrections []correctionLog
+	for line := range strings.Lines(logs.String()) {
+		var l correctionLog
+		if err := json.Unmarshal([]byte(line), &l); err != nil {
+			t.Fatalf("error parsing the log line %q: %v", line, err)
+		}
+		if l.Msg == "re-encoded a rendition with a corrective gain" {
+			corrections = append(corrections, l)
+		}
+	}
+	// The fixture is only useful while its first 64k encode misses the target.
+	if len(corrections) != 1 || corrections[0].Profile != "aac_64k" || corrections[0].Level != "WARN" {
+		t.Fatalf("corrective re-encodes = %+v, want one warning, for aac_64k", corrections)
+	}
+	c := corrections[0]
+	if math.Abs(c.FirstLUFS-testTargetLUFS) <= ToleranceLU || math.Abs(c.GainDB) > maxCorrectionDB {
+		t.Errorf("aac_64k first verified at %.2f LUFS and re-encoded with %+.2f dB, "+
+			"want it outside the tolerance and a gain within %.1f dB", c.FirstLUFS, c.GainDB, maxCorrectionDB)
+	}
+	if r := res.Renditions[1]; r.Loudness.LUFS != c.LUFS || r.Loudness.TruePeakDBTP != c.TruePeakDBTP {
+		t.Errorf("aac_64k stored %+v, want the re-encode's %.2f LUFS and %.2f dBTP", r.Loudness, c.LUFS, c.TruePeakDBTP)
+	}
+}
+
 func TestProcessRejects(t *testing.T) {
 	tests := []struct {
 		name    string
 		fixture func(testing.TB) string
 		want    string
+		// prefix accepts any message that starts with want.
+		prefix bool
 	}{
-		{"text file", testutil.NotAudio, MessageNotAudio},
-		{"0.3 s clip", func(tb testing.TB) string { return testutil.PinkClip(tb, 300*time.Millisecond) }, MessageTooShort},
-		{"2 s clip", func(tb testing.TB) string { return testutil.PinkClip(tb, 2*time.Second) }, MessageTooShort},
-		{"silence", testutil.Silence, MessageSilent},
+		{name: "text file", fixture: testutil.NotAudio, want: MessageNotAudio},
+		{name: "0.3 s clip", fixture: func(tb testing.TB) string { return testutil.PinkClip(tb, 300*time.Millisecond) }, want: MessageTooShort},
+		{name: "2 s clip", fixture: func(tb testing.TB) string { return testutil.PinkClip(tb, 2*time.Second) }, want: MessageTooShort},
+		{name: "silence", fixture: testutil.Silence, want: MessageSilent},
+		{name: "blue noise", fixture: testutil.BlueNoise, want: "aac_128k rendition out of spec", prefix: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -182,7 +238,11 @@ func TestProcessRejects(t *testing.T) {
 			if !ok {
 				t.Fatalf("Process() error = %v, want a rejection", err)
 			}
-			if rej.Message != tc.want {
+			matches := rej.Message == tc.want
+			if tc.prefix {
+				matches = strings.HasPrefix(rej.Message, tc.want)
+			}
+			if !matches {
 				t.Errorf("rejection message = %q, want %q", rej.Message, tc.want)
 			}
 		})
