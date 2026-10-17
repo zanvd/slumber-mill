@@ -1036,9 +1036,12 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     `TP`. With −4.0, 10- and 60-minute pink noise came out at −2.35 to −1.26 dBTP, 3 of 12 runs over the ceiling.
     With −4.5 the worst of 9 was −1.84, with −5.0 the worst of 11 was −1.69, and with −6.0 the rendition fell to
     −19 to −21 LUFS. The worst peak grew by roughly 0.3–0.5 dB for every tenfold increase in length, so a 10-hour
-    noise soundscape can still exceed the ceiling. Resampling loudnorm's 192 kHz output to 48 kHz adds 0.1–0.3 dB on
-    its own. At 64k, which has no `-cutoff`, white noise of 10 minutes or more measured −17.04 LUFS against a −16
-    target.
+    noise soundscape can still exceed the ceiling. Resampling loudnorm's 192 kHz output to 48 kHz added 0.00–0.24 dB
+    of true peak at −16 LUFS (pink noise and narration, 10 minutes), nothing in linear mode, and 1.3–2.3 dB on white
+    noise rendered dynamic at −10 LUFS; soxr at `precision=28` was no better and the encoded files came out the same.
+    At 64k, which has no `-cutoff`, white noise of 10 minutes or more measured −17.04 LUFS against a −16 target.
+    No 64k cutoff fixed that without pushing pink noise over the ceiling, but loudness follows a pre-encode `volume`
+    within 0.02 LU, so one corrective re-encode fixes it (§7 step 6).
 18. **loudnorm's linear mode is a request.** A thunder crack in quiet rain made it fall back to dynamic mode silently:
     on target overall (−16.09), but the rain bed rose from −45.3 to −13.2 LUFS.
     The report saying so only prints at info level.
