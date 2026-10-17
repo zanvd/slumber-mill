@@ -126,15 +126,20 @@ func TestMigrateThenTenantCreate(t *testing.T) {
 		wantLUFS       float64
 	}{
 		{
-			name:           "with a webhook",
+			name:           "with a webhook and the default target",
 			args:           []string{"-slug", "with-webhook", "-webhook-url", "https://93.184.215.14/hooks"},
 			wantWebhookURL: "https://93.184.215.14/hooks",
-			wantLUFS:       -16,
+			wantLUFS:       -20,
 		},
 		{
 			name:     "without a webhook",
 			args:     []string{"-slug", "plain", "-target-lufs", "-18"},
 			wantLUFS: -18,
+		},
+		{
+			name:     "at the loudest target",
+			args:     []string{"-slug", "loudest", "-target-lufs", "-16"},
+			wantLUFS: -16,
 		},
 		{
 			name:       "target louder than -16",
@@ -202,8 +207,8 @@ func TestMigrateThenTenantCreate(t *testing.T) {
 		})
 	}
 
-	if len(printed) != 3 {
-		t.Fatalf("got %d printed secrets, want 3", len(printed))
+	if len(printed) != 4 {
+		t.Fatalf("got %d printed secrets, want 4", len(printed))
 	}
 	for _, s := range printed {
 		if strings.Contains(stderrs.String(), s) {
