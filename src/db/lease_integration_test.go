@@ -238,6 +238,9 @@ func TestClaimConcurrently(t *testing.T) {
 		for range rows {
 			ids = append(ids, e.insert())
 		}
+		// A run_after defaulted to the insert time would leave the rows not yet due
+		// if the server's clock stepped back before the claims.
+		e.exec("UPDATE %[1]s SET run_after = ? WHERE id IN ?", "2020-01-01 00:00:00", ids)
 
 		claimed := make([][]db.Lease, claimers)
 		errs := make([]error, claimers)
