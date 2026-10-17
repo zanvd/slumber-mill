@@ -44,8 +44,15 @@ var (
 	dwTargets   = flag.String("dw-targets", "-16,-23", "comma-separated targets in LUFS")
 )
 
-// dwEvents are the kinds the warning exists for; every other kind is steady content.
-var dwEvents = map[string]bool{"thunder": true, "thunder-periodic": true, "bed-events": true}
+// dwEvents are the kinds the warning exists for, and dwProbes kinds between them and steady content,
+// reported apart from both. Every other kind is steady content.
+var (
+	dwEvents = map[string]bool{"thunder": true, "thunder-periodic": true, "bed-events": true}
+	dwProbes = map[string]bool{"thunder-mild": true, "crackle": true}
+)
+
+// crackleEnvelope is two trains of 5 ms clicks, every 0.37 s and every 0.61 s.
+const crackleEnvelope = "exp(-mod(t,0.37)*1000)+0.7*exp(-mod(t+0.13,0.61)*1000)"
 
 type dwKind struct {
 	inputs []string
@@ -129,6 +136,28 @@ func dwKinds(d time.Duration) map[string]dwKind {
 				"[rain][crack]amix=inputs=2:duration=first:normalize=0",
 				crackPeriod, max(minutes-1, 0), crackPeriod),
 			note: "the Thunder fixture's rain and crack, with a crack every minute from 30 s",
+		},
+		"thunder-mild": {
+			inputs: []string{
+				dwNoise("pink", 0.08, 21, d), dwNoise("pink", 0.08, 22, d),
+				dwNoise("white", 0.95, 23, 50*time.Millisecond),
+			},
+			filter: fmt.Sprintf("[0:a][1:a]amerge=inputs=2[rain];"+
+				"[2:a]afade=t=out:d=0.05:curve=exp,apad=whole_len=%d,aloop=loop=%d:size=%d,"+
+				"aformat=channel_layouts=stereo,adelay=30000:all=1[crack];"+
+				"[rain][crack]amix=inputs=2:duration=first:normalize=0",
+				crackPeriod, max(minutes-1, 0), crackPeriod),
+			note: "thunder-periodic with its rain 6 dB louder",
+		},
+		"crackle": {
+			inputs: []string{
+				dwNoise("pink", 0.04, 61, d), dwNoise("pink", 0.04, 62, d),
+				dwNoise("white", 0.9, 63, d),
+				fmt.Sprintf("aevalsrc=exprs='%s':sample_rate=48000:duration=%s", crackleEnvelope, secs),
+			},
+			filter: "[2:a][3:a]amultiply,highpass=f=300,aformat=channel_layouts=stereo[c];" +
+				"[0:a][1:a]amerge=inputs=2[bed];[bed][c]amix=inputs=2:duration=first:normalize=0",
+			note: "a quiet stereo bed with clicks from two trains at 0.37 s and 0.61 s",
 		},
 		"bed-events": {
 			inputs: []string{
@@ -493,7 +522,7 @@ func dwLine(r dwRow) string {
 
 func dwSortRows(rows []dwRow) {
 	order := []string{"pink-unc", "pink-dm", "pink-mono", "white-unc", "bright-white", "surround", "speech", "narration",
-		"thunder", "thunder-periodic", "bed-events"}
+		"thunder", "thunder-periodic", "bed-events", "thunder-mild", "crackle"}
 	slices.SortStableFunc(rows, func(a, b dwRow) int {
 		return cmp.Or(
 			cmp.Compare(slices.Index(order, a.Source), slices.Index(order, b.Source)),
@@ -522,7 +551,7 @@ func dwTable(rows []dwRow) string {
 type dwAsset struct {
 	source, duration          string
 	target                    float64
-	event                     bool
+	event, probe              bool
 	a, rise, b, c             float64
 	dynamic, sudden, rejected bool
 	suddenLU                  float64
@@ -571,7 +600,7 @@ func TestDynamicWarningReport(t *testing.T) {
 		a, ok := assets[k]
 		if !ok {
 			a = &dwAsset{
-				source: r.Source, duration: r.Duration, target: r.Target, event: r.Event,
+				source: r.Source, duration: r.Duration, target: r.Target, event: r.Event, probe: dwProbes[r.Source],
 				a: math.Inf(-1), rise: math.Inf(-1), b: math.Inf(-1), c: math.Inf(-1),
 				sudden: slices.Contains(r.Warnings, string(WarningSuddenLoudEvent)), suddenLU: r.SuddenLU,
 			}
@@ -590,8 +619,8 @@ func TestDynamicWarningReport(t *testing.T) {
 		list = append(list, assets[k])
 	}
 	for _, a := range list {
-		fmt.Fprintf(&b, "%-16s %5s %4s event=%-5v dynamic=%-5v A %+6.2f B %+6.2f C %+6.2f sudden %5.2f (%v) rejected=%v\n",
-			a.source, a.duration, num(a.target), a.event, a.dynamic, a.a, a.b, a.c, a.suddenLU, a.sudden, a.rejected)
+		fmt.Fprintf(&b, "%-16s %5s %4s event=%-5v probe=%-5v dynamic=%-5v A %+6.2f B %+6.2f C %+6.2f sudden %5.2f (%v) rejected=%v\n",
+			a.source, a.duration, num(a.target), a.event, a.probe, a.dynamic, a.a, a.b, a.c, a.suddenLU, a.sudden, a.rejected)
 	}
 	t.Log(b.String())
 
@@ -625,6 +654,9 @@ func TestDynamicWarningReport(t *testing.T) {
 				}
 				v := m.get(a)
 				name := fmt.Sprintf("%s/%s@%s", a.source, a.duration, num(a.target))
+				if a.probe {
+					continue
+				}
 				if a.event && v < eventMin {
 					eventMin, eventArg = v, name
 				}
