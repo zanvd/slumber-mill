@@ -229,7 +229,9 @@ has none, and their targets range from -16 to -23 LUFS. -16 is the loudest targe
 
 A run takes the duration plus 3-5 minutes to build, start and drain. It uses about 4 of the host's CPUs for
 the two encode workers. The project is `<name>-soak`, where `<name>` is `COMPOSE_PROJECT_NAME` or, as Compose
-itself defaults it, the checkout's directory name in lower case. That keeps soaks run from two checkouts apart. The
+itself defaults it, the checkout's directory name in lower case. That keeps soaks run from two checkouts apart; if
+the directory name has no letters, digits, hyphens or underscores, the script stops until `COMPOSE_PROJECT_NAME` is
+set. The
 project uses `var/out/soak/data` as its data directory and publishes no port. At the end the script takes the project
 down with its volumes and images. The driver's summary is left in `var/out/soak/summary.txt`, with its log in
 `driver.log` and the services' logs in `compose.log`. Webhook delivery is at-least-once, so the summary counts the
