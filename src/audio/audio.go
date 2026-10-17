@@ -218,9 +218,7 @@ func check(profile string, l Loudness, targetLUFS float64) string {
 		profile, l.LUFS, targetLUFS, ToleranceLU, l.TruePeakDBTP, CeilingDBTP)
 }
 
-// correction plans the gain of a corrective re-encode for a rendition verified as l: the gain that puts it on target,
-// lowered where it would bring the true peak within correctionHeadroomDB of the ceiling.
-// ok is false when there is no gain to apply, or the gain is out of bounds or misses the target by too much.
+// correction plans the gain of a corrective re-encode for a rendition verified as l.
 func correction(l Loudness, targetLUFS float64) (gainDB float64, ok bool) {
 	gain := targetLUFS - l.LUFS
 	if hundredths(l.TruePeakDBTP+gain) > hundredths(CeilingDBTP-correctionHeadroomDB) {
