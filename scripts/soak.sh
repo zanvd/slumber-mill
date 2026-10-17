@@ -43,6 +43,8 @@ duplicate_key='^api-[0-9]+ +\| .*"level":"WARN","msg":"query failed","method":"P
 failures=0
 results=()
 follower=
+webhook_kills=0
+idle_kills=0
 
 compose() {
   docker compose --project-directory "$root" -p "$project" --progress quiet \
@@ -161,12 +163,28 @@ prepare() {
   wait_for "the driver to start uploading" 600 logged soak "soak: uploading"
 }
 
+# delivery_in_flight HOSTNAME succeeds when the webhook worker with that hostname has held a delivery for 2 to 10
+# seconds. The receiver answers an immediate status or after 2-4 seconds, except that some events hang until the
+# client's 15 second timeout, so a delivery held this long is almost always a hanging one, which a SIGKILL a second
+# or two later is sure to catch in flight. It can't be a 410, which the receiver answers at once.
+delivery_in_flight() {
+  local n
+  n=$(sql "SELECT COUNT(*) FROM webhook_deliveries WHERE state = 'sending' AND locked_by LIKE '$1:%' \
+AND updated_at BETWEEN NOW(6) - INTERVAL 10 SECOND AND NOW(6) - INTERVAL 2 SECOND") || return 1
+  ((n > 0))
+}
+
 # crash SERVICE N sends SIGKILL to the Nth container of SERVICE and starts it again a few seconds later. Its work in
-# flight stays leased until the other replica's reaper requeues it, and a webhook worker holding the relay lock loses
-# it with its session.
+# flight stays leased until a reaper requeues it, and a webhook worker holding the relay lock loses it with its
+# session. A webhook worker is killed only once it has a delivery in flight, so that the kill leaves one to reap.
 crash() {
   local cid st
   cid=$(containers "$1" | sed -n "${2}p")
+  if [[ $1 == worker-webhook ]]; then
+    webhook_kills=$((webhook_kills + 1))
+    wait_for "$(name "$cid") to hold a delivery" 180 delivery_in_flight "$(docker inspect -f '{{.Config.Hostname}}' "$cid")" ||
+      idle_kills=$((idle_kills + 1))
+  fi
   log "chaos: SIGKILL $(name "$cid")"
   docker kill -s KILL "$cid" >/dev/null
   wait_for "$(name "$cid") to die" 30 dead "$cid" || true
@@ -291,6 +309,26 @@ check_logs() {
     record PASS "$what"
   else
     record FAIL "$what"
+  fi
+  # A webhook worker is SIGKILLed only once it holds a delivery, which stays leased until a reaper requeues it, so a
+  # run that killed one without finding it in flight, or without any delivery reaped, proves nothing.
+  if ((webhook_kills > 0)); then
+    local reaped_deliveries=${reaped["reaped deliveries whose lease expired, requeued"]:-0}
+    reaped_deliveries=$((reaped_deliveries + ${reaped["reaped deliveries whose lease expired, failed"]:-0}))
+    what="each of the $webhook_kills SIGKILLs of a webhook worker found it holding a delivery ($idle_kills did not)"
+    if ((idle_kills == 0)); then
+      record PASS "$what"
+    else
+      record FAIL "$what"
+    fi
+    what="a reaper requeued or failed the deliveries left leased by the SIGKILLs ($reaped_deliveries reaped)"
+    if ((reaped_deliveries > 0)); then
+      record PASS "$what"
+    else
+      record FAIL "$what"
+    fi
+  else
+    echo "  no webhook worker was SIGKILLed, so no delivery reap was expected"
   fi
   what="the duplicate-key WARN lines number no more than the uploads that could race ($duplicates, at most ${bound:-unknown})"
   if [[ $bound =~ ^[0-9]+$ ]] && ((duplicates <= bound)); then
