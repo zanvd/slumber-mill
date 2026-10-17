@@ -763,6 +763,25 @@ func TestProcessRejectsOutOfRangeTargets(t *testing.T) {
 	}
 }
 
+func TestProcessRejectsLongSources(t *testing.T) {
+	if !strings.Contains(MessageTooLong, "10 hours") || MaxDuration != 10*time.Hour {
+		t.Fatalf("MessageTooLong = %q with MaxDuration %v, want the message to state the 10-hour limit", MessageTooLong, MaxDuration)
+	}
+	run := &fakeRunner{responses: stereoScript()}
+	run.responses[0].stdout = probeJSON(2, "36000.000021")
+	_, err := (&FFmpeg{run: run}).Process(t.Context(), "/data/sources/1/a", -16, outputs())
+	rej, ok := errors.AsType[*Rejection](err)
+	if !ok || rej.Message != MessageTooLong {
+		t.Fatalf("Process() error = %v, want the rejection %q", err, MessageTooLong)
+	}
+	if strings.Contains(rej.Message, "/data") || strings.Contains(rej.Message, "36000") {
+		t.Errorf("rejection message %q has internal detail", rej.Message)
+	}
+	if len(run.calls) != 1 || run.calls[0].name != "ffprobe" {
+		t.Errorf("Process() ran %d commands, want only the probe", len(run.calls))
+	}
+}
+
 func TestValidateAcceptsLoudnormsLimits(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -811,6 +830,11 @@ func TestProbe(t *testing.T) {
 			want: Source{Codec: "pcm_s16le", SampleRate: 48000, Channels: 1, Duration: 3 * time.Second},
 		},
 		{name: "just under 3 s", src: existing, response: fakeResponse{stdout: probeJSON(1, "2.999979")}, wantRejection: MessageTooShort},
+		{
+			name: "exactly 10 h", src: existing, response: fakeResponse{stdout: probeJSON(2, "36000.000000")},
+			want: Source{Codec: "pcm_s16le", SampleRate: 48000, Channels: 2, Duration: 10 * time.Hour},
+		},
+		{name: "just over 10 h", src: existing, response: fakeResponse{stdout: probeJSON(2, "36000.000021")}, wantRejection: MessageTooLong},
 		{name: "unparseable", src: existing, response: fakeResponse{err: invalid}, wantRejection: MessageNotAudio},
 		{name: "missing", src: missing, response: fakeResponse{err: invalid}, wantErr: true, wantIs: fs.ErrNotExist},
 		{

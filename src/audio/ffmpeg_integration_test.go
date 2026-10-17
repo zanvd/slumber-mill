@@ -252,6 +252,26 @@ func TestProcessRejects(t *testing.T) {
 	}
 }
 
+// The fixtures are real WAV files of just over and exactly 10 hours at 1 Hz, which take a few dozen kilobytes
+// where rendering 10 hours of audio at a usual rate takes about 18 s.
+func TestProcessRejectsSourcesOverTheLimitAtTheProbe(t *testing.T) {
+	rec := &recordingRunner{runner: execRunner{}}
+	_, err := (&FFmpeg{run: rec}).Process(testContext(t), testutil.LongWAV(t, MaxDuration+time.Second), testTargetLUFS, tempOutputs(t))
+	t.Logf("Process() error = %v", err)
+	rej, ok := errors.AsType[*Rejection](err)
+	if !ok || rej.Message != MessageTooLong {
+		t.Fatalf("Process() error = %v, want the rejection %q", err, MessageTooLong)
+	}
+	if len(rec.calls) != 1 {
+		t.Errorf("Process() ran %d commands, want only the probe", len(rec.calls))
+	}
+
+	src, err := (&FFmpeg{run: execRunner{}}).probe(testContext(t), testutil.LongWAV(t, MaxDuration))
+	if err != nil || src.Duration != MaxDuration {
+		t.Errorf("probe() of exactly %v = %+v, %v, want it accepted", MaxDuration, src, err)
+	}
+}
+
 func TestProcessMissingSourceIsRetryable(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "missing.wav")
 	_, err := New().Process(testContext(t), src, testTargetLUFS, tempOutputs(t))

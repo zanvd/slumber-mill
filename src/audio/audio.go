@@ -16,6 +16,8 @@ const (
 	ToleranceLU = 1.0
 	// MinDuration is the shortest source accepted; very short clips measure as silent.
 	MinDuration = 3 * time.Second
+	// MaxDuration is the longest source accepted; the encode timeout is sized for it.
+	MaxDuration = 10 * time.Hour
 
 	// preEncodeTruePeakDBTP is the TP loudnorm aims for, leaving headroom for the peak the encoder adds.
 	preEncodeTruePeakDBTP = -4.5
@@ -43,6 +45,7 @@ const (
 const (
 	MessageNotAudio = "not audio"
 	MessageTooShort = "too short"
+	MessageTooLong  = "too long: the limit is 10 hours"
 	MessageSilent   = "silent"
 
 	MessageTargetOutOfRange = "target loudness must be from -70 to -16 LUFS"
