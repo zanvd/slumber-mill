@@ -56,7 +56,7 @@ the `id` field of the 202 response, then poll until the asset's `status` is `rea
 
 ```sh
 export API_KEY=sm_...
-curl -H "Authorization: Bearer $API_KEY" -F title=Rain -F file=@rain.wav http://127.0.0.1:8080/v1/assets
+curl -H "Authorization: Bearer $API_KEY" -F title=Rain -F file=@var/out/rain.wav http://127.0.0.1:8080/v1/assets
 export ASSET_ID=...
 curl -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8080/v1/assets/$ASSET_ID
 curl -H "Authorization: Bearer $API_KEY" -o rain-128k.m4a http://127.0.0.1:8080/v1/assets/$ASSET_ID/renditions/aac_128k
@@ -64,6 +64,34 @@ curl -H "Authorization: Bearer $API_KEY" -o rain-128k.m4a http://127.0.0.1:8080/
 
 The API listens on `:8080` inside its container, and Compose publishes that port on `127.0.0.1` only, so the local
 stack isn't open to the network. Uploads and renditions live in `var/data`, so they can be played from there.
+
+### Input files
+
+For a test file, generate 10 seconds of stereo pink noise with the ffmpeg in the `dev` service; it lands in
+`var/out/rain.wav`, which the upload above reads:
+
+```sh
+docker compose run --rm --no-deps dev ffmpeg -hide_banner -loglevel error \
+  -f lavfi -i anoisesrc=color=pink:amplitude=0.3:duration=10:seed=1 -ac 2 /out/rain.wav
+```
+
+- **Containers.** WAV, MP3, FLAC, Ogg, MP4 and MOV (so M4A), raw AAC, Matroska (so WebM) and AIFF. The encode
+  pool tells ffmpeg to open only those, from a local file, so playlists such as HLS and concat are rejected.
+  It takes the first audio stream, whatever its codec, as long as ffmpeg can decode it; video streams are ignored.
+- **Size.** The whole request may be up to 2 GiB (`SLUMBER_MILL_MAX_UPLOAD_BYTES`), or the API answers
+  `413 file_too_large`. A tenant may have 4 uploads in flight (`SLUMBER_MILL_MAX_UPLOADS_PER_TENANT`),
+  and the next one gets `429 too_many_uploads`. A body that stalls for 30 seconds gets `408`.
+  An empty file or a missing `title` is a `400 invalid_request`.
+- **Duration.** From 3 seconds to 10 hours. Shorter files read as silent, and a longer one would not finish
+  within the 5-hour encode timeout.
+- **Channels.** `aac_64k` is always mono, and `aac_128k` keeps up to 2 channels: a stereo source stays stereo, a mono
+  source gets a mono 128k file, and anything with more channels, such as 5.1, is downmixed to stereo. Each rendition
+  is normalised after its own downmix, so both land on the tenant's target.
+- **Rejections** aren't an upload error. The API answers 202, and the asset later turns `failed` with a message in
+  its `error` field, which is safe to show a tenant: `not audio` (unparseable, no audio stream or a disallowed
+  container), `too short`, `too long: the limit is 10 hours`, `silent`, or, if a rendition can't be brought to
+  target even after the corrective re-encode, its loudness and true peak against the limits.
+  Anything else is retried, and after three attempts ends as `processing failed after repeated attempts`.
 
 ### HTTP API
 
@@ -137,9 +165,12 @@ Environment variables, with the defaults used when one is unset:
   value is a configuration error and the process exits 1. The `api` and both pools read it, because the startup
   sweep of `tmp/` removes files older than the lease. The webhook lease is fixed at 1 minute.
   A worker heartbeats every third of its lease.
-- **Retention.** The webhook pool deletes deliveries in the `delivered` state 30 days after delivery and relayed
-  events 30 days after relay, in small batches. The 30 days are fixed, not configurable. It runs at startup and then hourly.
+- **Retention.** The webhook worker that holds the relay lock deletes deliveries in the `delivered` state
+  30 days after delivery and relayed events 30 days after relay, in small batches. The other webhook workers don't.
+  It runs when a worker takes the lock and then hourly while it holds it. The 30 days are fixed, not configurable.
   Assets and renditions are never deleted.
+- **Logs.** The encode and webhook pools log one INFO `work claimed` record per claim, with the row's internal `id`,
+  `tenant_id`, `attempt`, `worker` and `pool`, and one `work finished` record when the job ends.
 - **The secret key.** Only `api` (which runs `tenant create`) and `worker-webhook` get `SLUMBER_MILL_SECRET_KEYS`.
   Compose sets a fixed key marked dev-only; production reads it from a secret manager.
 
@@ -244,7 +275,7 @@ at the same time while the test suite runs against the same server:
 | `api`, `worker-encode` and `worker-webhook`, 25 each | 75 |
 | `migrate`, which holds one connection and exits before the others start | 1 |
 | `docker compose run api tenant create`, a one-off process with its own pool | 25 |
-| The `dev` suite: 5 packages with MySQL tests run in parallel, each holding up to two pools of 25 and one admin connection per throwaway database, 2 × (25 + 1) | 260 |
+| The `dev` suite: 5 packages run MySQL tests in parallel, each with 2 pools of 25 and 1 admin connection | 260 |
 | The healthcheck's `mysqladmin ping` | 1 |
 | Total | 362 |
 
@@ -260,21 +291,25 @@ Each with its trade-off.
 - **The asset is its own unit of work, and an outbox carries the webhooks.** An asset's `status` is its lease state,
   so an upload is one insert and finishing is one transaction in the asset repository, which also writes an
   `asset_events` row. The webhook pool's relay turns events into deliveries. No transaction spans two domains,
-  and the cost is a relay hop: about 0.6 s on average and 1.2 s at p99 in the prototype, because the relay
-  reads back to back until a batch comes back short instead of once a second. Exactly one relay runs at a time,
-  elected with a MySQL `GET_LOCK`.
+  and the cost is a relay hop: about 0.6 s on average and 1.2 s at p99 as measured, because the relay
+  reads back to back until a batch comes back short instead of once a second.
+- **One relay at a time, and retention rides on it.** Two relays read the same batches, so every webhook worker
+  tries a MySQL `GET_LOCK` once a second and only the holder relays; a crash ends its session and frees the lock.
+  Retention runs on the holder too, in its own goroutine so long delete batches don't stall relaying. That needs no
+  second election and keeps replicas from repeating each other's deletes. The cost is that the schedule follows the
+  lock: a worker that takes it over starts a run at once, which is harmless because the deletes are idempotent.
 - **Leasing on MySQL, not Redis or SQS.** One fewer system to operate, and the work is created in the same insert
   or transaction as the data it belongs to. A claim is `SELECT ... FOR UPDATE SKIP LOCKED` in READ COMMITTED:
   under REPEATABLE READ the gap locks cost uploads a third of their throughput and tripled their p99 latency.
   Every write after a claim is fenced, meaning it matches only while the row's id, state and `attempts` are still
-  the claimant's, so a worker that lost its lease changes nothing. Every time comes from `NOW(6)`, so clock skew between hosts can't distort a lease.
-  A reaper requeues expired leases with a short delay, not the retry backoff. The price is that MySQL does the
-  queueing: throughput is bounded by one database, and finished rows must stay cheap (they did, at a million
-  finished rows per table).
+  the claimant's, so a worker that lost its lease changes nothing. Every time comes from `NOW(6)`, so clock skew
+  between hosts can't distort a lease. A reaper requeues expired leases with a short delay, not the retry backoff.
+  The price is that MySQL does the queueing: throughput is bounded by one database, and finished rows must stay
+  cheap (they did, at a million finished rows per table).
 - **Layers.** Gin (the HTTP framework) handlers, services and GORM (the Go database library) repositories are joined
-  by interfaces that their consumers declare. Gin appears only in `httpsrv/` and GORM only in `db/` and the `repository.go` files, so a service tests against
-  a hand-written fake and a handler against a fake service. The cost is a little ceremony: models convert to
-  domain types at every boundary.
+  by interfaces that their consumers declare. Gin appears only in `httpsrv/` and GORM only in `db/` and the
+  `repository.go` files, so a service tests against a hand-written fake and a handler against a fake service.
+  The cost is a little ceremony: models convert to domain types at every boundary.
 - **GORM rules that keep leasing correct.** Skip the default transaction, translate duplicate-key errors,
   pass the caller's context on every call, let MySQL write the timestamps, update with maps rather than structs
   (a struct silently drops zero values), and check `RowsAffected` on every fence, which needs `clientFoundRows=true`.
@@ -287,25 +322,36 @@ Each with its trade-off.
   A listener asleep with the volume set for one story notices a quiet or sudden file, so the encode pool measures
   each output channel layout after the downmix, normalises each with its own two-pass `loudnorm`, then re-measures
   every encoded file. Each must be within 1 LU of the tenant's target (default -16 LUFS) with a true peak at or below
-  -1.5 dBTP, or the asset is rejected with the numbers. A rendition that misses gets one corrective re-encode with a
-  small gain (at most 1.5 dB), logged as a warning, before it's rejected. Each rendition stores its own figures.
+  -1.5 dBTP, or the asset is rejected with the numbers. Each rendition stores its own figures.
   `loudnorm` can silently fall back to dynamic mode, which lifts a quiet rain bed when a thunder crack arrives,
   so the pool publishes a `dynamic_normalization` warning when dynamic mode flattened the file's loud moments
-  by more than 6 LU. It also warns about
-  `sudden_loud_event` (max momentary loudness more than 10 LU above integrated) and `source_may_clip`.
-  Silent, shorter-than-3-second and longer-than-10-hour files are rejected. The cost is CPU: two measurement passes,
-  a render and a verification pass per upload.
+  by more than 6 LU; dynamic mode alone doesn't warn, since it is common on dense content and flattens little there.
+  It also warns about `sudden_loud_event` (max momentary loudness more than 10 LU above integrated) and
+  `source_may_clip`. The cost is CPU: two measurement passes, a render and a verification pass per upload.
+- **One corrective re-encode, then reject.** The AAC encoder moves loudness by a steady amount (bright noise loses
+  about 1 LU at 64k), and loudness follows a gain applied before the encoder closely, so one correction fixes
+  it. A rendition that misses gets its own layout re-rendered with a gain that brings it to target, lowered where
+  needed to keep its true peak 0.5 dB under the ceiling, then verified again. The gain is at most 1.5 dB and must land
+  within 0.8 LU of target; otherwise, or if the second check fails, the asset is rejected with the numbers of the
+  last attempt. More tries would only guess, and each costs 21-35 s per 10 minutes of audio, about 60% of it the
+  verification pass. The applied gain is logged at WARN.
+- **Sources over 10 hours are rejected at the probe, and an encode may take 5 hours.** Rejecting costs nothing
+  before any loudness pass. The limit is what the timeout is sized for: with two encodes overlapping on 2 CPUs,
+  a 10-hour source projects to about 2.5 hours with no correction and 3.8 with both renditions corrected,
+  and about 4 under heavy host contention.
 - **Tenant isolation, IDs and secrets.** Every tenant-owned query filters on `tenant_id`, and another tenant's asset
   is the same 404 as a missing one. Public and event IDs are UUIDv7 in `BINARY(16)`, which keeps inserts
-  append-mostly at the cost of revealing the creation time. Idempotency keys use the `ascii_bin` collation, so `Upload-42` and
-  `upload-42` are different keys; under MySQL's default collation they would collide. API keys are stored as SHA-256
-  only. Webhook secrets can't be hashed, since every delivery signs with the secret itself, so they are stored as
-  AES-256-GCM ciphertext bound to their row and tenant, under a key ring that lets a new key go first.
+  append-mostly at the cost of revealing the creation time. Idempotency keys use the `ascii_bin` collation, so
+  `Upload-42` and `upload-42` are different keys; under MySQL's default collation they would collide.
+  API keys are stored as SHA-256 only. Webhook secrets can't be hashed, since every delivery signs with the
+  secret itself, so they are stored as AES-256-GCM ciphertext bound to their row and tenant, under a key ring
+  that lets a new key go first.
   Only `tenant create` and the webhook pool hold the key. Someone with both the database and that pool's
   environment can still forge events.
 - **SSRF defences.** Tenants supply webhook URLs, so the client checks the IP it actually dials, after DNS
-  resolution, and refuses anything that isn't public: private, loopback, link-local, carrier-grade NAT, documentation
-  and 6to4 ranges, IPv4-mapped forms, and the well-known NAT64 prefixes. It uses no proxy and follows no redirects.
+  resolution, and refuses anything that isn't public: private, loopback, link-local, multicast, carrier-grade NAT,
+  6to4 and other reserved ranges, IPv4-mapped forms, and the well-known NAT64 prefixes. It uses no proxy and
+  follows no redirects.
   `tenant create` checks the host too, but DNS can change afterwards, so the dial-time check is the real guard.
   A network-specific NAT64 prefix, which each network's operator chooses, can embed a private IPv4 address,
   and no fixed list covers it. If the webhook pool runs on such a network, block the private ranges at the network
@@ -326,7 +372,8 @@ Each with its trade-off.
 
 Migrations are numbered SQL files in `src/db/migrations/`, applied in order under a MySQL lock, so many instances
 can start at once. MySQL DDL commits implicitly, so each file is one logical, re-runnable change, with `ALGORITHM`
-and `LOCK` stated, so MySQL refuses an unsafe change instead of silently blocking writes. SPEC.md measured these on MySQL 8.0.46; the Compose stack runs MySQL 8.4:
+and `LOCK` stated, so MySQL refuses an unsafe change instead of silently blocking writes.
+SPEC.md measured these on MySQL 8.0.46; the Compose stack runs MySQL 8.4:
 
 | Change | Result |
 |---|---|
@@ -365,8 +412,9 @@ For a change that spans a deploy (not built, only written down here):
 - **A source louder than 0 LUFS isn't handled.** loudnorm's `measured_I` option accepts -99 to 0, so pass 2 is
   expected to fail on such a source. That comes from the open questions of
   [pull request #11](https://github.com/zanvd/slumber-mill/pull/11), which added the audio package, and hasn't
-  been re-run since. The failure is a plain ffmpeg exit, not a rejection: the encode pool retries it with backoff, and after three attempts the asset ends
-  `failed` with the generic message "processing failed after repeated attempts", not a tenant-specific one.
+  been re-run since. The failure is a plain ffmpeg exit, not a rejection: the encode pool retries it with backoff,
+  and after three attempts the asset ends `failed` with the generic message "processing failed after repeated
+  attempts", not a tenant-specific one.
   It's rare, and nothing checks for it up front.
 - **Long noise-like soundscapes can still be rejected.** The 64k rendition rebuilds peaks the limiter removed,
   and its true peak can exceed -1.5 dBTP, more likely the longer the file.
