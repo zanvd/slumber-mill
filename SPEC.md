@@ -331,8 +331,9 @@ CREATE TABLE webhook_deliveries (
   A webhook URL is optional: at most 2048 bytes of printable ASCII without spaces,
   an absolute `http` or `https` URL with a host, and without userinfo, which would sit in the row in plaintext,
   or a fragment.
-  `target_lufs` is finite and from −70 to −5 LUFS, loudnorm's range, and is rounded to one decimal place
-  before the insert, so the tenant `tenant create` returns matches the row.
+  `target_lufs` is finite and from −70 to −16 LUFS, and is rounded to one decimal place before the insert,
+  so the tenant `tenant create` returns matches the row.
+  loudnorm accepts up to −5, but louder than −16 its limiter can't lift dense content to the target (pitfall 34).
 - **Closed sets are `ENUM` or `SET`:** `status`, `state`, `type`, `profile`, `codec`, `normalization` and `warnings`.
   In strict mode, MySQL 8's default, a value outside the list fails the insert (error 1265),
   so a typo in code can't be stored. New members are only ever appended, which is instant;
@@ -464,7 +465,7 @@ A corrective re-encode (step 6) adds about 20–32 s per 10 minutes for the rend
    loudnorm reads a measured LRA of 0 as unmeasured, so pass `max(measured_LRA, 0.01)`.
    Render anyway, but record `normalization='dynamic'` and warn.
 5. **Render (pass 2):** one ffmpeg run, one loudnorm per layout with its own measurements,
-   and pass 1's `target_offset` as `offset` (command below).
+   and pass 1's `target_offset` as `offset` (command below; pitfall 34).
    Run it at `-loglevel info`, since the pass-2 report only prints at that level,
    and **check the exit status before parsing any report** (pitfall 21).
 6. **Verify every rendition** (pitfall 16): integrated loudness within ±1 LU of target and true peak
@@ -506,7 +507,8 @@ with `,volume=<g>dB:precision=double` after `aresample=48000`.
 | `aac_64k` | 64 kbps | 1 | Offline downloads on small or full phones |
 
 Both outputs are 48 kHz MP4/AAC with `+faststart`.
-The integrated target comes from the tenant (default −16 LUFS) and is snapshotted onto the asset at upload.
+The integrated target comes from the tenant (default −16 LUFS, also the loudest allowed; pitfall 34)
+and is snapshotted onto the asset at upload.
 The published ceiling is −1.5 dBTP. loudnorm gets a pre-encode `TP` of −4.5 dBTP, 3 dB of headroom below it,
 because resampling and the encoder add true peak (pitfall 17), and `LRA=50`, its maximum in 6.1.1:
 it never blocks linear mode, and lower values pull dynamic renders off target.
@@ -540,6 +542,8 @@ Loudness and the peak ceiling are therefore **verified properties of each encode
 - **A rejection is permanent** and carries a message that is **safe to show the tenant**;
   failing stores it in `assets.error`. Any other cause becomes "processing failed after repeated attempts".
   ffmpeg's stderr, which contains internal paths, stays in logs and `last_error`.
+- A target outside −70 to −16 LUFS, which only a tenant created before the cap can have,
+  is a **rejection** before ffmpeg runs: "target loudness must be from -70 to -16 LUFS".
 - **Outputs are deterministic and promoted by atomic rename**, so if an attempt loses its lease after promoting,
   the files it left are identical to what the winner writes,
   including a corrective re-encode, whose gain comes from deterministic measurements.
@@ -955,7 +959,8 @@ What the tests must show:
 - **Audio:** for every fixture (dual-mono pink, uncorrelated pink, uncorrelated white),
   every rendition lands within 1 LU of target and under the ceiling;
   high-shelved white noise misses the target in its first 64k encode and passes after the corrective re-encode,
-  and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers; a text file is "not audio",
+  and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers;
+  a target louder than −16 LUFS is a rejection before ffmpeg runs; a text file is "not audio",
   a missing file is retryable, clips of 0.3 s and 2 s are "too short", and the thunder fixture is predicted dynamic
   and warned about; a non-zero ffmpeg exit is an error even when a report was printed.
 - **Webhooks:** verification accepts rotation and rejects tampering, a wrong secret,
@@ -1047,6 +1052,8 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     The report saying so only prints at info level.
     In linear mode the report's `output_tp` and `output_i` aren't the output's
     (−17.19 dBTP and −15.83 LUFS for white noise normalised to −16 LUFS), so only the verification pass's figures are stored.
+    Under the −4.5 dBTP pre-encode peak, dense content rarely gets linear mode: at −16 LUFS every pink-noise and
+    narration mono rendition rendered dynamic, so `dynamic_normalization` is common rather than exceptional.
 19. **LRA doesn't detect sudden loud events:** 0.1 LU for the thunder file.
     Max momentary minus integrated does: 21.6 LU, against 0.4 for steady rain.
 20. **Very short clips measure as `-inf`:** a 0.3 s clip reads as silent.
@@ -1090,6 +1097,18 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 33. **Concurrent relays read the same batches.**
     Two relays both took the oldest unrelayed events, so each event was read 1.8–1.9 times.
     The no-op inserts kept the outcome correct; a single elected relay brought it to 1.0.
+
+### Loudness targets
+
+34. **loudnorm's limiter can't lift dense content much past −16 LUFS, and the target offset makes it worse.**
+    Mono pink noise already rendered dynamic at −16.
+    Its 64k rendition collapsed at −15 (uncorrelated) and −14.5 (dual-mono), to about −19 LUFS at −14.
+    Pass 1 reports the shortfall as `target_offset`. Passed to pass 2 as `offset`, it adds gain ahead of the limiter
+    and deepens it: uncorrelated pink at −15 verified at −17.09 LUFS with its offset of 0.99 LU and −15.90 without.
+    Without an offset, pass 2's output matched pass 1's own to within 0.01 LU.
+    Offsets of 0.6 LU or more made the result worse, and smaller ones helped by 0.1–0.2 LU.
+    At 60 minutes, −16 verified on the first attempt and −15.5 needed the corrective re-encode for dual-mono pink.
+    Hence the −16 LUFS cap (§5).
 
 ## 15. Build order
 
