@@ -135,7 +135,7 @@ Each domain package owns its tables, and every transaction stays inside one repo
 src/                         the Go module: go.mod, go.sum and all Go code
   cmd/slumber-mill/main.go   composition root: env config, wiring, subcommands, signal handling
   db/                        Open (GORM config), lease SQL, Migrate (embedded SQL), ID, Clip, GORM logger
-  db/migrations/             0001_init.sql
+  db/migrations/             0001_init.sql, 0002_tenant_target_default.sql
   worker/                    pool runtime: polling, heartbeats, grace, release, backoff, panics
   tenant/                    repository.go, service.go (create, authenticate, webhook target)
   asset/                     repository.go, service.go (upload, get, list, renditions, events), processor.go
@@ -786,6 +786,7 @@ object storage, presigned uploads, signed CDN URLs, and the same write-then-comm
 | Append a member to a SET (up to 8 members) | `ALGORITHM=INSTANT` ✓ |
 | Grow a SET past 8 members (1 → 2 bytes) | ✗ table rebuild required |
 | Add a secondary index | `ALGORITHM=INPLACE, LOCK=NONE` ✓ |
+| Change a column default | `ALGORITHM=INSTANT, LOCK=DEFAULT` ✓; MySQL 8.4 refuses INSTANT with `LOCK=NONE`, `SHARED` or `EXCLUSIVE` |
 | Change collation of an indexed column (even within utf8mb4) | ✗ `ALGORITHM=COPY` only (blocks writes) |
 
 ### README section: zero-downtime migrations (written, not built)
@@ -973,6 +974,8 @@ What the tests must show:
   every rendition lands within 1 LU of target and under the ceiling;
   high-shelved white noise misses the target in its first 64k encode and passes after the corrective re-encode,
   and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers;
+  a speech-like fixture (pink noise band-limited to 100 Hz–5 kHz under a speech envelope, fixed seed)
+  passes verification in both renditions at the default −20 LUFS target;
   a target louder than −16 LUFS is a rejection before ffmpeg runs; a text file is "not audio",
   a missing file is retryable, clips of 0.3 s and 2 s are "too short", a source just over 10 h is "too long"
   at the probe and one of exactly 10 h is accepted, and the thunder fixture is predicted dynamic
@@ -1119,7 +1122,7 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 
 ### Loudness targets
 
-34. **loudnorm's limiter can't lift dense content much past −16 LUFS, and the target offset makes it worse.**
+34. **loudnorm's limiter can't lift dense content much past −16 LUFS, and the target offset changes how far it gets.**
     Mono pink noise already rendered dynamic at −16.
     Its 64k rendition collapsed at −15 (uncorrelated) and −14.5 (dual-mono), to about −19 LUFS at −14.
     Pass 1 reports the shortfall as `target_offset`. Passed to pass 2 as `offset`, it adds gain ahead of the limiter
