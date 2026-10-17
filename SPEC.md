@@ -458,18 +458,20 @@ A corrective re-encode (step 6) adds about 20–32 s per 10 minutes for the rend
    is a **rejection** ("not audio"); so is anything **shorter than 3 s** ("too short", pitfall 20).
 3. **Measure each output layout (pass 1).** For every distinct channel layout among the profiles,
    measure the downmixed signal: `-af aformat=channel_layouts=<layout>,loudnorm=...:print_format=json` (pitfall 15).
-   Run `ebur128` once for max momentary loudness. Integrated `-inf` or below −70 LUFS is a **rejection** ("silent").
+   Run `ebur128` once on the source for max momentary loudness, and once on each layout's downmix.
+   Integrated `-inf` or below −70 LUFS is a **rejection** ("silent").
 4. **Predict linear or dynamic.** Linear gain is only possible if `measured_TP + (target − measured_I) ≤ TP`
    and `measured_LRA ≤ LRA`, where `TP` is the pre-encode true peak passed to loudnorm (not the published ceiling)
    and `LRA` is loudnorm's; otherwise loudnorm silently switches to dynamic mode (pitfall 18).
    loudnorm reads a measured LRA of 0 as unmeasured, so pass `max(measured_LRA, 0.01)`.
-   Render anyway, but record `normalization='dynamic'` and warn.
+   Render anyway and record `normalization='dynamic'`.
 5. **Render (pass 2):** one ffmpeg run, one loudnorm per layout with its own measurements,
    and pass 1's `target_offset` as `offset` (command below; pitfall 34).
    Run it at `-loglevel info`, since the pass-2 report only prints at that level,
    and **check the exit status before parsing any report** (pitfall 21).
 6. **Verify every rendition** (pitfall 16): integrated loudness within ±1 LU of target and true peak
    at or below the published ceiling.
+   The verification pass also records each rendition's max momentary loudness.
    A rendition that fails gets **one corrective re-encode**: its layout alone goes through pass 2 again
    with the same pass-1 measurements and offset, with `volume=<g>dB:precision=double` after `aresample=48000`
    and only that profile's output, and is verified again.
@@ -534,7 +536,8 @@ Loudness and the peak ceiling are therefore **verified properties of each encode
 ### Warnings (publishable, but worth a human ear)
 
 - `sudden_loud_event`: max momentary loudness more than **10 LU** above integrated (pitfall 19).
-- `dynamic_normalization`: linear gain was impossible (step 4).
+- `dynamic_normalization`: a rendition rendered dynamic and flattened loud moments: the downmix's max momentary
+  loudness above integrated exceeds the rendition's by more than **6 LU** (pitfall 18).
 - `source_may_clip`: input true peak above −0.5 dBTP.
 
 ### Rejections, errors and side effects
@@ -962,7 +965,8 @@ What the tests must show:
   and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers;
   a target louder than −16 LUFS is a rejection before ffmpeg runs; a text file is "not audio",
   a missing file is retryable, clips of 0.3 s and 2 s are "too short", and the thunder fixture is predicted dynamic
-  and warned about; a non-zero ffmpeg exit is an error even when a report was printed.
+  and warned about; `dynamic_normalization` fires for the thunder fixture and not for steady pink noise
+  rendered dynamic; a non-zero ffmpeg exit is an error even when a report was printed.
 - **Webhooks:** verification accepts rotation and rejects tampering, a wrong secret,
   stale or future timestamps and garbage; `IsPublic` blocks every listed range, including IPv4-mapped and NAT64 forms;
   the client refuses private addresses and doesn't follow redirects; relaying an event twice yields one delivery;
@@ -1053,7 +1057,9 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     In linear mode the report's `output_tp` and `output_i` aren't the output's
     (−17.19 dBTP and −15.83 LUFS for white noise normalised to −16 LUFS), so only the verification pass's figures are stored.
     Under the −4.5 dBTP pre-encode peak, dense content rarely gets linear mode: at −16 LUFS every pink-noise and
-    narration mono rendition rendered dynamic, so `dynamic_normalization` is common rather than exceptional.
+    narration mono rendition rendered dynamic, so the mode alone says little.
+    On pink noise, narration and speech at −16 and −23 the flattening stayed under 2.1 LU;
+    on thunder in rain and quiet beds with loud events it was 10.3–19.9 LU.
 19. **LRA doesn't detect sudden loud events:** 0.1 LU for the thunder file.
     Max momentary minus integrated does: 21.6 LU, against 0.4 for steady rain.
 20. **Very short clips measure as `-inf`:** a 0.3 s clip reads as silent.
