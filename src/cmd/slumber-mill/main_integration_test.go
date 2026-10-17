@@ -133,8 +133,14 @@ func TestMigrateThenTenantCreate(t *testing.T) {
 		},
 		{
 			name:     "without a webhook",
-			args:     []string{"-slug", "plain", "-target-lufs", "-14"},
-			wantLUFS: -14,
+			args:     []string{"-slug", "plain", "-target-lufs", "-18"},
+			wantLUFS: -18,
+		},
+		{
+			name:       "target louder than -16",
+			args:       []string{"-slug", "loud", "-target-lufs", "-15"},
+			wantCode:   exitError,
+			wantStderr: "target_lufs: must be between -70 and -16",
 		},
 		{
 			name:       "private webhook host",

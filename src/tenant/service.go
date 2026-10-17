@@ -20,7 +20,7 @@ const (
 	maxSlugBytes       = 64
 	maxWebhookURLBytes = 2048
 	minTargetLUFS      = -70
-	maxTargetLUFS      = -5
+	maxTargetLUFS      = -16
 
 	apiKeyPrefix   = "sm_"
 	apiKeyBytes    = len(apiKeyPrefix) + 32
@@ -232,7 +232,7 @@ func (s *Service) validateCreate(ctx context.Context, p CreateParams) error {
 		}
 	}
 	if math.IsNaN(p.TargetLUFS) || p.TargetLUFS < minTargetLUFS || p.TargetLUFS > maxTargetLUFS {
-		v.Add("target_lufs", "must be between -70 and -5")
+		v.Add("target_lufs", "must be between -70 and -16")
 	}
 	return v.Err()
 }
