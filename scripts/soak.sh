@@ -15,7 +15,12 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # prepare takes the project down with its volumes before it starts.
 base=${root##*/}
 base=${base,,}
-project=${COMPOSE_PROJECT_NAME:-${base//[^a-z0-9_-]/}}-soak
+base=${base//[^a-z0-9_-]/}
+[[ -n ${COMPOSE_PROJECT_NAME:-$base} ]] || {
+  echo "soak.sh: the directory name leaves nothing for a project name; set COMPOSE_PROJECT_NAME" >&2
+  exit 1
+}
+project=${COMPOSE_PROJECT_NAME:-$base}-soak
 work=$root/var/out/soak
 data=$work/data
 tenants=$work/tenants
@@ -38,6 +43,9 @@ duplicate_key='^api-[0-9]+ +\| .*"level":"WARN","msg":"query failed","method":"P
 failures=0
 results=()
 follower=
+webhook_kills=0
+idle_kills=0
+uploads_end=0
 
 compose() {
   docker compose --project-directory "$root" -p "$project" --progress quiet \
@@ -156,12 +164,30 @@ prepare() {
   wait_for "the driver to start uploading" 600 logged soak "soak: uploading"
 }
 
+# delivery_in_flight HOSTNAME succeeds when that webhook worker holds a delivery the receiver is hanging on.
+delivery_in_flight() {
+  local n
+  n=$(sql "SELECT COUNT(*) FROM webhook_deliveries WHERE state = 'sending' AND locked_by LIKE '$1:%' \
+AND updated_at BETWEEN NOW(6) - INTERVAL 12 SECOND AND NOW(6) - INTERVAL 5 SECOND") || return 1
+  ((n > 0))
+}
+
 # crash SERVICE N sends SIGKILL to the Nth container of SERVICE and starts it again a few seconds later. Its work in
-# flight stays leased until the other replica's reaper requeues it, and a webhook worker holding the relay lock loses
-# it with its session.
+# flight stays leased until a reaper requeues it, and a webhook worker holding the relay lock loses it with its
+# session. A webhook worker is killed only once it has a delivery in flight, so that the kill leaves one to reap.
 crash() {
-  local cid st
+  local cid st waited=$EPOCHSECONDS patience=$((uploads_end - EPOCHSECONDS))
   cid=$(containers "$1" | sed -n "${2}p")
+  if [[ $1 == worker-webhook ]]; then
+    webhook_kills=$((webhook_kills + 1))
+    ((patience > 180)) && patience=180
+    if wait_for "$(name "$cid") to hold a delivery" "$patience" delivery_in_flight \
+      "$(docker inspect -f '{{.Config.Hostname}}' "$cid")"; then
+      log "chaos: $(name "$cid") held a delivery after $((EPOCHSECONDS - waited))s"
+    else
+      idle_kills=$((idle_kills + 1))
+    fi
+  fi
   log "chaos: SIGKILL $(name "$cid")"
   docker kill -s KILL "$cid" >/dev/null
   wait_for "$(name "$cid") to die" 30 dead "$cid" || true
@@ -203,6 +229,7 @@ check_exit() {
 # chaos injects a failure every chaos_every seconds until the driver's uploads have run for their duration.
 chaos() {
   local until=$(($1 + $(seconds "$SLUMBER_MILL_SOAK_DURATION"))) actions i=0
+  uploads_end=$until
   actions=("crash worker-encode 1" "crash worker-webhook 1" "stop api 1" "crash worker-encode 2"
     "stop worker-webhook 2" "crash worker-webhook 2" "stop worker-webhook 1")
   RANDOM=1
@@ -286,6 +313,27 @@ check_logs() {
     record PASS "$what"
   else
     record FAIL "$what"
+  fi
+  # A webhook worker is SIGKILLed once it holds a delivery, which stays leased until a reaper requeues it, or after
+  # the wait runs out. A hanging delivery may not turn up in time for every kill, so a run needs one that did, and a
+  # delivery reaped, to prove anything.
+  if ((webhook_kills > 0)); then
+    local reaped_deliveries=${reaped["reaped deliveries whose lease expired, requeued"]:-0}
+    reaped_deliveries=$((reaped_deliveries + ${reaped["reaped deliveries whose lease expired, failed"]:-0}))
+    what="a webhook worker was SIGKILLed holding a delivery ($((webhook_kills - idle_kills)) of $webhook_kills were)"
+    if ((idle_kills < webhook_kills)); then
+      record PASS "$what"
+    else
+      record FAIL "$what"
+    fi
+    what="a reaper requeued or failed the deliveries left leased by the SIGKILLs ($reaped_deliveries reaped)"
+    if ((reaped_deliveries > 0)); then
+      record PASS "$what"
+    else
+      record FAIL "$what"
+    fi
+  else
+    echo "  no webhook worker was SIGKILLed, so no delivery reap was expected"
   fi
   what="the duplicate-key WARN lines number no more than the uploads that could race ($duplicates, at most ${bound:-unknown})"
   if [[ $bound =~ ^[0-9]+$ ]] && ((duplicates <= bound)); then

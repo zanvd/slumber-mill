@@ -231,7 +231,10 @@ has none, and their targets range from -16 to -23 LUFS. -16 is the loudest targe
 - **Failures.** Every `SLUMBER_MILL_SOAK_CHAOS_EVERY` seconds (default 45) the script injects one failure, taking
   them in turn. It sends SIGKILL to an encode worker or a webhook worker and restarts it 5-20 seconds later; that
   leaves leases for the other replica to reap, and a killed webhook worker that holds the relay lock loses it with
-  its session. Or it runs `docker stop` on a webhook worker or the API, then starts it again.
+  its session. Before it kills a webhook worker it waits, for up to 3 minutes or until the uploads stop, until the
+  worker has held a delivery for 5-12 seconds. Only a delivery the receiver is hanging on lasts that long, and it
+  stays in flight for 15 seconds, so the kill leaves one leased. If none turns up in time, the kill goes ahead
+  anyway. Or the script runs `docker stop` on a webhook worker or the API, then starts it again.
 - **The checks.** When the uploads stop, the driver waits up to `SLUMBER_MILL_SOAK_DRAIN_TIMEOUT` (default `15m`)
   for every asset and delivery to finish and every event to be relayed. Then it checks these invariants:
   - the run did enough for the rest to mean something: every kind of upload, a ready asset, a failure with each
@@ -250,18 +253,24 @@ has none, and their targets range from -16 to -23 LUFS. -16 is the loudest targe
     with a 410 failed;
   - every webhook's asset equals the API's final asset.
 
-  The script also checks that each stopped container exited 0, or 137 after a SIGKILL. It fails on any deadlock or
-  lock wait timeout in the services' logs, and on any ERROR line. GORM logs the losing insert of two racing uploads
-  with the same key as a `query failed` WARN, which is normal. The script counts those lines, and they may number
-  no more than the driver's concurrent pairs plus its retries after a connection error.
+  The script also checks that each stopped container exited 0, or 137 after a SIGKILL. A run that SIGKILLs a webhook
+  worker fails unless at least one such kill found a delivery in flight and a reaper requeued at least one delivery.
+  A hanging delivery is 6% of events, so a kill may find none within its wait. The webhook workers are killed by the
+  2nd and 6th failures, and the 6th comes six intervals and three restarts in, about 5 minutes with the default
+  interval. The reap checks need a run long enough for both kills, so set `SLUMBER_MILL_SOAK_DURATION` to `6m` or
+  more; a shorter run has one kill, or none, and can fail the reap check by chance. The script also fails on any
+  deadlock or lock wait timeout in the services' logs, and on any ERROR line. GORM logs the losing insert of two
+  racing uploads with the same key as a `query failed` WARN, which is normal. The script counts those lines, and
+  they may number no more than the driver's concurrent pairs plus its retries after a connection error.
 
 A run takes the duration plus 3-5 minutes to build, start and drain. It uses about 4 of the host's CPUs for
 the two encode workers. The project is `<name>-soak`, where `<name>` is `COMPOSE_PROJECT_NAME` or, as Compose
-itself defaults it, the checkout's directory name in lower case. That keeps soaks run from two checkouts apart. The
-project uses `var/out/soak/data` as its data directory and publishes no port. At the end the script takes the project
-down with its volumes and images. The driver's summary is left in `var/out/soak/summary.txt`, with its log in
-`driver.log` and the services' logs in `compose.log`. Webhook delivery is at-least-once, so the summary counts the
-duplicates the receiver saw, but they don't fail the soak.
+itself defaults it, the checkout's directory name in lower case. That keeps soaks run from two checkouts apart; if
+the directory name has no letters, digits, hyphens or underscores, the script stops until `COMPOSE_PROJECT_NAME` is
+set. The project uses `var/out/soak/data` as its data directory and publishes no port. At the end the script takes
+the project down with its volumes and images. The driver's summary is left in `var/out/soak/summary.txt`, with its
+log in `driver.log` and the services' logs in `compose.log`. Webhook delivery is at-least-once, so the summary counts
+the duplicates the receiver saw, but they don't fail the soak.
 
 ### MySQL connection limit
 
