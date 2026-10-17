@@ -142,6 +142,7 @@ func (p *Pool) handle(ctx context.Context, l Lease) {
 		With("id", l.ID, "tenant_id", l.TenantID, "attempt", l.Attempt)
 	work, cancel := context.WithCancelCause(logging.CtxWithLogger(context.WithoutCancel(ctx), log))
 	defer cancel(nil)
+	log.InfoContext(work, "work claimed")
 
 	err := ctx.Err() // claimed as the pool stopped: release it unstarted
 	if err == nil {

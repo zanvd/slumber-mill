@@ -97,7 +97,8 @@ type Relay struct {
 	events  eventSource
 	tenants webhookTenants
 	// lock is nil unless this relay holds the relay lock.
-	lock relayLock
+	lock      relayLock
+	whileHeld func(ctx context.Context)
 }
 
 func NewRelay(r relayRepo, events eventSource, tenants webhookTenants) (*Relay, error) {
@@ -112,10 +113,18 @@ func NewRelay(r relayRepo, events eventSource, tenants webhookTenants) (*Relay, 
 	return &Relay{repo: r, events: events, tenants: tenants}, nil
 }
 
+// WhileHeld sets f to run in Run, in its own goroutine, for as long as the relay holds the lock.
+// Call it before Run.
+func (r *Relay) WhileHeld(f func(ctx context.Context)) {
+	r.whileHeld = f
+}
+
 // Run calls Once, waiting a second after each call, until ctx is cancelled. Then it gives up the relay lock.
 func (r *Relay) Run(ctx context.Context) {
 	log := logging.LoggerFromContext(ctx)
+	var held heldTask
 	defer func() {
+		held.stop()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 		defer cancel()
 		if err := r.Close(ctx); err != nil {
@@ -123,11 +132,44 @@ func (r *Relay) Run(ctx context.Context) {
 		}
 	}()
 	for ctx.Err() == nil {
-		if _, _, err := r.Once(ctx); err != nil && ctx.Err() == nil {
+		isHeld, _, err := r.Once(ctx)
+		if err != nil && ctx.Err() == nil {
 			log.ErrorContext(ctx, "relay failed", "error", err)
+		}
+		if isHeld && ctx.Err() == nil {
+			held.start(ctx, r.whileHeld)
+		} else {
+			held.stop()
 		}
 		sleep(ctx, relayInterval)
 	}
+}
+
+type heldTask struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (h *heldTask) start(ctx context.Context, f func(ctx context.Context)) {
+	if f == nil || h.cancel != nil {
+		return
+	}
+	ctx, h.cancel = context.WithCancel(ctx)
+	done := make(chan struct{})
+	h.done = done
+	go func() {
+		defer close(done)
+		f(ctx)
+	}()
+}
+
+func (h *heldTask) stop() {
+	if h.cancel == nil {
+		return
+	}
+	h.cancel()
+	<-h.done
+	*h = heldTask{}
 }
 
 // Once takes the relay lock if neither this relay nor another holds it. Holding the lock, it relays batches of
@@ -394,15 +436,10 @@ func (d *Deliverer) DeleteDelivered(ctx context.Context, age time.Duration) (del
 // toWorker passes on a repository error, matching worker.ErrLeaseLost if the lease was lost.
 func toWorker(err error) error {
 	if errors.Is(err, errLeaseLost) {
-		return &leaseLostError{err: err}
+		return worker.LeaseLost(err)
 	}
 	return err
 }
-
-type leaseLostError struct{ err error }
-
-func (e *leaseLostError) Error() string { return e.err.Error() }
-func (e *leaseLostError) Unwrap() error { return worker.ErrLeaseLost }
 
 func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)

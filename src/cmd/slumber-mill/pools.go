@@ -58,17 +58,16 @@ func sweepTemp(ctx context.Context, log *slog.Logger, files tempSweeper, age tim
 	log.InfoContext(ctx, "swept temp files", "older_than", age.String(), "removed", removed)
 }
 
-// runWebhook runs the relay, the delivery pool and retention until ctx is done and all of them have stopped.
+// runWebhook runs the relay and the delivery pool until ctx is done and both have stopped.
 // The relay gives up its lock as it stops, and the pool releases deliveries still in flight once the grace runs out.
 // The client's idle connections are closed after the pool has stopped, when nothing can reuse them.
-func runWebhook(ctx context.Context, relay, deliveries runner, client idleCloser, deleteOld func(context.Context)) {
+func runWebhook(ctx context.Context, relay, deliveries runner, client idleCloser) {
 	var wg sync.WaitGroup
 	wg.Go(func() { relay.Run(ctx) })
 	wg.Go(func() {
 		deliveries.Run(ctx)
 		client.CloseIdleConnections()
 	})
-	wg.Go(func() { deleteOld(ctx) })
 	wg.Wait()
 }
 

@@ -44,7 +44,7 @@ const (
 	// so a delivery rarely needs a heartbeat.
 	webhookLease = time.Minute
 	retention    = 30 * 24 * time.Hour
-	// retentionInterval is how long the webhook pool waits after a retention run before the next.
+	// retentionInterval is how long the worker holding the relay lock waits after a retention run before the next.
 	retentionInterval = time.Hour
 )
 
@@ -333,9 +333,10 @@ func runWebhookPool(ctx context.Context, log *slog.Logger, getenv func(string) s
 
 	poolLog.InfoContext(ctx, "worker pool started", "concurrency", cfg.Concurrency, "lease", webhookLease.String(),
 		"grace", cfg.ShutdownGrace.String())
-	runWebhook(logging.CtxWithLogger(ctx, poolLog), relay, deliveries, client, func(ctx context.Context) {
+	relay.WhileHeld(func(ctx context.Context) {
 		retain(ctx, retention, retentionInterval, assets.DeleteRelayedEvents, deliverer.DeleteDelivered)
 	})
+	runWebhook(logging.CtxWithLogger(ctx, poolLog), relay, deliveries, client)
 	poolLog.InfoContext(ctx, "worker pool stopped")
 	return nil
 }

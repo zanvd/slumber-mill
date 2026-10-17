@@ -260,8 +260,7 @@ func TestRunWebhook(t *testing.T) {
 				go func() {
 					defer close(done)
 					runWebhook(ctx, fakeLoop{name: "relay", stopping: tt.relayStops, steps: steps},
-						fakeLoop{name: "deliveries", stopping: tt.poolStops, steps: steps}, fakeClient{steps: steps},
-						fakeLoop{name: "retention", steps: steps}.Run)
+						fakeLoop{name: "deliveries", stopping: tt.poolStops, steps: steps}, fakeClient{steps: steps})
 					steps.add("returned")
 				}()
 
@@ -269,7 +268,7 @@ func TestRunWebhook(t *testing.T) {
 				synctest.Wait()
 				got := steps.names()
 				slices.Sort(got)
-				if want := []string{"deliveries started", "relay started", "retention started"}; !slices.Equal(got, want) {
+				if want := []string{"deliveries started", "relay started"}; !slices.Equal(got, want) {
 					t.Errorf("steps before the signal = %q, want %q", got, want)
 				}
 				cancel()
@@ -279,7 +278,6 @@ func TestRunWebhook(t *testing.T) {
 					"relay stopped":           running + tt.relayStops,
 					"deliveries stopped":      running + tt.poolStops,
 					"idle connections closed": running + tt.poolStops,
-					"retention stopped":       running,
 					"returned":                running + max(tt.relayStops, tt.poolStops),
 				}
 				for name, at := range want {

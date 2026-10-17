@@ -23,6 +23,22 @@ type Lease struct {
 	Attempt      int
 }
 
+type leaseLostError struct {
+	err error
+}
+
+func (e *leaseLostError) Error() string { return e.err.Error() }
+func (e *leaseLostError) Unwrap() error { return ErrLeaseLost }
+
+// LeaseLost wraps a repository's lease-lost error so that it matches ErrLeaseLost and keeps its message.
+// LeaseLost(nil) is nil.
+func LeaseLost(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &leaseLostError{err: err}
+}
+
 type permanentError struct {
 	err error
 }
