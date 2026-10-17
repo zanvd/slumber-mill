@@ -573,9 +573,6 @@ func TestProcessRefusesBadArguments(t *testing.T) {
 		target  float64
 		outputs []Output
 	}{
-		{"target too low", -70.1, outputs()},
-		{"target too high", -4.9, outputs()},
-		{"target not a number", math.NaN(), outputs()},
 		{"no outputs", -16, nil},
 		{"no path", -16, []Output{{Profile: Profiles()[0]}}},
 		{"three channels", -16, []Output{{Profile: Profile{Name: "x", BitrateKbps: 64, MaxChannels: 3}, Path: "/x"}}},
@@ -598,13 +595,38 @@ func TestProcessRefusesBadArguments(t *testing.T) {
 	}
 }
 
+func TestProcessRejectsOutOfRangeTargets(t *testing.T) {
+	tests := []struct {
+		name   string
+		target float64
+	}{
+		{"just louder than -16", -15.9},
+		{"louder than loudnorm's range", -4.9},
+		{"quieter than loudnorm's range", -70.1},
+		{"not a number", math.NaN()},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &fakeRunner{}
+			_, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", tc.target, outputs())
+			rej, ok := errors.AsType[*Rejection](err)
+			if !ok || rej.Message != MessageTargetOutOfRange {
+				t.Errorf("Process() error = %v, want a rejection with %q", err, MessageTargetOutOfRange)
+			}
+			if len(run.calls) != 0 {
+				t.Errorf("Process() ran %d commands, want none", len(run.calls))
+			}
+		})
+	}
+}
+
 func TestValidateAcceptsLoudnormsLimits(t *testing.T) {
 	tests := []struct {
 		name   string
 		target float64
 	}{
 		{"lowest target", -70},
-		{"highest target", -5},
+		{"highest target", -16},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

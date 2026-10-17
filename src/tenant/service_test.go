@@ -87,7 +87,7 @@ func TestCreateValidation(t *testing.T) {
 		urlASCII   = "must be printable ASCII without spaces"
 		userinfo   = "must not contain a user name or password"
 		fragment   = "must not contain a fragment"
-		lufsRange  = "must be between -70 and -5"
+		lufsRange  = "must be between -70 and -16"
 		urlPrefix  = "https://example.com/"
 		maxURLPath = 2048 - len(urlPrefix)
 	)
@@ -164,12 +164,13 @@ func TestCreateValidation(t *testing.T) {
 		{"empty fragment", webhookURL("https://example.com/hooks#"), "webhook_url", fragment},
 
 		{"lowest target", lufs(-70), "", ""},
-		{"highest target", lufs(-5), "", ""},
+		{"highest target", lufs(-16), "", ""},
 		{"rounds onto the lowest target", lufs(-69.96), "", ""},
-		{"rounds onto the highest target", lufs(-5.04), "", ""},
+		{"rounds onto the highest target", lufs(-16.04), "", ""},
 		{"below the lowest target", lufs(-70.1), "target_lufs", lufsRange},
 		{"rounds onto the lowest target from below", lufs(-70.04), "target_lufs", lufsRange},
-		{"above the highest target", lufs(-4.9), "target_lufs", lufsRange},
+		{"above the highest target", lufs(-15.9), "target_lufs", lufsRange},
+		{"loudnorm's highest target", lufs(-5), "target_lufs", lufsRange},
 		{"zero target", lufs(0), "target_lufs", lufsRange},
 		{"NaN target", lufs(math.NaN()), "target_lufs", lufsRange},
 		{"infinite target", lufs(math.Inf(1)), "target_lufs", lufsRange},
@@ -280,11 +281,10 @@ func TestCreateRoundsTargetLUFS(t *testing.T) {
 	}{
 		{-16, -16},
 		{-23.5, -23.5},
-		{-14.25, -14.3},
-		{-14.24, -14.2},
+		{-18.25, -18.3},
+		{-18.24, -18.2},
 		{-16.04, -16},
 		{-69.96, -70},
-		{-5.04, -5},
 	}
 	for _, tc := range tests {
 		t.Run(fmt.Sprint(tc.in), func(t *testing.T) {
