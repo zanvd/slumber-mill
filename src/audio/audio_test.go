@@ -299,7 +299,7 @@ func TestProcessCorrectsARendition(t *testing.T) {
 				s := stereoScript()
 				s[3].stderr = report(verifyInstance, stereoLoud, Linear)
 				return append(s,
-					fakeResponse{stderr: report("loudnorm@stereo", stereoEncoded, Linear)},
+					fakeResponse{stderr: report("loudnorm@stereo", stereoEncoded, Dynamic)},
 					fakeResponse{stderr: report(verifyInstance, stereoCorrected, Linear)},
 				)
 			}(),
@@ -311,7 +311,7 @@ func TestProcessCorrectsARendition(t *testing.T) {
 				"-map [o0] -map_metadata -1 -c:a aac -b:a 128k -cutoff 20000 -movflags +faststart -f mp4 /data/tmp/part-1",
 			want: Rendition{
 				Profile: Profiles()[0], Path: "/data/tmp/part-1", Channels: 2, Measured: stereoMeasured,
-				Predicted: Linear, Normalization: Linear, Loudness: stereoCorrected,
+				Predicted: Linear, Normalization: Dynamic, Loudness: stereoCorrected,
 			},
 			log: `"profile":"aac_128k","gain_db":-1.01,"first_lufs":-14.99,"first_true_peak_dbtp":-3,` +
 				`"lufs":-16.01,"true_peak_dbtp":-4.02`,
