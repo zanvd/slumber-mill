@@ -40,6 +40,21 @@ func UncorrelatedWhite(tb testing.TB) string {
 		"[0:a][1:a]amerge=inputs=2")
 }
 
+// BrightWhite is UncorrelatedWhite with its treble raised. Its first 64k encode misses the target,
+// and a corrective re-encode brings it back.
+func BrightWhite(tb testing.TB) string {
+	tb.Helper()
+	return audioFixture(tb, "bright-white.wav",
+		[]string{noise("white", 0.25, 3, noiseDuration), noise("white", 0.25, 4, noiseDuration)},
+		"[0:a][1:a]amerge=inputs=2,highshelf=g=3:f=12000")
+}
+
+// BlueNoise is dual-mono blue noise. Both renditions miss the target by more than a corrective re-encode makes up.
+func BlueNoise(tb testing.TB) string {
+	tb.Helper()
+	return audioFixture(tb, "blue-noise.wav", []string{noise("blue", 0.25, 3, noiseDuration)}, "", "-ac", "2")
+}
+
 // MonoPink is one channel of pink noise.
 func MonoPink(tb testing.TB) string {
 	tb.Helper()
