@@ -973,7 +973,8 @@ What the tests must show:
   high-shelved white noise misses the target in its first 64k encode and passes after the corrective re-encode,
   and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers;
   a target louder than −16 LUFS is a rejection before ffmpeg runs; a text file is "not audio",
-  a missing file is retryable, clips of 0.3 s and 2 s are "too short", and the thunder fixture is predicted dynamic
+  a missing file is retryable, clips of 0.3 s and 2 s are "too short", a source just over 10 h is "too long"
+  at the probe and one of exactly 10 h is accepted, and the thunder fixture is predicted dynamic
   and warned about; `dynamic_normalization` fires for the thunder fixture and not for steady pink noise
   rendered dynamic; a non-zero ffmpeg exit is an error even when a report was printed.
 - **Webhooks:** verification accepts rotation and rejects tampering, a wrong secret,
