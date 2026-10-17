@@ -15,7 +15,12 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # prepare takes the project down with its volumes before it starts.
 base=${root##*/}
 base=${base,,}
-project=${COMPOSE_PROJECT_NAME:-${base//[^a-z0-9_-]/}}-soak
+base=${base//[^a-z0-9_-]/}
+[[ -n ${COMPOSE_PROJECT_NAME:-$base} ]] || {
+  echo "soak.sh: the directory name leaves nothing for a project name; set COMPOSE_PROJECT_NAME" >&2
+  exit 1
+}
+project=${COMPOSE_PROJECT_NAME:-$base}-soak
 work=$root/var/out/soak
 data=$work/data
 tenants=$work/tenants
