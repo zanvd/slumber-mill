@@ -106,7 +106,8 @@ webhook_secret: whsec_...
 ```
 
 The `webhook_secret` line appears only when the tenant has a `-webhook-url`. Only hashes and ciphertext are stored,
-so if you lose them, they are gone. Logs go to stderr as JSON. `-target-lufs` defaults to -16 and must be from -70 to -5.
+so if you lose them, they are gone. Logs go to stderr as JSON.
+`-target-lufs` defaults to -16, which is also the loudest allowed, and must be from -70 to -16.
 The command refuses a webhook URL whose host isn't public.
 
 Exit codes, for every subcommand: 0 for success or help, 1 for a runtime or configuration error,
@@ -186,9 +187,7 @@ Uploads go through a pinned `curlimages/curl` container on the project's network
 encode lease is its 1 minute minimum. A driver, the `soak` service in `scripts/soak.compose.yaml`, runs
 `TestFullStackSoak` (build tag `soak`) from the `dev` image on the project's network. The script creates five
 tenants with `tenant create` in the `api` service. Four have webhooks pointing at the driver's receiver; the fifth
-has none, and their targets range from -16 to -23 LUFS. A higher target, such as -14, would get most of the noise
-fixtures rejected. Under the -4.5 dBTP pre-encode peak, loudnorm can't reach the target in linear mode, so it falls
-back to dynamic mode and lands more than 1 LU short.
+has none, and their targets range from -16 to -23 LUFS. -16 is the loudest target `tenant create` accepts.
 
 - **Uploads.** Ten uploaders go through the API for `SLUMBER_MILL_SOAK_DURATION` (default `10m`), and pause while
   12 assets are unfinished. They send 5-20 second stereo, mono and 5.1 noise fixtures from fixed seeds, an
@@ -373,8 +372,9 @@ For a change that spans a deploy (not built, only written down here):
 - **Bright content needs a second encode at 64k.** White noise, hiss and rain lose about 1 LU in the 64k encode,
   which has no `-cutoff`; the corrective re-encode puts it back at the cost of about 20-32 s per 10 minutes.
   Content that loses more than 1.5 LU, such as heavily treble-boosted noise, is rejected.
-- **Bright content at loud targets can fail the peak ceiling.** Around -9 LUFS and above, the encoder's added
-  peaks leave too little headroom.
+- **Targets louder than -16 LUFS aren't supported.** loudnorm's limiter can't lift dense content past about -16,
+  so `tenant create` refuses them, and an asset of a tenant created before the cap is rejected with
+  "target loudness must be from -70 to -16 LUFS".
 - **Re-sealing webhook secrets under a new key is documented, not built.** A new key can go first in the key ring,
   and older ciphertexts still open; re-sealing the old rows and then dropping the old key is manual.
 - **The webhook egress check and NAT64.** See "SSRF defences" above.
