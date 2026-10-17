@@ -446,6 +446,7 @@ Under `cpus: 2` one stereo encode took about 93 s per 10 minutes of audio on a w
 and 119 s on a 60-minute file; with two 60-minute encodes sharing two cores, 126 s and 151 s
 (about 160–175 s while fully overlapped), so a 10-hour soundscape needs roughly 2–3 hours (pitfall 23),
 and size the timeout, the lease and the pool's CPU limit with that in mind.
+A corrective re-encode (step 6) adds about 20–32 s per 10 minutes for the rendition it corrects.
 
 ### Steps
 
@@ -467,8 +468,15 @@ and size the timeout, the lease and the pool's CPU limit with that in mind.
    Run it at `-loglevel info`, since the pass-2 report only prints at that level,
    and **check the exit status before parsing any report** (pitfall 21).
 6. **Verify every rendition** (pitfall 16): integrated loudness within ±1 LU of target and true peak
-   at or below the published ceiling. Store each rendition's `lufs`, `true_peak_dbtp`, `lra_lu` and `normalization`;
-   a failed check is a **rejection** with the numbers.
+   at or below the published ceiling.
+   A rendition that fails gets **one corrective re-encode**: its layout alone goes through pass 2 again
+   with the same pass-1 measurements and offset, with `volume=<g>dB:precision=double` after `aresample=48000`
+   and only that profile's output, and is verified again.
+   The gain `g` is `target − LUFS`, lowered where needed so that `true peak + g ≤ ceiling − 0.5`.
+   The re-encode runs only if `|g| ≤ 1.5` dB and `LUFS + g` is within 0.8 LU of target.
+   The applied gain is logged at WARN with the first attempt's loudness and true peak (pitfall 17).
+   Store each rendition's final `lufs`, `true_peak_dbtp`, `lra_lu` and `normalization`.
+   A rendition that fails and can't be corrected, or fails again, is a **rejection** with the numbers of its last attempt.
 7. **Hash and promote** each output to `renditions/<tenant>/<asset>/<profile>.m4a` (§10).
 8. **Complete** (§6): renditions, measurements, warnings, `ready` and the `asset.ready` event, in one transaction.
 
@@ -487,6 +495,9 @@ The pass-2 command from step 5 (line breaks added for readability):
 -map [o1] -map_metadata -1 -c:a aac -b:a 64k                -movflags +faststart -f mp4 tmp1
 ```
 
+The corrective re-encode is the same command for one layout and one output,
+with `,volume=<g>dB:precision=double` after `aresample=48000`.
+
 ### Profiles
 
 | Profile | Bitrate | Channels | Purpose |
@@ -501,6 +512,8 @@ because resampling and the encoder add true peak (pitfall 17), and `LRA=50`, its
 it never blocks linear mode, and lower values pull dynamic renders off target.
 A lower `TP` doesn't buy more: at −5.0 the worst 64k peak was no lower,
 and at −6.0 the 64k rendition of pink noise landed 3–5 LU under target.
+The 64k profile keeps the encoder's default low-pass: no `-cutoff` brought 10-minute white noise within tolerance
+without pushing pink noise over the ceiling, so the corrective re-encode covers it.
 
 ### Why per-rendition loudness (measured)
 
@@ -528,7 +541,8 @@ Loudness and the peak ceiling are therefore **verified properties of each encode
   failing stores it in `assets.error`. Any other cause becomes "processing failed after repeated attempts".
   ffmpeg's stderr, which contains internal paths, stays in logs and `last_error`.
 - **Outputs are deterministic and promoted by atomic rename**, so if an attempt loses its lease after promoting,
-  the files it left are identical to what the winner writes.
+  the files it left are identical to what the winner writes,
+  including a corrective re-encode, whose gain comes from deterministic measurements.
 - **Loops:** AAC in MP4 isn't sample-accurate (pitfall 22), so seamless soundscapes can click at every seam
   unless players honour gapless metadata or crossfade. The README flags it for the players; solving it is out of scope.
 
@@ -939,7 +953,9 @@ What the tests must show:
   a panic is a failed attempt and the worker survives; the claim is `FOR UPDATE SKIP LOCKED`,
   and no write sets timestamps or drops zero values (checked with GORM's dry run, no database).
 - **Audio:** for every fixture (dual-mono pink, uncorrelated pink, uncorrelated white),
-  every rendition lands within 1 LU of target and under the ceiling; a text file is "not audio",
+  every rendition lands within 1 LU of target and under the ceiling;
+  high-shelved white noise misses the target in its first 64k encode and passes after the corrective re-encode,
+  and blue noise, beyond the re-encode's bound, is rejected with the first attempt's numbers; a text file is "not audio",
   a missing file is retryable, clips of 0.3 s and 2 s are "too short", and the thunder fixture is predicted dynamic
   and warned about; a non-zero ffmpeg exit is an error even when a report was printed.
 - **Webhooks:** verification accepts rotation and rejects tampering, a wrong secret,
@@ -1020,12 +1036,17 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     `TP`. With −4.0, 10- and 60-minute pink noise came out at −2.35 to −1.26 dBTP, 3 of 12 runs over the ceiling.
     With −4.5 the worst of 9 was −1.84, with −5.0 the worst of 11 was −1.69, and with −6.0 the rendition fell to
     −19 to −21 LUFS. The worst peak grew by roughly 0.3–0.5 dB for every tenfold increase in length, so a 10-hour
-    noise soundscape can still exceed the ceiling. Resampling loudnorm's 192 kHz output to 48 kHz adds 0.1–0.3 dB on
-    its own. At 64k, which has no `-cutoff`, white noise of 10 minutes or more measured −17.04 LUFS against a −16
-    target.
+    noise soundscape can still exceed the ceiling. Resampling loudnorm's 192 kHz output to 48 kHz added 0.00–0.24 dB
+    of true peak at −16 LUFS (pink noise and narration, 10 minutes), nothing in linear mode, and 1.3–2.3 dB on white
+    noise rendered dynamic at −10 LUFS; soxr at `precision=28` was no better and the encoded files came out the same.
+    At 64k, which has no `-cutoff`, white noise of 10 minutes or more measured −17.04 LUFS against a −16 target.
+    No 64k cutoff fixed that without pushing pink noise over the ceiling, but loudness follows a pre-encode `volume`
+    within 0.02 LU on 10- and 60-minute noise, and 0.1 LU on a 10-second fixture, so one corrective re-encode fixes it (§7 step 6).
 18. **loudnorm's linear mode is a request.** A thunder crack in quiet rain made it fall back to dynamic mode silently:
     on target overall (−16.09), but the rain bed rose from −45.3 to −13.2 LUFS.
     The report saying so only prints at info level.
+    In linear mode the report's `output_tp` and `output_i` aren't the output's
+    (−17.19 dBTP and −15.83 LUFS for white noise normalised to −16 LUFS), so only the verification pass's figures are stored.
 19. **LRA doesn't detect sudden loud events:** 0.1 LU for the thunder file.
     Max momentary minus integrated does: 21.6 LU, against 0.4 for steady rain.
 20. **Very short clips measure as `-inf`:** a 0.3 s clip reads as silent.

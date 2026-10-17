@@ -96,6 +96,22 @@ func stereoScript() []fakeResponse {
 	}
 }
 
+var (
+	monoShort     = Loudness{LUFS: -17.3, TruePeakDBTP: -6.79, LRALU: 0.4, ThresholdLUFS: -27.3}
+	monoCorrected = Loudness{LUFS: -15.98, TruePeakDBTP: -5.47, LRALU: 0.4, ThresholdLUFS: -25.98}
+)
+
+// correctiveScript is stereoScript with a 64k rendition that verifies 1.3 LU short of the target,
+// then its corrective re-encode and second verification.
+func correctiveScript() []fakeResponse {
+	s := stereoScript()
+	s[4].stderr = report(verifyInstance, monoShort, Dynamic)
+	return append(s,
+		fakeResponse{stderr: report("loudnorm@mono", monoEncoded, Dynamic)},
+		fakeResponse{stderr: report(verifyInstance, monoCorrected, Dynamic)},
+	)
+}
+
 func outputs() []Output {
 	return []Output{{Profile: Profiles()[0], Path: "/data/tmp/part-1"}, {Profile: Profiles()[1], Path: "/data/tmp/part-2"}}
 }
@@ -131,14 +147,17 @@ func TestProcess(t *testing.T) {
 	}
 }
 
+// The whitelists only apply to an input they precede.
+const (
+	whitelists = "-protocol_whitelist file -format_whitelist wav,mp3,flac,ogg,mov,aac,matroska,aiff"
+	common     = "-nostdin -hide_banner -nostats -loglevel info " + whitelists
+)
+
 func TestProcessCommands(t *testing.T) {
 	run := &fakeRunner{responses: stereoScript()}
 	if _, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs()); err != nil {
 		t.Fatalf("Process() error = %v", err)
 	}
-	// The whitelists only apply to an input they precede.
-	const whitelists = "-protocol_whitelist file -format_whitelist wav,mp3,flac,ogg,mov,aac,matroska,aiff"
-	const common = "-nostdin -hide_banner -nostats -loglevel info " + whitelists
 	want := []string{
 		"ffprobe -v error " + whitelists +
 			" -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels:format=duration -of json /src.wav",
@@ -247,14 +266,112 @@ func TestProcessLayouts(t *testing.T) {
 	}
 }
 
+func TestProcessCorrectsARendition(t *testing.T) {
+	stereoLoud := Loudness{LUFS: -14.99, TruePeakDBTP: -3, LRALU: 0.3, ThresholdLUFS: -24.99}
+	stereoCorrected := Loudness{LUFS: -16.01, TruePeakDBTP: -4.02, LRALU: 0.3, ThresholdLUFS: -26.01}
+	tests := []struct {
+		name string
+		// failing is the index of the rendition that fails its first verification.
+		failing int
+		script  []fakeResponse
+		retry   string
+		want    Rendition
+		log     string
+	}{
+		{
+			name: "aac_64k short of the target", failing: 1, script: correctiveScript(),
+			retry: "ffmpeg -y " + common + " -i /src.wav -filter_complex " +
+				"[0:a:0]asplit=1[s0];" +
+				"[s0]aformat=channel_layouts=mono,loudnorm@mono=I=-16:TP=-4.5:LRA=50:measured_I=-20.7:measured_TP=-6.59:" +
+				"measured_LRA=0.1:measured_thresh=-30.7:offset=0.07:linear=true:print_format=json,aresample=48000," +
+				"volume=1.3dB:precision=double[o0] " +
+				"-map [o0] -map_metadata -1 -c:a aac -b:a 64k -movflags +faststart -f mp4 /data/tmp/part-2",
+			want: Rendition{
+				Profile: Profiles()[1], Path: "/data/tmp/part-2", Channels: 1, Measured: monoMeasured,
+				Predicted: Dynamic, Normalization: Dynamic, Loudness: monoCorrected,
+			},
+			log: `"profile":"aac_64k","gain_db":1.3,"first_lufs":-17.3,"first_true_peak_dbtp":-6.79,` +
+				`"lufs":-15.98,"true_peak_dbtp":-5.47`,
+		},
+		{
+			name: "aac_128k over the target", failing: 0,
+			script: func() []fakeResponse {
+				s := stereoScript()
+				s[3].stderr = report(verifyInstance, stereoLoud, Linear)
+				return append(s,
+					fakeResponse{stderr: report("loudnorm@stereo", stereoEncoded, Dynamic)},
+					fakeResponse{stderr: report(verifyInstance, stereoCorrected, Linear)},
+				)
+			}(),
+			retry: "ffmpeg -y " + common + " -i /src.wav -filter_complex " +
+				"[0:a:0]asplit=1[s0];" +
+				"[s0]aformat=channel_layouts=stereo,loudnorm@stereo=I=-16:TP=-4.5:LRA=50:measured_I=-17.69:measured_TP=-7.26:" +
+				"measured_LRA=0.1:measured_thresh=-27.69:offset=-0.31:linear=true:print_format=json,aresample=48000," +
+				"volume=-1.01dB:precision=double[o0] " +
+				"-map [o0] -map_metadata -1 -c:a aac -b:a 128k -cutoff 20000 -movflags +faststart -f mp4 /data/tmp/part-1",
+			want: Rendition{
+				Profile: Profiles()[0], Path: "/data/tmp/part-1", Channels: 2, Measured: stereoMeasured,
+				Predicted: Linear, Normalization: Dynamic, Loudness: stereoCorrected,
+			},
+			log: `"profile":"aac_128k","gain_db":-1.01,"first_lufs":-14.99,"first_true_peak_dbtp":-3,` +
+				`"lufs":-16.01,"true_peak_dbtp":-4.02`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &fakeRunner{responses: tc.script}
+			var logs bytes.Buffer
+			ctx := logging.CtxWithLogger(t.Context(), slog.New(slog.NewJSONHandler(&logs, nil)))
+
+			res, err := (&FFmpeg{run: run}).Process(ctx, "/src.wav", -16, outputs())
+			if err != nil {
+				t.Fatalf("Process() error = %v", err)
+			}
+			if len(run.calls) != 7 {
+				t.Fatalf("Process() ran %d commands, want 7: pass 2 and a verification again for one rendition", len(run.calls))
+			}
+			if got := run.calls[5].name + " " + strings.Join(run.calls[5].args, " "); got != tc.retry {
+				t.Errorf("the corrective re-encode ran\n%s\nwant\n%s", got, tc.retry)
+			}
+			if first, again := run.calls[3+tc.failing].args, run.calls[6].args; !slices.Equal(again, first) {
+				t.Errorf("the second verification ran %q, want %q", again, first)
+			}
+			if got := res.Renditions[tc.failing]; got != tc.want {
+				t.Errorf("rendition %d = %+v\nwant %+v", tc.failing, got, tc.want)
+			}
+			kept := []Loudness{stereoEncoded, monoEncoded}
+			if other := 1 - tc.failing; res.Renditions[other].Loudness != kept[other] {
+				t.Errorf("rendition %d verified at %+v, want its first verification %+v",
+					other, res.Renditions[other].Loudness, kept[other])
+			}
+			if !strings.Contains(logs.String(), `"level":"WARN","msg":"re-encoded a rendition with a corrective gain",`+tc.log) {
+				t.Errorf("logs = %s, want a warning with %s", &logs, tc.log)
+			}
+			if n := strings.Count(logs.String(), "corrective gain"); n != 1 {
+				t.Errorf("logs = %s, want one corrective re-encode, not %d", &logs, n)
+			}
+		})
+	}
+}
+
 // TestProcessChecksExitStatusFirst runs each ffmpeg stage so that it prints complete reports
 // and then exits non-zero, as an interrupted ffmpeg does.
 func TestProcessChecksExitStatusFirst(t *testing.T) {
-	for stage, name := range []string{"pass 1", "pass 2", "verification"} {
-		t.Run(name, func(t *testing.T) {
-			script := stereoScript()
+	tests := []struct {
+		name  string
+		stage int
+	}{
+		{"pass 1", 1},
+		{"pass 2", 2},
+		{"verification", 3},
+		{"corrective re-encode", 5},
+		{"verification after the re-encode", 6},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			script := correctiveScript()
 			failed := &exitError{name: "ffmpeg", code: 255, status: "exit status 255", stderr: "Exiting normally, received signal 15."}
-			script[stage+1].err = failed
+			script[tc.stage].err = failed
 			run := &fakeRunner{responses: script}
 
 			_, err := (&FFmpeg{run: run}).Process(t.Context(), "/src.wav", -16, outputs())
@@ -264,8 +381,8 @@ func TestProcessChecksExitStatusFirst(t *testing.T) {
 			if _, ok := errors.AsType[*Rejection](err); ok {
 				t.Errorf("Process() error = %v, want it not to be a rejection", err)
 			}
-			if len(run.calls) != stage+2 {
-				t.Errorf("Process() ran %d commands, want it to stop after the failed one (%d)", len(run.calls), stage+2)
+			if len(run.calls) != tc.stage+1 {
+				t.Errorf("Process() ran %d commands, want it to stop after the failed one (%d)", len(run.calls), tc.stage+1)
 			}
 		})
 	}
@@ -309,17 +426,43 @@ func TestProcessRejectsFromReports(t *testing.T) {
 			wantRuns: 5,
 		},
 		{
+			name: "retry skipped",
+			script: func(s []fakeResponse) []fakeResponse {
+				s[4].stderr = report(verifyInstance, Loudness{LUFS: -17.6, TruePeakDBTP: -6}, Dynamic)
+				return s
+			},
+			want: "aac_64k rendition out of spec: -17.60 LUFS against a target of -16.0 ± 1 LU, " +
+				"true peak -6.00 dBTP against a ceiling of -1.5 dBTP",
+			wantRuns: 5,
+		},
+		{
+			name: "retry fails again",
+			script: func([]fakeResponse) []fakeResponse {
+				s := correctiveScript()
+				s[6].stderr = report(verifyInstance, Loudness{LUFS: -17.1, TruePeakDBTP: -5.6}, Dynamic)
+				return s
+			},
+			want: "aac_64k rendition out of spec: -17.10 LUFS against a target of -16.0 ± 1 LU, " +
+				"true peak -5.60 dBTP against a ceiling of -1.5 dBTP",
+			wantRuns: 7,
+		},
+		{
 			name: "both renditions out of spec",
 			script: func(s []fakeResponse) []fakeResponse {
 				s[3].stderr = report(verifyInstance, Loudness{LUFS: -14.99, TruePeakDBTP: -3}, Linear)
 				s[4].stderr = report(verifyInstance, Loudness{LUFS: -16, TruePeakDBTP: -1.49}, Linear)
-				return s
+				return append(s,
+					fakeResponse{stderr: report("loudnorm@stereo", stereoEncoded, Linear)},
+					fakeResponse{stderr: report(verifyInstance, Loudness{LUFS: -17.01, TruePeakDBTP: -4.01}, Linear)},
+					fakeResponse{stderr: report("loudnorm@mono", monoEncoded, Dynamic)},
+					fakeResponse{stderr: report(verifyInstance, Loudness{LUFS: -16.51, TruePeakDBTP: -1.49}, Linear)},
+				)
 			},
-			want: "aac_128k rendition out of spec: -14.99 LUFS against a target of -16.0 ± 1 LU, " +
-				"true peak -3.00 dBTP against a ceiling of -1.5 dBTP; " +
-				"aac_64k rendition out of spec: -16.00 LUFS against a target of -16.0 ± 1 LU, " +
+			want: "aac_128k rendition out of spec: -17.01 LUFS against a target of -16.0 ± 1 LU, " +
+				"true peak -4.01 dBTP against a ceiling of -1.5 dBTP; " +
+				"aac_64k rendition out of spec: -16.51 LUFS against a target of -16.0 ± 1 LU, " +
 				"true peak -1.49 dBTP against a ceiling of -1.5 dBTP",
-			wantRuns: 5,
+			wantRuns: 9,
 		},
 	}
 	for _, tc := range tests {
@@ -384,10 +527,12 @@ func TestProcessMissingReport(t *testing.T) {
 		{"pass 1", 1},
 		{"pass 2", 2},
 		{"verification", 3},
+		{"corrective re-encode", 5},
+		{"verification after the re-encode", 6},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			script := stereoScript()
+			script := correctiveScript()
 			script[tc.stage].stderr = strings.Replace(script[tc.stage].stderr, "loudnorm@", "Parsed_loudnorm_", 1)
 			_, err := (&FFmpeg{run: &fakeRunner{responses: script}}).Process(t.Context(), "/src.wav", -16, outputs())
 			if err == nil || !strings.Contains(err.Error(), "no report from loudnorm@") {
@@ -670,6 +815,42 @@ func TestCheck(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if msg := check("aac_64k", tc.m, tc.target); (msg == "") != tc.ok {
 				t.Errorf("check(%+v, %v) = %q, want it to pass: %t", tc.m, tc.target, msg, tc.ok)
+			}
+		})
+	}
+}
+
+func TestCorrection(t *testing.T) {
+	tests := []struct {
+		name   string
+		target float64
+		m      Loudness
+		want   float64
+		ok     bool
+	}{
+		{"short of the target", -16, Loudness{LUFS: -17.3, TruePeakDBTP: -6.79}, 1.3, true},
+		{"over the target", -16, Loudness{LUFS: -14.99, TruePeakDBTP: -3}, -1.01, true},
+		{"peak over the ceiling only", -16, Loudness{LUFS: -16, TruePeakDBTP: -1.49}, -0.51, true},
+		{"the peak lowers the gain", -16, Loudness{LUFS: -17.3, TruePeakDBTP: -3}, 1, true},
+		{"peak lands exactly 0.5 dB under the ceiling", -16, Loudness{LUFS: -17.3, TruePeakDBTP: -3.3}, 1.3, true},
+		{"gain of exactly 1.5 dB", -16, Loudness{LUFS: -17.5, TruePeakDBTP: -6}, 1.5, true},
+		{"cut of exactly 1.5 dB", -16, Loudness{LUFS: -14.5, TruePeakDBTP: -4}, -1.5, true},
+		{"1.5 dB to a fractional target", -16.3, Loudness{LUFS: -17.8, TruePeakDBTP: -6}, 1.5, true},
+		{"gain over 1.5 dB", -16, Loudness{LUFS: -17.51, TruePeakDBTP: -6}, 0, false},
+		{"cut over 1.5 dB", -16, Loudness{LUFS: -14.49, TruePeakDBTP: -6}, 0, false},
+		{"lowered to exactly 0.8 LU short", -16, Loudness{LUFS: -17.5, TruePeakDBTP: -2.7}, 0.7, true},
+		{"lowered to more than 0.8 LU short", -16, Loudness{LUFS: -17.5, TruePeakDBTP: -2.69}, 0, false},
+		{"peak cut to exactly 0.8 LU short", -16, Loudness{LUFS: -16, TruePeakDBTP: -1.2}, -0.8, true},
+		{"peak cut to more than 0.8 LU short", -16, Loudness{LUFS: -16, TruePeakDBTP: -1.19}, 0, false},
+		{"no gain", -16, Loudness{LUFS: -16, TruePeakDBTP: -3}, 0, false},
+		{"the ceiling leaves no room", -16, Loudness{LUFS: -17.2, TruePeakDBTP: -2}, 0, false},
+		{"blue noise", -16, Loudness{LUFS: -22, TruePeakDBTP: -8}, 0, false},
+		{"silent", -16, Loudness{LUFS: math.Inf(-1), TruePeakDBTP: math.Inf(-1)}, 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, ok := correction(tc.m, tc.target); got != tc.want || ok != tc.ok {
+				t.Errorf("correction(%+v, %v) = %v, %t, want %v, %t", tc.m, tc.target, got, ok, tc.want, tc.ok)
 			}
 		})
 	}

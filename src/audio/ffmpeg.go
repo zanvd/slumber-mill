@@ -37,7 +37,8 @@ type FFmpeg struct {
 
 func New() *FFmpeg { return &FFmpeg{run: execRunner{}} }
 
-// Process probes src, measures it, renders outputs normalised to targetLUFS and verifies each one.
+// Process probes src, measures it, renders outputs normalised to targetLUFS and verifies each one,
+// giving one that fails a corrective re-encode if a small gain can bring it within spec.
 // A *Rejection means retrying can't help. A missing source isn't one: its error matches fs.ErrNotExist.
 func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, outputs []Output) (Result, error) {
 	if err := validate(targetLUFS, outputs); err != nil {
@@ -56,7 +57,7 @@ func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, ou
 	for i, m := range measured {
 		predicted[i] = predict(m, targetLUFS)
 	}
-	rendered, err := f.render(ctx, src, targetLUFS, layouts, measured, offsets, outputs)
+	rendered, err := f.render(ctx, src, targetLUFS, layouts, measured, offsets, 0, outputs)
 	if err != nil {
 		return Result{}, err
 	}
@@ -71,6 +72,7 @@ func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, ou
 	}
 
 	renditions := make([]Rendition, len(outputs))
+	layoutOf := make([]int, len(outputs))
 	for i, l := range layouts {
 		for _, o := range l.outputs {
 			renditions[o] = Rendition{
@@ -81,13 +83,22 @@ func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, ou
 				Predicted:     predicted[i],
 				Normalization: rendered[i],
 			}
+			layoutOf[o] = i
+		}
+	}
+	for i := range renditions {
+		r := &renditions[i]
+		if r.Loudness, err = f.verify(ctx, r.Path, targetLUFS); err != nil {
+			return Result{}, fmt.Errorf("error verifying %s: %w", r.Profile.Name, err)
 		}
 	}
 	var failures []string
 	for i := range renditions {
 		r := &renditions[i]
-		if r.Loudness, err = f.verify(ctx, r.Path, targetLUFS); err != nil {
-			return Result{}, fmt.Errorf("error verifying %s: %w", r.Profile.Name, err)
+		if check(r.Profile.Name, r.Loudness, targetLUFS) != "" {
+			if err := f.correct(ctx, src, targetLUFS, layouts[layoutOf[i]], offsets[layoutOf[i]], r); err != nil {
+				return Result{}, err
+			}
 		}
 		if msg := check(r.Profile.Name, r.Loudness, targetLUFS); msg != "" {
 			failures = append(failures, msg)
@@ -226,10 +237,10 @@ func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetL
 
 // render runs pass 2 and returns the mode each layout's loudnorm reported.
 func (f *FFmpeg) render(ctx context.Context, src string, targetLUFS float64, layouts []layout,
-	measured []Loudness, offsets []float64, outputs []Output,
+	measured []Loudness, offsets []float64, gainDB float64, outputs []Output,
 ) ([]Normalization, error) {
 	log := newFFmpegLog("")
-	err := f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, offsets, outputs), nil, log)
+	err := f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, offsets, gainDB, outputs), nil, log)
 	log.flush()
 	if err != nil {
 		return nil, fmt.Errorf("error rendering: %w", err)
@@ -248,6 +259,31 @@ func (f *FFmpeg) render(ctx context.Context, src string, targetLUFS float64, lay
 		}
 	}
 	return modes, nil
+}
+
+// correct gives a rendition that failed verification one corrective re-encode, if correction finds a gain for it.
+func (f *FFmpeg) correct(ctx context.Context, src string, targetLUFS float64, l layout, offset float64, r *Rendition,
+) error {
+	gain, ok := correction(r.Loudness, targetLUFS)
+	if !ok {
+		return nil
+	}
+	only := layout{name: l.name, channels: l.channels, outputs: []int{0}}
+	modes, err := f.render(ctx, src, targetLUFS, []layout{only}, []Loudness{r.Measured}, []float64{offset}, gain,
+		[]Output{{Profile: r.Profile, Path: r.Path}})
+	if err != nil {
+		return fmt.Errorf("error re-encoding %s: %w", r.Profile.Name, err)
+	}
+	first := r.Loudness
+	if r.Loudness, err = f.verify(ctx, r.Path, targetLUFS); err != nil {
+		return fmt.Errorf("error verifying %s after re-encoding it: %w", r.Profile.Name, err)
+	}
+	r.Normalization = modes[0]
+	logging.LoggerFromContext(ctx).WarnContext(ctx, "re-encoded a rendition with a corrective gain",
+		"profile", r.Profile.Name, "gain_db", gain,
+		"first_lufs", first.LUFS, "first_true_peak_dbtp", first.TruePeakDBTP,
+		"lufs", r.Loudness.LUFS, "true_peak_dbtp", r.Loudness.TruePeakDBTP)
+	return nil
 }
 
 // verify measures an encoded rendition as it is.
@@ -313,8 +349,9 @@ func measureArgs(src string, targetLUFS float64, layouts []layout, measureSource
 	return args
 }
 
+// renderArgs builds pass 2. A gainDB other than 0 follows the resampler in every layout.
 func renderArgs(src string, targetLUFS float64, layouts []layout, measured []Loudness, offsets []float64,
-	outputs []Output,
+	gainDB float64, outputs []Output,
 ) []string {
 	var graph strings.Builder
 	fmt.Fprintf(&graph, "[0:a:0]asplit=%d", len(layouts))
@@ -327,6 +364,9 @@ func renderArgs(src string, targetLUFS float64, layouts []layout, measured []Lou
 			":measured_thresh=%s:offset=%s:linear=true:print_format=json,aresample=48000",
 			i, l.name, loudnormInstance(l), loudnormTargets(targetLUFS),
 			num(m.LUFS), num(m.TruePeakDBTP), num(measuredLRA(m)), num(m.ThresholdLUFS), num(offsets[i]))
+		if gainDB != 0 {
+			fmt.Fprintf(&graph, ",volume=%sdB:precision=double", num(gainDB))
+		}
 		if len(l.outputs) > 1 {
 			fmt.Fprintf(&graph, ",asplit=%d", len(l.outputs))
 		}

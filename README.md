@@ -288,7 +288,8 @@ Each with its trade-off.
   A listener asleep with the volume set for one story notices a quiet or sudden file, so the encode pool measures
   each output channel layout after the downmix, normalises each with its own two-pass `loudnorm`, then re-measures
   every encoded file. Each must be within 1 LU of the tenant's target (default -16 LUFS) with a true peak at or below
-  -1.5 dBTP, or the asset is rejected with the numbers. Each rendition stores its own figures.
+  -1.5 dBTP, or the asset is rejected with the numbers. A rendition that misses gets one corrective re-encode with a
+  small gain (at most 1.5 dB), logged as a warning, before it's rejected. Each rendition stores its own figures.
   `loudnorm` can silently fall back to dynamic mode, which lifts a quiet rain bed when a thunder crack arrives,
   so the pool predicts the mode and publishes a `dynamic_normalization` warning. It also warns about
   `sudden_loud_event` (max momentary loudness more than 10 LU above integrated) and `source_may_clip`.
@@ -369,8 +370,9 @@ For a change that spans a deploy (not built, only written down here):
   It's rare, and nothing checks for it up front.
 - **Long noise-like soundscapes can still be rejected.** The 64k rendition rebuilds peaks the limiter removed,
   and its true peak can exceed -1.5 dBTP, more likely the longer the file.
-- **Long bright content can miss the loudness tolerance at 64k.** White noise, hiss and rain measure about
-  -17.0 LUFS for a -16 target, since the 64k encode has no `-cutoff`.
+- **Bright content needs a second encode at 64k.** White noise, hiss and rain lose about 1 LU in the 64k encode,
+  which has no `-cutoff`; the corrective re-encode puts it back at the cost of about 20-32 s per 10 minutes.
+  Content that loses more than 1.5 LU, such as heavily treble-boosted noise, is rejected.
 - **Bright content at loud targets can fail the peak ceiling.** Around -9 LUFS and above, the encoder's added
   peaks leave too little headroom.
 - **Re-sealing webhook secrets under a new key is documented, not built.** A new key can go first in the key ring,

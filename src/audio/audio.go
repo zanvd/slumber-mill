@@ -24,6 +24,12 @@ const (
 	// minMeasuredLRA stands in for a measured LRA of 0, which loudnorm reads as unmeasured.
 	minMeasuredLRA = 0.01
 
+	// A corrective re-encode's gain is at most maxCorrectionDB either way, keeps the true peak correctionHeadroomDB
+	// under the ceiling, and must aim within correctionToleranceLU of the target.
+	maxCorrectionDB       = 1.5
+	correctionHeadroomDB  = 0.5
+	correctionToleranceLU = 0.8
+
 	minTargetLUFS = -70.0
 	maxTargetLUFS = -5.0
 	silentLUFS    = -70.0
@@ -210,6 +216,20 @@ func check(profile string, l Loudness, targetLUFS float64) string {
 	return fmt.Sprintf("%s rendition out of spec: %.2f LUFS against a target of %.1f ± %.0f LU, "+
 		"true peak %.2f dBTP against a ceiling of %.1f dBTP",
 		profile, l.LUFS, targetLUFS, ToleranceLU, l.TruePeakDBTP, CeilingDBTP)
+}
+
+// correction plans the gain of a corrective re-encode for a rendition verified as l.
+func correction(l Loudness, targetLUFS float64) (gainDB float64, ok bool) {
+	gain := targetLUFS - l.LUFS
+	if hundredths(l.TruePeakDBTP+gain) > hundredths(CeilingDBTP-correctionHeadroomDB) {
+		gain = CeilingDBTP - correctionHeadroomDB - l.TruePeakDBTP
+	}
+	gain = hundredths(gain) / 100
+	if gain == 0 || hundredths(math.Abs(gain)) > hundredths(maxCorrectionDB) ||
+		hundredths(math.Abs(l.LUFS+gain-targetLUFS)) > hundredths(correctionToleranceLU) {
+		return 0, false
+	}
+	return gain, true
 }
 
 func warnings(in Input, renditions []Rendition) []Warning {
