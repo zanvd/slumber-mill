@@ -1041,7 +1041,7 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     noise rendered dynamic at −10 LUFS; soxr at `precision=28` was no better and the encoded files came out the same.
     At 64k, which has no `-cutoff`, white noise of 10 minutes or more measured −17.04 LUFS against a −16 target.
     No 64k cutoff fixed that without pushing pink noise over the ceiling, but loudness follows a pre-encode `volume`
-    within 0.02 LU, so one corrective re-encode fixes it (§7 step 6).
+    within 0.02 LU on 10- and 60-minute noise, and 0.1 LU on a 10-second fixture, so one corrective re-encode fixes it (§7 step 6).
 18. **loudnorm's linear mode is a request.** A thunder crack in quiet rain made it fall back to dynamic mode silently:
     on target overall (−16.09), but the rain bed rose from −45.3 to −13.2 LUFS.
     The report saying so only prints at info level.
