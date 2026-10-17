@@ -31,7 +31,7 @@ const (
 	correctionToleranceLU = 0.8
 
 	minTargetLUFS = -70.0
-	maxTargetLUFS = -5.0
+	maxTargetLUFS = -16.0
 	silentLUFS    = -70.0
 
 	suddenLoudEventLU = 10.0
@@ -43,6 +43,8 @@ const (
 	MessageNotAudio = "not audio"
 	MessageTooShort = "too short"
 	MessageSilent   = "silent"
+
+	MessageTargetOutOfRange = "target loudness must be from -70 to -16 LUFS"
 )
 
 // Rejection is a permanent failure caused by the source. Message is safe to show the tenant;
@@ -147,10 +149,6 @@ type Result struct {
 }
 
 func validate(targetLUFS float64, outputs []Output) error {
-	if math.IsNaN(targetLUFS) || targetLUFS < minTargetLUFS || targetLUFS > maxTargetLUFS {
-		return fmt.Errorf("target of %v LUFS is outside loudnorm's range of %v to %v LUFS",
-			targetLUFS, minTargetLUFS, maxTargetLUFS)
-	}
 	if len(outputs) == 0 {
 		return errors.New("no outputs to render")
 	}
@@ -165,6 +163,9 @@ func validate(targetLUFS float64, outputs []Output) error {
 			return fmt.Errorf("output %s has a bitrate of %d kbps and a cutoff of %d Hz",
 				o.Profile.Name, o.Profile.BitrateKbps, o.Profile.CutoffHz)
 		}
+	}
+	if math.IsNaN(targetLUFS) || targetLUFS < minTargetLUFS || targetLUFS > maxTargetLUFS {
+		return reject(MessageTargetOutOfRange, fmt.Errorf("target of %v LUFS", targetLUFS))
 	}
 	return nil
 }
