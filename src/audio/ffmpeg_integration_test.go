@@ -252,8 +252,6 @@ func TestProcessRejects(t *testing.T) {
 	}
 }
 
-// The fixtures are real WAV files of just over and exactly 10 hours at 1 Hz, which take a few dozen kilobytes
-// where rendering 10 hours of audio at a usual rate takes about 18 s.
 func TestProcessRejectsSourcesOverTheLimitAtTheProbe(t *testing.T) {
 	rec := &recordingRunner{runner: execRunner{}}
 	_, err := (&FFmpeg{run: rec}).Process(testContext(t), testutil.LongWAV(t, MaxDuration+time.Second), testTargetLUFS, tempOutputs(t))

@@ -16,7 +16,6 @@ const (
 	ToleranceLU = 1.0
 	// MinDuration is the shortest source accepted; very short clips measure as silent.
 	MinDuration = 3 * time.Second
-	// MaxDuration is the longest source accepted; the encode timeout is sized for it.
 	MaxDuration = 10 * time.Hour
 
 	// preEncodeTruePeakDBTP is the TP loudnorm aims for, leaving headroom for the peak the encoder adds.
