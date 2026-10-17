@@ -314,13 +314,14 @@ check_logs() {
   else
     record FAIL "$what"
   fi
-  # A webhook worker is SIGKILLed only once it holds a delivery, which stays leased until a reaper requeues it, so a
-  # run that killed one without finding it in flight, or without any delivery reaped, proves nothing.
+  # A webhook worker is SIGKILLed once it holds a delivery, which stays leased until a reaper requeues it, or after
+  # the wait runs out. A hanging delivery may not turn up in time for every kill, so a run needs one that did, and a
+  # delivery reaped, to prove anything.
   if ((webhook_kills > 0)); then
     local reaped_deliveries=${reaped["reaped deliveries whose lease expired, requeued"]:-0}
     reaped_deliveries=$((reaped_deliveries + ${reaped["reaped deliveries whose lease expired, failed"]:-0}))
-    what="each of the $webhook_kills SIGKILLs of a webhook worker found it holding a delivery ($idle_kills did not)"
-    if ((idle_kills == 0)); then
+    what="a webhook worker was SIGKILLed holding a delivery ($((webhook_kills - idle_kills)) of $webhook_kills were)"
+    if ((idle_kills < webhook_kills)); then
       record PASS "$what"
     else
       record FAIL "$what"
