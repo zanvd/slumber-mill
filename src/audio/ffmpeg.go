@@ -189,6 +189,9 @@ func (f *FFmpeg) probe(ctx context.Context, src string) (Source, error) {
 	if duration < MinDuration {
 		return Source{}, reject(MessageTooShort, fmt.Errorf("duration %v is under %v", duration, MinDuration))
 	}
+	if duration > MaxDuration {
+		return Source{}, reject(MessageTooLong, fmt.Errorf("duration %v is over %v", duration, MaxDuration))
+	}
 	return Source{Codec: stream.CodecName, SampleRate: sampleRate, Channels: stream.Channels, Duration: duration}, nil
 }
 

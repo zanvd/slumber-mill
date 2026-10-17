@@ -293,8 +293,8 @@ Each with its trade-off.
   so the pool publishes a `dynamic_normalization` warning when dynamic mode flattened the file's loud moments
   by more than 6 LU. It also warns about
   `sudden_loud_event` (max momentary loudness more than 10 LU above integrated) and `source_may_clip`.
-  Silent and shorter-than-3-second files are rejected. The cost is CPU: two measurement passes, a render and a
-  verification pass per upload.
+  Silent, shorter-than-3-second and longer-than-10-hour files are rejected. The cost is CPU: two measurement passes,
+  a render and a verification pass per upload.
 - **Tenant isolation, IDs and secrets.** Every tenant-owned query filters on `tenant_id`, and another tenant's asset
   is the same 404 as a missing one. Public and event IDs are UUIDv7 in `BINARY(16)`, which keeps inserts
   append-mostly at the cost of revealing the creation time. Idempotency keys use the `ascii_bin` collation, so `Upload-42` and
@@ -371,7 +371,7 @@ For a change that spans a deploy (not built, only written down here):
 - **Long noise-like soundscapes can still be rejected.** The 64k rendition rebuilds peaks the limiter removed,
   and its true peak can exceed -1.5 dBTP, more likely the longer the file.
 - **Bright content needs a second encode at 64k.** White noise, hiss and rain lose about 1 LU in the 64k encode,
-  which has no `-cutoff`; the corrective re-encode puts it back at the cost of about 20-32 s per 10 minutes.
+  which has no `-cutoff`; the corrective re-encode puts it back at the cost of about 21-29 s per 10 minutes.
   Content that loses more than 1.5 LU, such as heavily treble-boosted noise, is rejected.
 - **Targets louder than -16 LUFS aren't supported.** loudnorm's limiter can't lift dense content past about -16,
   so `tenant create` refuses them, and an asset of a tenant created before the cap is rejected with

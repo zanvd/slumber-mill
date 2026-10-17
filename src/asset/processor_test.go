@@ -353,7 +353,7 @@ func TestProcessorContexts(t *testing.T) {
 			t.Fatalf("Process() error = %v", err)
 		}
 
-		if want := start.Add(4 * time.Hour); !f.tc.deadline.Equal(want) {
+		if want := start.Add(5 * time.Hour); !f.tc.deadline.Equal(want) {
 			t.Errorf("transcoder deadline = %v, want %v", f.tc.deadline, want)
 		}
 		if !f.repo.finishAt.Equal(start.Add(time.Hour)) {
