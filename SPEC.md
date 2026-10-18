@@ -363,7 +363,7 @@ stateDiagram-v2
 `leased` and `done` are `processing` and `ready` for assets, and `sending` and `delivered` for deliveries.
 
 ```sql
-SELECT id, tenant_id, attempts FROM <table>
+SELECT id, tenant_id, attempts FROM <table> FORCE INDEX (ix_<table>_claim)
 WHERE <state> = 'queued' AND run_after <= NOW(6)
 ORDER BY run_after, id
 LIMIT 1
@@ -375,6 +375,7 @@ FOR UPDATE SKIP LOCKED
   In GORM the lock comes from `clause.Locking` with `clause.LockingOptionsSkipLocked`.
   Uploads insert into the table the encode pool claims from, and under REPEATABLE READ the claim's gap locks cost them
   a third of their throughput and tripled their p99 latency (pitfall 11).
+  `FORCE INDEX` keeps the claim on its index, where it locks only the row it returns (pitfall 35).
 - **Fencing:** every write after a claim matches `id`, the leased state and `attempts`.
   Zero rows affected means `ErrLeaseLost`, and the holder discards its result (pitfall 12).
 - **Heartbeat** every `lease / 3`, fenced. `ErrLeaseLost` cancels the work's context, which kills ffmpeg;
@@ -964,11 +965,12 @@ For real stereo fixtures, use two seeds and `amerge`: `anoisesrc -ac 2` produces
 
 What the tests must show:
 
-- **Leasing:** each due row is claimed exactly once under concurrent claimers; a reaped holder's writes are fenced out,
+- **Leasing:** each due row is claimed exactly once under concurrent claimers, and a claim in flight leaves
+  the other due rows claimable; a reaped holder's writes are fenced out,
   and an unchanged fenced update still counts its row; a completion and its domain writes commit or roll back together;
   retries back off, and fail at the limit or at once when permanent; release returns the attempt;
   work is released after the grace, also when it errors while draining;
-  a panic is a failed attempt and the worker survives; the claim is `FOR UPDATE SKIP LOCKED`,
+  a panic is a failed attempt and the worker survives; the claim forces its index and is `FOR UPDATE SKIP LOCKED`,
   and no write sets timestamps or drops zero values (checked with GORM's dry run, no database).
 - **Audio:** for every fixture (dual-mono pink, uncorrelated pink, uncorrelated white),
   every rendition lands within 1 LU of target and under the ceiling;
@@ -1140,6 +1142,17 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     As dual-mono sources, their 128k stereo renditions passed at −16 (−16.51 and −16.12) and every mono one failed:
     the stereo layout carries 3 dB less true peak than mono at the same loudness.
     Hence the −20 LUFS default (§7).
+
+### Leasing
+
+35. **The claim's plan decides what it locks.** On a fresh table of 40 due rows, MySQL 8.4 ran the claim
+    as a table scan and a sort: the claim index's range was costed at 80 rows, counting the entries
+    an earlier update had delete-marked. That scan locked all 40 rows until commit,
+    and concurrent claims came back empty. With a claim in flight, the plan switched to the index,
+    and a claim there that found every row locked returned nothing
+    but kept its locks on the index entries until it ended.
+    Between the two, a concurrency test claimed 1 of 40 rows, with 39 due and no claim about to take them;
+    a pool would sleep a poll interval with work due. Under `FORCE INDEX` each claim locked one entry and its row.
 
 ## 15. Build order
 

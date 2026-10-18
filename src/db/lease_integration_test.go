@@ -288,6 +288,38 @@ func TestClaimConcurrently(t *testing.T) {
 	})
 }
 
+// A claim locks only the row it returns, so a claim still in flight leaves the other due rows claimable.
+// The outer transaction keeps the first claim's locks after Claim returns.
+func TestClaimInFlightLeavesOtherRowsClaimable(t *testing.T) {
+	forEachTable(t, func(t *testing.T, table leasedTable) {
+		e := newLeaseEnv(t, table)
+		var ids []uint64
+		for range 40 {
+			ids = append(ids, e.insert())
+		}
+		e.exec("UPDATE %[1]s SET run_after = ? WHERE id IN ?", "2020-01-01 00:00:00", ids)
+
+		err := e.gdb.Transaction(func(tx *gorm.DB) error {
+			held, ok, err := table.newLeases(tx).Claim(t.Context(), "held", testLease)
+			if err != nil || !ok {
+				return fmt.Errorf("first Claim() = %v, %t, %v; want a lease", held, ok, err)
+			}
+			other, ok, err := e.leases.Claim(t.Context(), "other", testLease)
+			if err != nil || !ok {
+				return fmt.Errorf("Claim() beside the held claim of row %d = %v, %t, %v; want a lease",
+					held.ID, other, ok, err)
+			}
+			if other.ID == held.ID {
+				return fmt.Errorf("both claims got row %d", held.ID)
+			}
+			return nil
+		}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestClaimOrder(t *testing.T) {
 	forEachTable(t, func(t *testing.T, table leasedTable) {
 		e := newLeaseEnv(t, table)
