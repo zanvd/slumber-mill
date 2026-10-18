@@ -1,10 +1,10 @@
-.PHONY: up down tenant test test-unit vet fmt tidy cover process-checks
+.PHONY: up down tenant test test-unit vet fmt tidy cover process-checks checkly-agent checkly-test checkly-deploy
 
 up:
 	docker compose up -d --build
 
 down:
-	docker compose --profile dev down --remove-orphans
+	docker compose --profile dev --profile checkly down --remove-orphans
 
 tenant:
 	docker compose run --rm api tenant create -slug $(SLUG)
@@ -29,3 +29,12 @@ cover:
 
 process-checks:
 	bash scripts/process-checks.sh
+
+checkly-agent:
+	docker compose --profile checkly up -d checkly-agent
+
+checkly-test:
+	docker compose --profile checkly run --rm checkly npx checkly test --private-location slumber-mill-local --record
+
+checkly-deploy:
+	docker compose --profile checkly run --rm checkly npx checkly deploy

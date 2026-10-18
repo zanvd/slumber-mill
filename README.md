@@ -48,7 +48,8 @@ docker compose run --rm dev go test -tags integration -coverprofile=/out/cover.o
 ```
 
 A Makefile wraps these: `make up`, `make tenant SLUG=demo`, `make test-unit`, `make test`, `make vet`, `make fmt`,
-`make tidy`, `make cover`, `make down` and `make process-checks`.
+`make tidy`, `make cover`, `make down` and `make process-checks`; the Checkly targets are under
+[Monitoring with Checkly](#monitoring-with-checkly).
 
 Export the key from the `api_key:` line that `tenant create` printed as `API_KEY`, upload a file, set `ASSET_ID` to
 the `id` field of the 202 response, then poll until the asset's `status` is `ready` and download a rendition
@@ -272,6 +273,40 @@ set. The project uses `var/out/soak/data` as its data directory and publishes no
 the project down with its volumes and images. The driver's summary is left in `var/out/soak/summary.txt`, with its
 log in `driver.log` and the services' logs in `compose.log`. Webhook delivery is at-least-once, so the summary counts
 the duplicates the receiver saw, but they don't fail the soak.
+
+### Monitoring with Checkly
+
+The `checkly/` directory is a [Checkly](https://www.checklyhq.com) CLI project: monitoring as code, in Node and
+TypeScript, outside the Go module. It defines the check group `slumber-mill` (base URL `http://api:8080`, alerts to
+the account's existing email channel, whose ID is in `checkly/checks/group.ts`) with `api-healthz` and `api-readyz`,
+which assert a 200 from `/healthz` and `/readyz` every five minutes. The checks run from a Checkly private location
+named `slumber-mill-local`, served by an agent in the Compose stack, so they reach `api` on the Compose network and
+nothing is exposed to the internet. Both services are in the `checkly` profile, so `docker compose up` doesn't
+start them.
+
+Setup, once:
+
+1. In Checkly, create a private location with the slug `slumber-mill-local` and copy the agent key it shows once
+   (it starts with `pl_`), and create a user API key. The account ID is in the account settings.
+2. Put the keys in the gitignored `.env`:
+
+   ```
+   CHECKLY_API_KEY=...
+   CHECKLY_ACCOUNT_ID=...
+   CHECKLY_PL_API_KEY=pl_...
+   ```
+
+```sh
+make up                # the stack the agent will probe
+make checkly-agent     # start the private-location agent
+make checkly-test      # run the checks there and record a test session
+make checkly-deploy    # create or update the live checks and the group in your Checkly account
+```
+
+`checkly-test` runs the checks once, through the agent, and prints a link to the recorded session.
+`checkly-deploy` changes your live account: the checks start running on their schedule and alert the channel.
+The first run installs `node_modules` into the `checkly-node-modules` volume from the committed `package-lock.json`,
+which also pins the `checkly` package; `make down` stops the agent.
 
 ### MySQL connection limit
 

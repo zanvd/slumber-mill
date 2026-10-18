@@ -114,6 +114,31 @@ services:
         condition: service_healthy
     command: ["go", "test", "-race", "-tags", "integration", "./..."]
 
+  checkly:
+    profiles: ["checkly"]
+    build:
+      context: ./checkly
+      args:
+        APP_UID: ${APP_UID:-1000}
+    user: "${APP_UID:-1000}"
+    environment:
+      CHECKLY_API_KEY: ${CHECKLY_API_KEY:-}
+      CHECKLY_ACCOUNT_ID: ${CHECKLY_ACCOUNT_ID:-}
+    volumes:
+      - type: bind
+        source: ./checkly
+        target: /checkly
+        bind:
+          create_host_path: false
+      - checkly-node-modules:/checkly/node_modules
+
+  checkly-agent:
+    profiles: ["checkly"]
+    image: checkly/agent:8.11.0@sha256:270e21a8b9955ee13c30d1c5fb7484960bac4680702b5bfc78ebdc91acc5c012
+    environment:
+      API_KEY: ${CHECKLY_PL_API_KEY:-}
+    restart: unless-stopped
+
 configs:
   mysql-test-account:
     content: |
@@ -127,3 +152,4 @@ volumes:
   mysql-data:
   go-mod:
   go-build:
+  checkly-node-modules:

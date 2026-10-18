@@ -1,0 +1,12 @@
+{
+  "name": "slumber-mill-checkly",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Checkly monitoring as code for SlumberMill",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "checkly": "9.5.0"
+  }
+}
