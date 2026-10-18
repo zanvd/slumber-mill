@@ -695,6 +695,50 @@ func TestReap(t *testing.T) {
 	})
 }
 
+// A reap locks only the batch it returns, so a reap still in flight leaves the other expired rows reapable.
+// With more expired rows than a batch and nothing else in the table, a table scan would lock them all.
+// The outer transaction keeps the first reap's locks after Reap returns.
+func TestReapInFlightLeavesTheRestReapable(t *testing.T) {
+	forEachTable(t, func(t *testing.T, table leasedTable) {
+		e := newLeaseEnv(t, table)
+		e.insertExpired(150)
+
+		err := e.gdb.Transaction(func(tx *gorm.DB) error {
+			requeued, failed, err := table.newLeases(tx).Reap(t.Context(), 3, nil)
+			if err != nil || requeued != 100 || failed != 0 {
+				return fmt.Errorf("first Reap() = %d requeued, %d failed, %v; want 100, 0", requeued, failed, err)
+			}
+			requeued, failed, err = e.leases.Reap(t.Context(), 3, nil)
+			if err != nil || requeued != 50 || failed != 0 {
+				return fmt.Errorf("Reap() beside the held reap = %d requeued, %d failed, %v; want 50, 0",
+					requeued, failed, err)
+			}
+			return nil
+		}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// insertExpired inserts n rows already leased with expired leases, so no index entry is delete-marked.
+func (e *leaseEnv) insertExpired(n int) {
+	e.t.Helper()
+	columns, values := "event_id, body", "?, '{}'"
+	if e.table.name == "assets" {
+		columns = "public_id, title, source_sha256, source_bytes, target_lufs"
+		values = "?, 'expired', REPEAT(x'ab', 32), 1024, -20"
+	}
+	rows := make([]string, n)
+	args := make([]any, 0, 4*n)
+	for i := range n {
+		rows[i] = "(" + values + ", ?, ?, 1, 'crashed', NOW(6) - INTERVAL ? SECOND)"
+		args = append(args, db.NewID(), e.tenantID, e.table.leased, n-i)
+	}
+	e.exec("INSERT INTO %[1]s ("+columns+", tenant_id, %[2]s, attempts, locked_by, lease_expires_at) VALUES "+
+		strings.Join(rows, ", "), args...)
+}
+
 func otherTable(t *testing.T, table leasedTable) leasedTable {
 	t.Helper()
 	for _, other := range leasedTables() {
