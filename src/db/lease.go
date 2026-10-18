@@ -49,7 +49,7 @@ type Leases struct {
 
 // leasedTable holds the names that the lease SQL interpolates, so they come only from the constructors below.
 type leasedTable struct {
-	name, column                 string
+	name, column, claimIndex     string
 	queued, leased, done, failed string
 }
 
@@ -61,14 +61,14 @@ type leaseRow struct {
 
 func NewAssetLeases(gdb *gorm.DB) *Leases {
 	return &Leases{db: gdb, t: leasedTable{
-		name: "assets", column: "status",
+		name: "assets", column: "status", claimIndex: "ix_assets_claim",
 		queued: "queued", leased: "processing", done: "ready", failed: "failed",
 	}}
 }
 
 func NewWebhookDeliveryLeases(gdb *gorm.DB) *Leases {
 	return &Leases{db: gdb, t: leasedTable{
-		name: "webhook_deliveries", column: "state",
+		name: "webhook_deliveries", column: "state", claimIndex: "ix_webhook_deliveries_claim",
 		queued: "queued", leased: "sending", done: "delivered", failed: "failed",
 	}}
 }
@@ -80,7 +80,8 @@ func (l *Leases) Claim(ctx context.Context, workerID string, lease time.Duration
 	}
 	var row leaseRow
 	err := l.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		err := tx.Table(l.t.name).
+		// A table scan with a sort would lock every due row, and leave concurrent claims empty, until commit.
+		err := tx.Table("? FORCE INDEX (?)", clause.Table{Name: l.t.name}, clause.Column{Name: l.t.claimIndex}).
 			Select("id", "tenant_id", "attempts").
 			Where(l.t.column+" = ? AND run_after <= NOW(6)", l.t.queued).
 			Order("run_after, id").

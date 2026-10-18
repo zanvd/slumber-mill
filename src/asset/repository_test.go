@@ -393,7 +393,7 @@ func TestLeaseWritesSQL(t *testing.T) {
 				return err
 			},
 			want: []wantStatement{
-				{contains: []string{"FROM `assets` WHERE status = ? AND run_after <= NOW(6)", "FOR UPDATE SKIP LOCKED"}},
+				{contains: []string{"FROM `assets` FORCE INDEX (`ix_assets_claim`) WHERE status = ? AND run_after <= NOW(6)", "FOR UPDATE SKIP LOCKED"}},
 				{
 					contains: []string{"`attempts`=attempts + 1"},
 					columns:  sorted("status", "attempts", "locked_by", "lease_expires_at"),
