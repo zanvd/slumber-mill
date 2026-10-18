@@ -278,11 +278,27 @@ the duplicates the receiver saw, but they don't fail the soak.
 
 The `checkly/` directory is a [Checkly](https://www.checklyhq.com) CLI project: monitoring as code, in Node and
 TypeScript, outside the Go module. It defines the check group `slumber-mill` (base URL `http://api:8080`, alerts to
-the account's existing email channel, whose ID is in `checkly/checks/group.ts`) with `api-healthz` and `api-readyz`,
-which assert a 200 from `/healthz` and `/readyz` every five minutes. The checks run from a Checkly private location
-named `slumber-mill-local`, served by an agent in the Compose stack, so they reach `api` on the Compose network and
-nothing is exposed to the internet. Both services are in the `checkly` profile, so `docker compose up` doesn't
-start them.
+the account's existing email channel, whose ID is in `checkly/checks/group.ts`) with these checks:
+
+| Check | Type | Shows |
+|---|---|---|
+| `api-healthz` | API, every 5 min | `GET /healthz` returns 200 |
+| `api-readyz` | API, every 5 min | `GET /readyz` returns 200, so the database is reachable |
+| `ingest-round-trip` | Multistep, every 15 min | An upload as the probe tenant turns `ready`, a ranged rendition download returns 206, and an unknown asset 404 |
+| `webhook-delivered` | Heartbeat, 15 min period and 15 min grace | The webhook pool delivered the probe tenant's webhooks |
+
+`ingest-round-trip` builds 10 seconds of stereo pink noise from a fixed seed (48 kHz, 16-bit WAV), uploads it with a
+fresh `Idempotency-Key`, polls the asset every 2 seconds until it is `ready`, then fetches the first 1024 bytes of
+`aac_64k` and expects 206 with an `ETag`, and finally asks for a random UUIDv7 and expects 404. It fails at once if
+the asset turns `failed`, and after 3 minutes of waiting, since Checkly stops a multistep run after 240 seconds.
+The probe tenant `checkly-probe` has the heartbeat's ping URL as its webhook URL, so each of its `asset.ready` and
+`asset.failed` webhooks pings `webhook-delivered`, which alerts when none arrives for 15 minutes plus 15 minutes
+of grace. Each run keeps its upload: about 2.2 MB of source and renditions in `var/data`, or roughly 210 MB a day,
+since assets are never deleted.
+
+The checks run from a Checkly private location named `slumber-mill-local`, served by an agent in the Compose stack,
+so they reach `api` on the Compose network and nothing is exposed to the internet. Both services are in the
+`checkly` profile, so `docker compose up` doesn't start them.
 
 Setup, once:
 
@@ -303,10 +319,47 @@ make checkly-test      # run the checks there and record a test session
 make checkly-deploy    # create or update the live checks and the group in your Checkly account
 ```
 
-`checkly-test` runs the checks once, through the agent, and prints a link to the recorded session.
+`checkly-test` runs the checks once, through the agent, and prints a link to the recorded session; heartbeats only
+wait for pings, so it doesn't run `webhook-delivered`.
 `checkly-deploy` changes your live account: the checks start running on their schedule and alert the channel.
 The first run installs `node_modules` into the `checkly-node-modules` volume from the committed `package-lock.json`,
 which also pins the `checkly` package; `make down` stops the agent.
+
+The probe tenant's webhook URL is the heartbeat's ping URL, which exists only once the heartbeat is deployed, so
+the probe is set up after the first deploy. Until its key is stored, `ingest-round-trip` fails and alerts.
+
+1. Deploy, and copy the ping URL of `webhook-delivered`, which looks like `https://ping.checklyhq.com/<uuid>`.
+   The deploy output lists it, and so does the heartbeat's page in the Checkly app, under Heartbeats.
+
+   ```sh
+   make checkly-deploy
+   ```
+
+2. Create the probe tenant with that URL as its webhook, and keep the `api_key:` line it prints.
+   The webhook secret isn't needed: the heartbeat counts pings and doesn't check signatures.
+
+   ```sh
+   docker compose run --rm api tenant create -slug checkly-probe -webhook-url https://ping.checklyhq.com/<uuid>
+   ```
+
+3. Store the key as the secret account variable `SLUMBER_MILL_PROBE_API_KEY`. Without a value on the command line,
+   the CLI asks for it without echoing, so the key stays out of the shell history.
+
+   ```sh
+   docker compose --profile checkly run --rm checkly npx checkly env add SLUMBER_MILL_PROBE_API_KEY --secret
+   ```
+
+Test sessions see the account's variables too, so from then on `make checkly-test` needs nothing else. To test against a
+tenant that isn't stored in Checkly, such as one in a fresh local stack, pass its key for that run only:
+
+```sh
+docker compose --profile checkly run --rm checkly npx checkly test --private-location slumber-mill-local --record \
+  -e SLUMBER_MILL_PROBE_API_KEY=sm_...
+```
+
+The heartbeat is pinged from the webhook pool's container, so the stack needs outbound HTTPS to
+`ping.checklyhq.com`. Its addresses are public, so the SSRF guard lets the delivery through whatever
+`SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` says.
 
 ### MySQL connection limit
 

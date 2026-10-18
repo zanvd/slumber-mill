@@ -969,6 +969,37 @@ GitHub Actions runs what a developer runs: build the images, vet with the integr
 the unit tests with `--no-deps`, then the whole suite. The workflow writes `APP_UID` to `.env` first,
 since a hosted runner isn't guaranteed to be UID 1000, and caches image layers with Buildx's GitHub Actions cache.
 
+### Synthetic monitoring (Checkly)
+
+The checks are in the group `slumber-mill`, which runs them from the private location `slumber-mill-local`
+against `SLUMBER_MILL_BASE_URL` (`http://api:8080`) and alerts one email channel.
+
+| Check | Type | Asserts |
+|---|---|---|
+| `api-healthz` | API, 5 min | `GET /healthz` is 200 |
+| `api-readyz` | API, 5 min | `GET /readyz` is 200 |
+| `ingest-round-trip` | Multistep, 15 min | The upload round trip below |
+| `webhook-delivered` | Heartbeat, 15 min period, 15 min grace | A ping arrives at least every 30 min |
+
+- **`ingest-round-trip`** uses Playwright's request API as the probe tenant `checkly-probe`,
+  whose key is the secret account variable `SLUMBER_MILL_PROBE_API_KEY`.
+  It builds a 10 s, 48 kHz, stereo, 16-bit WAV of pink noise from a fixed seed, with an independent signal
+  per channel: non-silent and longer than 3 s (§7, step 2). Both renditions of it land on the −20 LUFS default
+  in linear mode without a corrective re-encode (measured: −20.06 and −20.01 LUFS, about 2 s to encode).
+  It POSTs it to `/v1/assets` with a fresh `Idempotency-Key` and expects 202 and a `Location` header,
+  polls `GET /v1/assets/:id` every 2 s until `ready`, failing on `failed` or after 180 s,
+  GETs `/renditions/aac_64k` with `Range: bytes=0-1023` and expects 206, an `ETag` and 1024 bytes,
+  and GETs a random UUIDv7 and expects 404.
+  Checkly stops a multistep run after 240 s, so the test's own timeout is 210 s.
+  Each run keeps its asset, about 2.2 MB on disk, since assets are never deleted.
+- **`webhook-delivered`:** the probe tenant's webhook URL is this heartbeat's ping URL, so every `asset.ready`
+  and `asset.failed` webhook of the probe (§8) pings it. It shows that the relay and the delivery slots work and
+  that the webhook pool reaches the internet; that the upload succeeded is `ingest-round-trip`'s job.
+  `ping.checklyhq.com` resolves to public addresses, so the SSRF-safe client lets it through
+  with `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` off as well as on.
+- The ping URL exists only after the first deploy, so the probe tenant is created after it,
+  and `ingest-round-trip` fails until its key is stored.
+
 ## 13. Testing
 
 Three tiers:
