@@ -27,6 +27,9 @@ process lifecycle and shutdown, and loudness that is verified rather than assume
 - No object storage or CDN. Local disk sits behind a small storage type; the README explains the production swap.
 - No push notifications or payment webhooks. Both are listed as next steps (§17).
 - No metrics stack. Structured logs only; metrics are listed as a next step.
+- No monitoring in the Go module or the default stack. Synthetic monitoring is the one exception to the stack below:
+  a Checkly CLI project in `checkly/`, in Node and TypeScript, with its own Compose services in the opt-in
+  `checkly` profile (§12). It lives on the `feat/checkly` branch and is not part of the build order (§15).
 - No per-tenant fairness scheduling. Called out as a known limitation.
 
 ## 3. Stack
@@ -40,8 +43,10 @@ process lifecycle and shutdown, and loudness that is verified rather than assume
 | Media | ffmpeg 6.1.1 from Ubuntu 24.04 | Fixed by the encode worker's image; the figures depend on it |
 | Runtime | Docker with Compose v2 | The only thing the host needs (§12) |
 | CI | GitHub Actions | Runs the same Compose `dev` service as a laptop |
+| Monitoring | Checkly CLI 9.5.0 (Node 24 LTS, TypeScript) | Optional, in `checkly/`; the `checkly` Compose profile (§12) |
 
-No other dependencies.
+No other dependencies for the Go module. The Checkly project has its own `package.json`, with `checkly` pinned
+exactly and a committed `package-lock.json`; nothing in it is built into or imported by the Go binary.
 
 ### Using Go 1.27
 
@@ -875,6 +880,14 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
   Its default command runs the whole suite, `go test -race -tags integration ./...`.
   It sits in the `dev` profile, so `docker compose up` doesn't start the test suite;
   `docker compose run` names it explicitly and starts it anyway.
+- `checkly` and `checkly-agent`, both in the `checkly` profile, so `docker compose up` doesn't start them.
+  `checkly` builds `checkly/Dockerfile` (Node 24 LTS, pinned by digest, running as `APP_UID`), mounts `./checkly` at
+  `/checkly` with `node_modules` in the `checkly-node-modules` volume, so the container writes nothing else into the
+  repository, and takes `CHECKLY_API_KEY` and `CHECKLY_ACCOUNT_ID` from `.env`. Its entrypoint runs `npm ci` whenever
+  `package-lock.json` has changed. `checkly-agent` is `checkly/agent`, pinned by digest, with `API_KEY` from
+  `CHECKLY_PL_API_KEY`. It sits on the stack's network, so the private location `slumber-mill-local` reaches
+  `api:8080`. Checks and the group are defined in `checkly/checks/`; `checkly deploy` changes the live account and is
+  run by hand.
 
 Everyday commands, which double as the README quick start:
 
