@@ -1168,7 +1168,7 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     a pool would sleep a poll interval with work due. Under `FORCE INDEX` each claim locked one entry and its row.
     The reap did the same with more than a batch expired, and needed no stale statistics:
     on a table of 150 or 1,000 expired rows and nothing else, freshly inserted or just analysed,
-    the lease index's range was costed at the right row count but above the scan (350 against 106 for 1,000 rows).
+    the lease index's range was costed at the right row count but above the scan (350 against 107 for 1,000 rows).
     The scan locked every expired row and returned 100, and a second reap beside it got none.
     With about 100 other rows in the table, the plan used the index. Under `FORCE INDEX` a reap locked only its batch.
 
