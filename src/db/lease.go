@@ -49,7 +49,8 @@ type Leases struct {
 
 // leasedTable holds the names that the lease SQL interpolates, so they come only from the constructors below.
 type leasedTable struct {
-	name, column, claimIndex     string
+	name, column                 string
+	claimIndex, leaseIndex       string
 	queued, leased, done, failed string
 }
 
@@ -61,14 +62,15 @@ type leaseRow struct {
 
 func NewAssetLeases(gdb *gorm.DB) *Leases {
 	return &Leases{db: gdb, t: leasedTable{
-		name: "assets", column: "status", claimIndex: "ix_assets_claim",
+		name: "assets", column: "status", claimIndex: "ix_assets_claim", leaseIndex: "ix_assets_lease",
 		queued: "queued", leased: "processing", done: "ready", failed: "failed",
 	}}
 }
 
 func NewWebhookDeliveryLeases(gdb *gorm.DB) *Leases {
 	return &Leases{db: gdb, t: leasedTable{
-		name: "webhook_deliveries", column: "state", claimIndex: "ix_webhook_deliveries_claim",
+		name: "webhook_deliveries", column: "state",
+		claimIndex: "ix_webhook_deliveries_claim", leaseIndex: "ix_webhook_deliveries_lease",
 		queued: "queued", leased: "sending", done: "delivered", failed: "failed",
 	}}
 }
@@ -176,7 +178,8 @@ func (l *Leases) Reap(ctx context.Context, maxAttempts int,
 	}
 	err = l.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rows []leaseRow
-		err := tx.Table(l.t.name).
+		// A table scan with a sort would lock every expired row, not just the batch, until commit.
+		err := tx.Table("? FORCE INDEX (?)", clause.Table{Name: l.t.name}, clause.Column{Name: l.t.leaseIndex}).
 			Select("id", "tenant_id", "attempts").
 			Where(l.t.column+" = ? AND lease_expires_at < NOW(6)", l.t.leased).
 			Order("lease_expires_at, id").

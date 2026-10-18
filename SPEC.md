@@ -387,7 +387,17 @@ FOR UPDATE SKIP LOCKED
   Otherwise the row goes back to `queued` with `run_after = NOW(6) + backoff`:
   exponential with equal jitter, a random value in `[d/2, d]` where `d = min(base·2^(attempt-1), max)`.
 - **Release** on shutdown: back to `queued` with `attempts - 1`, so deploys don't use up retries.
-- **Reaper:** rows whose lease expired, `FOR UPDATE SKIP LOCKED`, 100 at a time. It counts as an attempt,
+- **Reaper:** rows whose lease expired, 100 at a time, in a READ COMMITTED transaction:
+
+  ```sql
+  SELECT id, tenant_id, attempts FROM <table> FORCE INDEX (ix_<table>_lease)
+  WHERE <state> = '<leased>' AND lease_expires_at < NOW(6)
+  ORDER BY lease_expires_at, id
+  LIMIT 100
+  FOR UPDATE SKIP LOCKED
+  ```
+
+  `FORCE INDEX` keeps the reap's locks to the batch it returns (pitfall 35). The reap counts as an attempt,
   so work that keeps killing workers eventually fails, but it requeues with a short fixed delay (about 5 s),
   not the backoff (pitfall 26). Running out of attempts fails the row as above. Each pool reaps only its own table.
 - **Clock:** every time comes from `NOW(6)`, so clock skew between hosts can't distort leases.
@@ -966,11 +976,13 @@ For real stereo fixtures, use two seeds and `amerge`: `anoisesrc -ac 2` produces
 What the tests must show:
 
 - **Leasing:** each due row is claimed exactly once under concurrent claimers, and a claim in flight leaves
-  the other due rows claimable; a reaped holder's writes are fenced out,
+  the other due rows claimable; a reap in flight leaves the expired rows beyond its batch reapable;
+  a reaped holder's writes are fenced out,
   and an unchanged fenced update still counts its row; a completion and its domain writes commit or roll back together;
   retries back off, and fail at the limit or at once when permanent; release returns the attempt;
   work is released after the grace, also when it errors while draining;
-  a panic is a failed attempt and the worker survives; the claim forces its index and is `FOR UPDATE SKIP LOCKED`,
+  a panic is a failed attempt and the worker survives;
+  the claim and the reap force their indexes and are `FOR UPDATE SKIP LOCKED`,
   and no write sets timestamps or drops zero values (checked with GORM's dry run, no database).
 - **Audio:** for every fixture (dual-mono pink, uncorrelated pink, uncorrelated white),
   every rendition lands within 1 LU of target and under the ceiling;
@@ -1145,7 +1157,8 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
 
 ### Leasing
 
-35. **The claim's plan decides what it locks.** On a fresh table of 40 due rows, MySQL 8.4 ran the claim
+35. **The plans of the claim and the reap decide what they lock.**
+    On a fresh table of 40 due rows, MySQL 8.4 ran the claim
     as a table scan and a sort: the claim index's range was costed at 80 rows, counting the entries
     an earlier update had delete-marked. That scan locked all 40 rows until commit,
     and concurrent claims came back empty. With a claim in flight, the plan switched to the index,
@@ -1153,6 +1166,11 @@ Each item was hit or measured in the prototype or the GORM probe unless it's mar
     but kept its locks on the index entries until it ended.
     Between the two, a concurrency test claimed 1 of 40 rows, with 39 due and no claim about to take them;
     a pool would sleep a poll interval with work due. Under `FORCE INDEX` each claim locked one entry and its row.
+    The reap did the same with more than a batch expired, and needed no stale statistics:
+    on a table of 150 or 1,000 expired rows and nothing else, freshly inserted or just analysed,
+    the lease index's range was costed at the right row count but above the scan (350 against 107 for 1,000 rows).
+    The scan locked every expired row and returned 100, and a second reap beside it got none.
+    With about 100 other rows in the table, the plan used the index. Under `FORCE INDEX` a reap locked only its batch.
 
 ## 15. Build order
 

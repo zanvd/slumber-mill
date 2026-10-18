@@ -302,8 +302,8 @@ func leaseCases(lt leasedTable) []leaseCase {
 			},
 			want: []wantStatement{
 				{contains: []string{
-					"SELECT `id`,`tenant_id`,`attempts` FROM `" + lt.name + "`",
-					"WHERE " + lt.column + " = ? AND lease_expires_at < NOW(6) ORDER BY lease_expires_at, id LIMIT ?",
+					"SELECT `id`,`tenant_id`,`attempts` FROM `" + lt.name + "` FORCE INDEX (`ix_" + lt.name + "_lease`) " +
+						"WHERE " + lt.column + " = ? AND lease_expires_at < NOW(6) ORDER BY lease_expires_at, id LIMIT ?",
 					" FOR UPDATE SKIP LOCKED",
 				}},
 				{

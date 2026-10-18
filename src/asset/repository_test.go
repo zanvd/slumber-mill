@@ -97,7 +97,7 @@ func (r *recorder) query(gdb *gorm.DB) {
 	case *[]eventRow:
 		*dest = append(*dest, r.eventRows...)
 	default:
-		if gdb.Statement.Table == "assets" {
+		if strings.Contains(gdb.Statement.SQL.String(), "FROM `assets`") {
 			r.answerLeaseScan(gdb)
 		}
 	}
@@ -494,7 +494,7 @@ func TestLeaseWritesSQL(t *testing.T) {
 				return err
 			},
 			want: append([]wantStatement{
-				{contains: []string{"FROM `assets` WHERE status = ? AND lease_expires_at < NOW(6)", "FOR UPDATE SKIP LOCKED"}},
+				{contains: []string{"FROM `assets` FORCE INDEX (`ix_assets_lease`) WHERE status = ? AND lease_expires_at < NOW(6)", "FOR UPDATE SKIP LOCKED"}},
 				{contains: []string{"WHERE id IN (?)"}, columns: retrying, vars: map[int]any{5: uint64(8)}},
 				{contains: []string{"WHERE id IN (?)"}, columns: failing, vars: map[int]any{4: uint64(9)}},
 			}, failed(failedMessage, 9, 43)...),
