@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/tracing"
 )
@@ -63,5 +65,26 @@ func TestSetupTracingLogsStartupErrors(t *testing.T) {
 	}
 	if !warned {
 		t.Errorf("no tracing error warning for the bad sampler in the log:\n%s", logs.String())
+	}
+}
+
+// TestPoolTracer gives the pools no provider when tracing is off, so they read no trace context, and the provider
+// when it's on.
+func TestPoolTracer(t *testing.T) {
+	off, err := tracing.Setup(t.Context(), tracing.Config{})
+	if err != nil {
+		t.Fatalf("Setup() without an endpoint: error = %v", err)
+	}
+	if got := poolTracer(off); got != nil {
+		t.Errorf("poolTracer() with tracing off = %v, want nil", got)
+	}
+	// Nothing is exported: no span is started, and the provider is shut down without one.
+	on, err := tracing.Setup(t.Context(), tracing.Config{Endpoint: "http://127.0.0.1:1", ServiceName: "pool-test"})
+	if err != nil {
+		t.Fatalf("Setup() error = %v", err)
+	}
+	defer on.Shutdown(t.Context())
+	if got := poolTracer(on); got != trace.TracerProvider(on) {
+		t.Errorf("poolTracer() with tracing on = %v, want the provider", got)
 	}
 }

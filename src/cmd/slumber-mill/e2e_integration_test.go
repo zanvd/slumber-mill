@@ -25,6 +25,7 @@ import (
 	"github.com/zanvd/slumber-mill/src/apiv1"
 	"github.com/zanvd/slumber-mill/src/audio"
 	"github.com/zanvd/slumber-mill/src/testutil"
+	"github.com/zanvd/slumber-mill/src/tracing"
 	"github.com/zanvd/slumber-mill/src/webhook"
 )
 
@@ -48,6 +49,8 @@ type e2e struct {
 	cancel  context.CancelFunc
 	procs   []*e2eProcess
 	stopped bool
+	// logs holds each process's log, by its name.
+	logs map[string]*logWatch
 }
 
 type e2eProcess struct {
@@ -65,6 +68,8 @@ type receivedHook struct {
 
 type e2eConfig struct {
 	encodeConcurrency int
+	// otlpEndpoint, if set, is where every process exports the traces Checkly started, as its own service.
+	otlpEndpoint string
 }
 
 // startE2E starts the stack and waits until the API serves and both pools have started.
@@ -83,6 +88,7 @@ func startE2E(t *testing.T, cfg e2eConfig) *e2e {
 		testStack: newTestStack(t, dsn, dataDir),
 		client:    &http.Client{Timeout: waitTimeout},
 		hooks:     make(chan receivedHook, 64),
+		logs:      map[string]*logWatch{},
 	}
 
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -119,20 +125,29 @@ func startE2E(t *testing.T, cfg e2eConfig) *e2e {
 		envDataDir:       dataDir,
 		envShutdownGrace: "5s",
 	}
-	with := func(extra map[string]string) map[string]string {
+	with := func(service string, extra map[string]string) map[string]string {
 		env := maps.Clone(common)
 		maps.Copy(env, extra)
+		if cfg.otlpEndpoint != "" {
+			maps.Copy(env, map[string]string{
+				tracing.EnvEndpoint:    cfg.otlpEndpoint,
+				tracing.EnvHeaders:     "authorization=" + otlpTestKey,
+				tracing.EnvProtocol:    "http/protobuf",
+				tracing.EnvServiceName: service,
+			})
+		}
 		return env
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	e.cancel = cancel
-	api := e.start(ctx, t, "api", with(map[string]string{envHTTPAddr: "127.0.0.1:0", envDrainDelay: "0s"}), "api")
+	api := e.start(ctx, t, "api",
+		with("slumber-mill-api", map[string]string{envHTTPAddr: "127.0.0.1:0", envDrainDelay: "0s"}), "api")
 	encode := e.start(ctx, t, "encode pool",
-		with(map[string]string{envEncodeConcurrency: strconv.Itoa(cfg.encodeConcurrency)}),
+		with("slumber-mill-worker-encode", map[string]string{envEncodeConcurrency: strconv.Itoa(cfg.encodeConcurrency)}),
 		"worker", "-pool", "encode")
 	hooks := e.start(ctx, t, "webhook pool",
-		with(map[string]string{envSecretKeys: keys, envWebhookAllowPrivate: "true"}),
+		with("slumber-mill-worker-webhook", map[string]string{envSecretKeys: keys, envWebhookAllowPrivate: "true"}),
 		"worker", "-pool", "webhook")
 	t.Cleanup(func() { e.stop(t) })
 
@@ -147,6 +162,7 @@ func startE2E(t *testing.T, cfg e2eConfig) *e2e {
 func (e *e2e) start(ctx context.Context, t *testing.T, name string, env map[string]string, args ...string) *logWatch {
 	t.Helper()
 	stderr, logs := watchLog(t)
+	e.logs[name] = logs
 	p := &e2eProcess{name: name, done: make(chan int, 1)}
 	e.procs = append(e.procs, p)
 	go func() {
@@ -205,6 +221,12 @@ func (e *e2e) get(t *testing.T, path string, header http.Header) (*http.Response
 // upload posts the file at path through the API, checks that it was accepted, and returns the asset.
 func (e *e2e) upload(t *testing.T, title, path string) apiv1.Asset {
 	t.Helper()
+	return e.uploadWith(t, title, path, nil)
+}
+
+// uploadWith uploads as upload does, with header added to the request.
+func (e *e2e) uploadWith(t *testing.T, title, path string, header http.Header) apiv1.Asset {
+	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	if err := mw.WriteField("title", title); err != nil {
@@ -230,6 +252,9 @@ func (e *e2e) upload(t *testing.T, title, path string) apiv1.Asset {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	for k, v := range header {
+		req.Header[k] = v
+	}
 	resp, respBody := e.do(t, req)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("POST /v1/assets = %d %s, want 202", resp.StatusCode, respBody)

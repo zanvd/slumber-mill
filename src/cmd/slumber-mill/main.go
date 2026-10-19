@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zanvd/slumber-mill/src/asset"
 	"github.com/zanvd/slumber-mill/src/audio"
@@ -39,7 +40,8 @@ const (
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 2 * time.Minute
 	// traceFlushTimeout bounds the export of the last spans. With the default drain delay and grace
-	// it keeps the API's longest stop at 43 s, inside Compose's 45 s stop_grace_period.
+	// it keeps the API's longest stop at 43 s, and a pool's at 33 s and its outcome writes,
+	// inside Compose's 45 s stop_grace_period.
 	traceFlushTimeout = 3 * time.Second
 
 	defaultTargetLUFS = -20
@@ -244,13 +246,22 @@ func setupTracing(ctx context.Context, log *slog.Logger, cfg tracing.Config) (*t
 	return tp, nil
 }
 
-// flushTraces exports the spans still queued, within traceFlushTimeout, after the HTTP server has stopped.
+// flushTraces exports the spans still queued, within traceFlushTimeout, after the HTTP server or the pool has stopped.
 func flushTraces(ctx context.Context, log *slog.Logger, tp *tracing.Provider) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), traceFlushTimeout)
 	defer cancel()
 	if err := tp.Shutdown(ctx); err != nil {
 		log.WarnContext(ctx, "error flushing traces", "error", err)
 	}
+}
+
+// poolTracer is the provider a pool continues stored traces with, or nil when tracing is off,
+// so that the pool doesn't read the trace context of the work it claims.
+func poolTracer(tp *tracing.Provider) trace.TracerProvider {
+	if !tp.Enabled() {
+		return nil
+	}
+	return tp
 }
 
 func runWorker(ctx context.Context, log *slog.Logger, args []string, getenv func(string) string) error {
@@ -287,6 +298,13 @@ func runEncodePool(ctx context.Context, log *slog.Logger, getenv func(string) st
 		return err
 	}
 
+	tp, err := setupTracing(ctx, poolLog, cfg.Tracing)
+	if err != nil {
+		return err
+	}
+	// Deferred first, so it runs last: once the pool has stopped and every lease's span has ended.
+	defer flushTraces(ctx, poolLog, tp)
+
 	gdb, err := db.Open(cfg.DSN, log)
 	if err != nil {
 		return err
@@ -298,7 +316,7 @@ func runEncodePool(ctx context.Context, log *slog.Logger, getenv func(string) st
 	defer pool.Close()
 
 	processor, err := asset.NewProcessor(asset.NewRepository(gdb), files, ff,
-		asset.ProcessorConfig{WorkerID: id, Lease: cfg.Lease})
+		asset.ProcessorConfig{WorkerID: id, Lease: cfg.Lease, Tracer: poolTracer(tp)})
 	if err != nil {
 		return fmt.Errorf("error creating the processor: %w", err)
 	}
@@ -336,6 +354,13 @@ func runWebhookPool(ctx context.Context, log *slog.Logger, getenv func(string) s
 	files := storage.NewLocal(cfg.DataDir)
 	sweepTemp(ctx, poolLog, files, cfg.EncodeLease)
 
+	tp, err := setupTracing(ctx, poolLog, cfg.Tracing)
+	if err != nil {
+		return err
+	}
+	// Deferred first, so it runs last: once the pool has stopped and every lease's span has ended.
+	defer flushTraces(ctx, poolLog, tp)
+
 	gdb, err := db.Open(cfg.DSN, log)
 	if err != nil {
 		return err
@@ -355,7 +380,7 @@ func runWebhookPool(ctx context.Context, log *slog.Logger, getenv func(string) s
 	}
 	client := webhook.NewClient(cfg.WebhookAllowPrivate)
 	deliverer, err := webhook.NewDeliverer(repo, tenants, client,
-		webhook.DelivererConfig{WorkerID: id, Lease: webhookLease})
+		webhook.DelivererConfig{WorkerID: id, Lease: webhookLease, Tracer: poolTracer(tp)})
 	if err != nil {
 		return fmt.Errorf("error creating the deliverer: %w", err)
 	}

@@ -40,7 +40,10 @@ func setChecklyHeaders(r *http.Request) {
 	r.Header.Set("tracestate", "checkly=true")
 }
 
-func uploadRequest(t *testing.T, base, apiKey string) *http.Request {
+// notAudio is an upload only the encode pool finds isn't audio.
+var notAudio = []byte("not audio, which only the encode pool checks")
+
+func uploadRequest(t *testing.T, base, apiKey string, content []byte) *http.Request {
 	t.Helper()
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
@@ -51,7 +54,7 @@ func uploadRequest(t *testing.T, base, apiKey string) *http.Request {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(fw, "not audio, which only the encode pool checks"); err != nil {
+	if _, err := fw.Write(content); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -113,7 +116,7 @@ func TestAPITraceNesting(t *testing.T) {
 	}
 
 	resp := serveOnce(t, srv.Handler(), func(base string) *http.Request {
-		r := uploadRequest(t, base, apiKey)
+		r := uploadRequest(t, base, apiKey, notAudio)
 		setChecklyHeaders(r)
 		return r
 	})
@@ -141,7 +144,7 @@ func TestAPITraceNesting(t *testing.T) {
 
 	rec.Reset()
 	resp = serveOnce(t, srv.Handler(), func(base string) *http.Request {
-		r := uploadRequest(t, base, apiKey)
+		r := uploadRequest(t, base, apiKey, notAudio)
 		r.Header.Set("traceparent", "00-"+checklyTraceID+"-"+checklyParentID+"-01")
 		return r
 	})

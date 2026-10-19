@@ -15,6 +15,20 @@ func envFrom(m map[string]string) func(string) string {
 	return func(name string) string { return m[name] }
 }
 
+// sameTracing reports whether a and b are the same configuration, comparing header values by their bytes.
+func sameTracing(a, b tracing.Config) bool {
+	if a.Endpoint != b.Endpoint || a.ServiceName != b.ServiceName || len(a.Headers) != len(b.Headers) {
+		return false
+	}
+	for name, v := range a.Headers {
+		w, ok := b.Headers[name]
+		if !ok || string(v.Bytes()) != string(w.Bytes()) {
+			return false
+		}
+	}
+	return true
+}
+
 func TestLoadAPIConfig(t *testing.T) {
 	defaults := apiConfig{
 		DSN:                 "slumber_mill:slumber_mill@tcp(mysql:3306)/slumber_mill",
@@ -263,6 +277,32 @@ func TestLoadEncodeConfig(t *testing.T) {
 			}(),
 		},
 		{
+			name: "tracing on",
+			env: map[string]string{
+				tracing.EnvEndpoint: "https://otel.eu-west-1.checklyhq.com", tracing.EnvHeaders: "authorization=k",
+				tracing.EnvServiceName: "slumber-mill-worker-encode",
+			},
+			want: func() encodeConfig {
+				c := defaults
+				c.Tracing = tracing.Config{
+					Endpoint:    "https://otel.eu-west-1.checklyhq.com",
+					Headers:     map[string]secret.Value{"authorization": secret.NewValue([]byte("k"))},
+					ServiceName: "slumber-mill-worker-encode",
+				}
+				return c
+			}(),
+		},
+		{
+			name:    "tracing with another protocol",
+			env:     map[string]string{tracing.EnvEndpoint: "https://otel.test", tracing.EnvProtocol: "grpc"},
+			wantErr: []string{`OTEL_EXPORTER_OTLP_PROTOCOL must be http/protobuf, got "grpc"`},
+		},
+		{
+			name:    "an exporter variable the pool doesn't support",
+			env:     map[string]string{"OTEL_EXPORTER_OTLP_TIMEOUT": "10000"},
+			wantErr: []string{"OTEL_EXPORTER_OTLP_TIMEOUT isn't supported, so it must be unset"},
+		},
+		{
 			name:    "every invalid variable is reported",
 			env:     map[string]string{envEncodeConcurrency: "all", envEncodeLease: "long", envShutdownGrace: "0"},
 			wantErr: []string{envEncodeConcurrency, envEncodeLease, envShutdownGrace},
@@ -285,8 +325,13 @@ func TestLoadEncodeConfig(t *testing.T) {
 			if err != nil {
 				t.Fatalf("loadEncodeConfig() error = %v", err)
 			}
-			if got != tt.want {
-				t.Errorf("loadEncodeConfig() = %+v, want %+v", got, tt.want)
+			want := tt.want
+			if !sameTracing(got.Tracing, want.Tracing) {
+				t.Errorf("loadEncodeConfig().Tracing = %+v, want %+v", got.Tracing, want.Tracing)
+			}
+			got.Tracing, want.Tracing = tracing.Config{}, tracing.Config{}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("loadEncodeConfig() = %+v, want %+v", got, want)
 			}
 		})
 	}
@@ -310,12 +355,37 @@ func TestLoadWebhookConfig(t *testing.T) {
 		ShutdownGrace: 30 * time.Second,
 	}
 	tests := []struct {
-		name    string
-		env     map[string]string
-		want    plain
-		wantErr []string
+		name        string
+		env         map[string]string
+		want        plain
+		wantTracing tracing.Config
+		wantErr     []string
 	}{
 		{name: "defaults", env: map[string]string{envSecretKeys: keys}, want: defaults},
+		{
+			name: "tracing on",
+			env: map[string]string{
+				envSecretKeys:       keys,
+				tracing.EnvEndpoint: "https://otel.eu-west-1.checklyhq.com", tracing.EnvHeaders: "authorization=k",
+				tracing.EnvServiceName: "slumber-mill-worker-webhook",
+			},
+			want: defaults,
+			wantTracing: tracing.Config{
+				Endpoint:    "https://otel.eu-west-1.checklyhq.com",
+				Headers:     map[string]secret.Value{"authorization": secret.NewValue([]byte("k"))},
+				ServiceName: "slumber-mill-worker-webhook",
+			},
+		},
+		{
+			name:    "tracing with another protocol",
+			env:     map[string]string{envSecretKeys: keys, tracing.EnvEndpoint: "https://otel.test", tracing.EnvProtocol: "grpc"},
+			wantErr: []string{`OTEL_EXPORTER_OTLP_PROTOCOL must be http/protobuf, got "grpc"`},
+		},
+		{
+			name:    "an exporter variable the pool doesn't support",
+			env:     map[string]string{envSecretKeys: keys, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://otel.test"},
+			wantErr: []string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT isn't supported, so it must be unset"},
+		},
 		{
 			name: "every variable set",
 			env: map[string]string{
@@ -396,6 +466,9 @@ func TestLoadWebhookConfig(t *testing.T) {
 			}
 			if gotPlain != tt.want {
 				t.Errorf("loadWebhookConfig() = %+v, want %+v", gotPlain, tt.want)
+			}
+			if !sameTracing(got.Tracing, tt.wantTracing) {
+				t.Errorf("loadWebhookConfig().Tracing = %+v, want %+v", got.Tracing, tt.wantTracing)
 			}
 			if string(got.SecretKeys.Bytes()) != keys {
 				t.Error("loadWebhookConfig().SecretKeys doesn't hold the key ring")
