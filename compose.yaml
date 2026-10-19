@@ -133,7 +133,7 @@ services:
       - checkly-node-modules:/checkly/node_modules
 
   checkly-agent:
-    profiles: ["checkly"]
+    profiles: ["checkly-agent"]
     image: checkly/agent:8.11.0@sha256:270e21a8b9955ee13c30d1c5fb7484960bac4680702b5bfc78ebdc91acc5c012
     environment:
       API_KEY: ${CHECKLY_PL_API_KEY:-}

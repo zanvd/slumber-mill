@@ -880,12 +880,16 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
   Its default command runs the whole suite, `go test -race -tags integration ./...`.
   It sits in the `dev` profile, so `docker compose up` doesn't start the test suite;
   `docker compose run` names it explicitly and starts it anyway.
-- `checkly` and `checkly-agent`, both in the `checkly` profile, so `docker compose up` doesn't start them.
-  `checkly` builds `checkly/Dockerfile` (Node 24 LTS, pinned by digest, running as `APP_UID`), mounts `./checkly` at
+- `checkly` in the `checkly` profile and `checkly-agent` in the `checkly-agent` profile, so a plain
+  `docker compose up` starts neither. A checkout opts in to the agent with `COMPOSE_PROFILES=checkly-agent` in its
+  `.env`, which makes `up` start it, and never the CLI container; only one checkout on the account may opt in.
+  `make checkly-agent` starts it without the opt-in, and `make down` lists both profiles and stops it either way.
+  `process-checks.sh` and `soak.sh` set `COMPOSE_PROFILES` empty for their projects, which read the root `.env`,
+  so they never start an agent. `checkly` builds `checkly/Dockerfile` (Node 24 LTS, pinned by digest, running as `APP_UID`), mounts `./checkly` at
   `/checkly` with `node_modules` in the `checkly-node-modules` volume, so the container writes nothing else into the
   repository, and takes `CHECKLY_API_KEY` and `CHECKLY_ACCOUNT_ID` from `.env`. Its entrypoint runs `npm ci` whenever
   `package-lock.json` has changed. `checkly-agent` is `checkly/agent`, pinned by digest, with `API_KEY` from
-  `CHECKLY_PL_API_KEY`. It sits on the stack's network, so the private location `slumber-mill-local` reaches
+  `CHECKLY_PL_API_KEY` and `restart: unless-stopped`. It sits on the stack's network, so the private location `slumber-mill-local` reaches
   `api:8080`. Checks and the group are defined in `checkly/checks/`; `checkly deploy` changes the live account and is
   run by hand.
 

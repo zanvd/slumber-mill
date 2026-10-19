@@ -4,7 +4,7 @@ up:
 	docker compose up -d --build
 
 down:
-	docker compose --profile dev --profile checkly down --remove-orphans
+	docker compose --profile dev --profile checkly --profile checkly-agent down --remove-orphans
 
 tenant:
 	docker compose run --rm api tenant create -slug $(SLUG)
@@ -31,7 +31,7 @@ process-checks:
 	bash scripts/process-checks.sh
 
 checkly-agent:
-	docker compose --profile checkly up -d checkly-agent
+	docker compose --profile checkly-agent up -d checkly-agent
 
 checkly-test:
 	docker compose --profile checkly run --rm checkly npx checkly test --private-location slumber-mill-local --record
