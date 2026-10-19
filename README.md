@@ -193,6 +193,8 @@ Environment variables, with the defaults used when one is unset:
   last spans, so with the defaults it stops within 43 seconds.
 - With tracing on, each worker pool also exports its last spans once its work is released or done, for at most
   3 seconds, so with the defaults it stops within 33 seconds plus the few milliseconds its outcome writes take.
+  Reading a claimed job's trace context gives up after 5 seconds, so a stalled database can't hold the stop: a job
+  claimed as the pool stops is released once the read ends, well within the grace.
 - A signal before the API listens ends it with exit 0 and the log line `stopped before serving HTTP`.
 - After a SIGKILL or a crash, the reaper requeues the asset once its lease has expired and counts the attempt.
   The dead attempt's temp files wait for the next startup sweep.

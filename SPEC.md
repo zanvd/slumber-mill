@@ -480,7 +480,8 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 - The pool puts a logger carrying `worker`, `pool`, `id`, `tenant_id`, `attempt` and `took` into the work's context.
 - **Tracing** (`feat/checkly`): a source may also implement
   `Trace(ctx context.Context, l Lease) (context.Context, trace.Span)`, which `asset.Processor` and `webhook.Deliverer`
-  do when given a tracer provider. The pool calls it right after the claim and runs the work, its heartbeats and the
+  do when given a tracer provider; their read of the trace context gives up after 5 s and only loses the span
+  (§12, "A pool's last spans"). The pool calls it right after the claim and runs the work, its heartbeats and the
   outcome's write in the context it returns; once the outcome is written, it sets `slumber_mill.outcome` on the span
   (`done`, `discarded`, `released` or `failed`, as logged; `failed` is an error) and ends it. When the span is
   exported, the lease's logger also carries `trace_id` and `span_id`. A nil span means no span; neither changes
@@ -965,7 +966,10 @@ the one exception is `process-checks`, which runs `bash scripts/process-checks.s
 - **A pool's last spans:** with tracing on, once the pool has stopped and every lease's outcome is written, the
   tracer provider exports the spans still queued, for at most 3 s. With the default grace that is 30 + 3 = 33 s
   and the outcome writes, which take milliseconds unless MySQL stalls (each is bounded by 15 s), inside the 45 s
-  `stop_grace_period`.
+  `stop_grace_period`. The read of a claimed lease's trace context is bounded by 5 s of its own, because it runs
+  on the work's uncancellable context before the heartbeat and the grace start. A stop during it releases the
+  lease once the read ends, so it never adds to the grace: a slot stops within 5 s and the release, or within
+  the grace and the outcome write.
 - **No init process is needed.** Go handles signals itself, so running as PID 1 is fine:
   verified as PID 1 of a PID namespace, the first SIGTERM started the drain and the second ended the process.
   `exec.Cmd.Wait` reaps ffmpeg, so no zombies.
@@ -1221,7 +1225,8 @@ What the tests must show:
   `asset_events` (written by finish, fail and the reaper) and `webhook_deliveries`, as NULL for a tenant's upload;
   migration 0003 adds the columns as nullable ASCII and applies again after a run that stopped partway;
   the processor and the deliverer continue a stored trace in `asset.encode` and `webhook.deliver`, a NULL one
-  records nothing and with tracing off nothing is read (fakes and `tracetest`); the pool ends a lease's span with
+  records nothing and with tracing off nothing is read (fakes and `tracetest`), and a stalled read gives up after
+  its 5 s without a span, so a pool stopped during it still returns then (`synctest`); the pool ends a lease's span with
   its outcome, runs the work, heartbeats and outcome under it and adds the trace IDs to the lease's logs; the steps of
   §7 are children of the encode span; the delivery span holds the host and status but no path or query, and the
   request on the wire is the same with or without a span, without `traceparent`; against MySQL and ffmpeg,
