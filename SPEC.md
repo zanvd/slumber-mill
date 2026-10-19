@@ -996,10 +996,28 @@ its value. The variables are the `OTEL_EXPORTER_OTLP_` ones `TRACES_ENDPOINT`, `
 `TRACES_CERTIFICATE`, `CLIENT_CERTIFICATE`, `CLIENT_KEY`, `TRACES_CLIENT_CERTIFICATE`, `TRACES_CLIENT_KEY`,
 `INSECURE` and `TRACES_INSECURE`, plus `OTEL_GO_X_OBSERVABILITY`. They are refused for these reasons:
 - the exporter would log the values it can't parse as plain text, some of them file paths;
-- they would change behaviour this spec doesn't cover;
+- they change where and how spans are sent (a second endpoint, TLS, timeouts, compression) or what the exporter
+  itself reports, which this spec fixes to the variables above;
 - with tracing off, a setting such as a per-signal endpoint would silently do nothing.
 
 The list is the one `otlptracehttp` v1.47.0 reads, and is checked again whenever the OpenTelemetry version changes.
+
+The SDK reads variables of its own, and with tracing on `api` honours them:
+- the batching variables `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_EXPORT_TIMEOUT`, `OTEL_BSP_MAX_QUEUE_SIZE` and
+  `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`;
+- the span limits `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_ATTRIBUTE_COUNT_LIMIT`,
+  `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`,
+  `OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` and `OTEL_LINK_ATTRIBUTE_COUNT_LIMIT`;
+- `OTEL_RESOURCE_ATTRIBUTES`, which `sdktrace.WithResource` merges in through `resource.Environment()`, so its
+  attributes go out with every exported span (`service.name` stays `OTEL_SERVICE_NAME`'s);
+- `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`, which are read but always overridden by the Checkly-only
+  sampler.
+
+They are treated differently from the exporter's because they are tuning and labels an operator chooses, they
+don't change where spans go or which traces are exported, and they never print plain text: a bad sampler or
+resource value is reported through the error handler, which `main.go` sets before the provider is built, so it
+lands in the JSON log, and a bad number goes only to OpenTelemetry's own logger at its info verbosity (V(4)),
+which isn't printed by default, and the default value is used.
 
 The temp refresh (every lease/3) and the startup temp sweep's age follow the encode lease,
 so `api` and both pools read `SLUMBER_MILL_ENCODE_LEASE`.
