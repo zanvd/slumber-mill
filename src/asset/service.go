@@ -16,11 +16,17 @@ import (
 	"unicode/utf8"
 	"uuid"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/validation"
 )
 
 const (
+	tracerName = "github.com/zanvd/slumber-mill/src/asset"
+
 	// DefaultListLimit is the page size the API uses when a request doesn't give one.
 	DefaultListLimit = 20
 	MaxListLimit     = 100
@@ -81,7 +87,14 @@ type Upload struct {
 }
 
 // Stage streams r to a temp file while hashing it. On error nothing is left behind.
-func (s *Service) Stage(ctx context.Context, r io.Reader) (Upload, error) {
+func (s *Service) Stage(ctx context.Context, r io.Reader) (u Upload, err error) {
+	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "asset.Stage")
+	defer func() {
+		if err != nil {
+			span.SetStatus(codes.Error, "")
+		}
+		span.End()
+	}()
 	f, err := s.files.TempFile()
 	if err != nil {
 		return Upload{}, fmt.Errorf("error staging upload: %w", err)
@@ -91,11 +104,12 @@ func (s *Service) Stage(ctx context.Context, r io.Reader) (Upload, error) {
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
+	span.SetAttributes(attribute.Int64("slumber_mill.upload.bytes", n))
 	if err != nil {
 		s.remove(ctx, f.Name())
 		return Upload{}, fmt.Errorf("error staging upload: %w", err)
 	}
-	u := Upload{path: f.Name(), size: uint64(n)}
+	u = Upload{path: f.Name(), size: uint64(n)}
 	h.Sum(u.sha256[:0])
 	return u, nil
 }
