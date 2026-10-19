@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"errors"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ErrLeaseLost means a fenced write matched no row: the lease expired and was reaped, or another worker holds it.
@@ -16,6 +18,13 @@ type source interface {
 	Fail(ctx context.Context, l Lease, cause error) error // retry with backoff, or give up
 	Release(ctx context.Context, l Lease) error
 	Reap(ctx context.Context) error
+}
+
+// tracedSource is a source whose work may continue a trace stored with it.
+type tracedSource interface {
+	// Trace returns ctx with the span of the lease's work, or a nil span if it has none.
+	// The pool ends the span, with the lease's outcome, once the outcome is written.
+	Trace(ctx context.Context, l Lease) (context.Context, trace.Span)
 }
 
 type Lease struct {

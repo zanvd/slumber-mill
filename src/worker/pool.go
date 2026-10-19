@@ -10,10 +10,17 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/zanvd/slumber-mill/src/logging"
 )
 
-const outcomeTimeout = 15 * time.Second
+const (
+	outcomeTimeout = 15 * time.Second
+	attrOutcome    = "slumber_mill.outcome"
+)
 
 var errGraceExpired = errors.New("shutdown grace expired")
 
@@ -40,6 +47,7 @@ type Pool struct {
 // Process does the work and completes it, fenced; Fail retries with backoff or gives up;
 // Release requeues the work without using an attempt; Reap requeues or fails work whose lease expired;
 // and Extend, Process, Fail and Release return ErrLeaseLost once fenced out.
+// A source with a Trace method gives each lease a span, which the pool ends with the lease's outcome.
 func NewPool(src source, cfg Config) (*Pool, error) {
 	switch {
 	case src == nil:
@@ -142,7 +150,8 @@ func (p *Pool) handle(ctx context.Context, l Lease) {
 		With("id", l.ID, "tenant_id", l.TenantID, "attempt", l.Attempt)
 	work, cancel := context.WithCancelCause(logging.CtxWithLogger(context.WithoutCancel(ctx), log))
 	defer cancel(nil)
-	log.InfoContext(work, "work claimed")
+	work, span := p.trace(work, l)
+	logging.LoggerFromContext(work).InfoContext(work, "work claimed")
 
 	err := ctx.Err() // claimed as the pool stopped: release it unstarted
 	if err == nil {
@@ -154,7 +163,39 @@ func (p *Pool) handle(ctx context.Context, l Lease) {
 		close(done)
 		wg.Wait()
 	}
-	p.settle(work, l, decide(err, work, ctx), err)
+	o := decide(err, work, ctx)
+	p.settle(work, l, o, err)
+	endSpan(span, o)
+}
+
+// trace starts the lease's span if the source traces its work. The work's logger then carries the span's
+// trace and span IDs when the span is exported, so its lines can be found from the trace.
+func (p *Pool) trace(work context.Context, l Lease) (context.Context, trace.Span) {
+	src, ok := p.src.(tracedSource)
+	if !ok {
+		return work, nil
+	}
+	ctx, span := src.Trace(work, l)
+	if span == nil {
+		return work, nil
+	}
+	if sc := span.SpanContext(); span.IsRecording() && sc.IsSampled() {
+		log := logging.LoggerFromContext(ctx).With("trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
+		ctx = logging.CtxWithLogger(ctx, log)
+	}
+	return ctx, span
+}
+
+// endSpan ends the lease's span with its outcome, as an error if the attempt failed.
+func endSpan(span trace.Span, o outcome) {
+	if span == nil {
+		return
+	}
+	span.SetAttributes(attribute.String(attrOutcome, string(o)))
+	if o == outcomeFail {
+		span.SetStatus(codes.Error, "")
+	}
+	span.End()
 }
 
 func (p *Pool) process(ctx context.Context, l Lease) (err error) {

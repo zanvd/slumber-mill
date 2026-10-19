@@ -13,6 +13,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // call is one call to a fakeSource, with the state of its context at the time.
@@ -22,6 +24,7 @@ type call struct {
 	cause    error
 	ctxErr   error
 	deadline time.Time
+	span     trace.SpanContext
 }
 
 // fakeSource hands out the leases in due, one per Claim, and records every call.
@@ -104,7 +107,8 @@ func (f *fakeSource) record(calls *[]call, ctx context.Context, l Lease, cause e
 	deadline, _ := ctx.Deadline()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	*calls = append(*calls, call{lease: l, at: time.Now(), cause: cause, ctxErr: ctx.Err(), deadline: deadline})
+	*calls = append(*calls, call{lease: l, at: time.Now(), cause: cause, ctxErr: ctx.Err(), deadline: deadline,
+		span: trace.SpanContextFromContext(ctx)})
 	return len(*calls)
 }
 
