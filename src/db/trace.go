@@ -65,6 +65,10 @@ type statementSpan struct {
 
 func endSpan(operation string) func(*gorm.DB) {
 	return func(g *gorm.DB) {
+		// startSpan made nothing without a sampled span, and the flag can't change in between.
+		if !trace.SpanContextFromContext(g.Statement.Context).IsSampled() {
+			return
+		}
 		v, ok := g.InstanceGet(spanKey)
 		if !ok {
 			return
