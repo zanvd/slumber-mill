@@ -27,10 +27,12 @@ process lifecycle and shutdown, and loudness that is verified rather than assume
 - No object storage or CDN. Local disk sits behind a small storage type; the README explains the production swap.
 - No push notifications or payment webhooks. Both are listed as next steps (§17).
 - No metrics stack. Structured logs only; metrics are listed as a next step.
-- No monitoring in the Go module or the default stack. Synthetic monitoring is the one exception to the stack below:
-  a Checkly CLI project in `checkly/`, in Node and TypeScript, with its own Compose services, `checkly` and
-  `checkly-agent`, in opt-in profiles (§12). It lives on the `feat/checkly` branch and is not part of the build
-  order (§15).
+- No monitoring in the Go module or the default stack, with two exceptions, both on the `feat/checkly` branch and
+  outside the build order (§15):
+  - Synthetic monitoring: a Checkly CLI project in `checkly/`, in Node and TypeScript, with its own Compose services,
+    `checkly` and `checkly-agent`, in opt-in profiles (§12).
+  - Tracing of Checkly's checks: `api` exports the spans of traces a Checkly check started to Checkly Traces over
+    OTLP/HTTP, with the OpenTelemetry modules in §3. Tenant traffic is never exported (§12).
 - No per-tenant fairness scheduling. Called out as a known limitation.
 
 ## 3. Stack
@@ -45,9 +47,12 @@ process lifecycle and shutdown, and loudness that is verified rather than assume
 | Runtime | Docker with Compose v2 | The only thing the host needs (§12) |
 | CI | GitHub Actions | Runs the same Compose `dev` service as a laptop |
 | Monitoring | Checkly CLI 9.5.0 (Node 24 LTS, TypeScript) | Optional, in `checkly/`; the `checkly` and `checkly-agent` Compose profiles (§12) |
+| Tracing | OpenTelemetry Go v1.47.0: `go.opentelemetry.io/otel`, `otel/trace`, `otel/sdk`, `otel/exporters/otlp/otlptrace/otlptracehttp` | Needs Go 1.26+; only traces a Checkly check started, exported to Checkly Traces (§12) |
 
-No other dependencies for the Go module. The Checkly project has its own `package.json`, with `checkly` pinned
-exactly and a committed `package-lock.json`; nothing in it is built into or imported by the Go binary.
+No other dependencies for the Go module than the four OpenTelemetry modules above: no `contrib` packages such as
+`otelhttp` or `otelgin`, and no `gorm.io/plugin/opentelemetry`; the HTTP wrapper and the GORM callback are the
+project's own. The Checkly project has its own `package.json`, with `checkly` pinned exactly and a committed
+`package-lock.json`; nothing in it is built into or imported by the Go binary.
 
 ### Using Go 1.27
 
@@ -153,6 +158,7 @@ src/                         the Go module: go.mod, go.sum and all Go code
   apiv1/                     public JSON types, shared by API responses and webhook payloads
   validation/                field errors that services return and the API renders as 400
   logging/                   a logger carried in the context (CtxWithLogger, LoggerFromContext)
+  tracing/                   OTLP/HTTP tracer provider from the OTEL_* variables, the Checkly-only sampler
   httpsrv/                   Gin router, middleware, handlers, error mapping
   testutil/                  throwaway MySQL database per test, audio fixtures
 var/                         host-synced volumes; gitignored apart from the .gitkeep files
@@ -196,7 +202,10 @@ and nothing specific to one layer's technology crosses into another:
   GORM models are unexported structs converted to and from domain types at the boundary (`toRepo`, `newAssetFromRepo`),
   so GORM tags and `db.ID` never appear in a domain type.
 - **A plain `context.Context` crosses layers, never `*gin.Context`** (pitfall 1).
-  It carries cancellation and the request's or job's logger (`logging.LoggerFromContext`).
+  It carries cancellation and the request's or job's logger (`logging.LoggerFromContext`),
+  and, for a traced request, its span: `db` and `asset` start child spans from that span's provider,
+  so only `httpsrv` is given a tracer provider, by `main.go`. Of OpenTelemetry's globals, only the error handler
+  is set, by `main.go`, so the SDK's errors reach the JSON log; the provider and propagator are never global.
 - **Errors are translated at each boundary.**
   A repository maps `gorm.ErrRecordNotFound` to its package's `ErrNotFound` and `gorm.ErrDuplicatedKey`
   to an unexported `errDuplicate`, and wraps anything else as `fmt.Errorf("error ...: %w: %v", errDatabase, err)`,
@@ -842,6 +851,8 @@ Both runtime images use `ENTRYPOINT ["slumber-mill"]`,
 so `docker compose run --rm api tenant create ...` runs the CLI in the lean image.
 
 - **The binary is static** (`CGO_ENABLED=0`; Gin, GORM and the driver are pure Go): 22.7 MB in the prototype.
+  On `feat/checkly` the OpenTelemetry modules took it from 36.2 MB to 42.5 MB (Go 1.27.2, measured with the
+  `build` stage's command).
   Only `dev` needs cgo, for the race detector.
 - **Only the encode worker's image has ffmpeg.**
   It adds about 440 MiB to Ubuntu (200 packages, from a simulated install without recommended packages);
@@ -871,6 +882,11 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
 - `migrate`: the `runtime` image, `command: migrate`, run once;
   the API and both pools depend on it with `condition: service_completed_successfully`.
 - `api`: `runtime`, `command: api`, port 8080, published on `127.0.0.1` only, so the local stack isn't open to the network.
+  It gets the OpenTelemetry variables for Checkly Traces (see "Synthetic monitoring" below):
+  `OTEL_EXPORTER_OTLP_ENDPOINT: ${CHECKLY_OTEL_API_KEY:+https://otel.eu-west-1.checklyhq.com}`,
+  `OTEL_EXPORTER_OTLP_HEADERS: authorization=${CHECKLY_OTEL_API_KEY:-}`, `OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf`
+  and `OTEL_SERVICE_NAME: slumber-mill-api`. Without `CHECKLY_OTEL_API_KEY` in `.env` the endpoint is empty,
+  which turns tracing off.
 - `worker-encode`: `runtime-media`, `command: worker -pool encode`, `cpus: 2`,
   so `GOMAXPROCS` and the pool size follow the limit.
 - `worker-webhook`: `runtime`, `command: worker -pool webhook`.
@@ -935,6 +951,9 @@ the one exception is `process-checks`, which runs `bash scripts/process-checks.s
    so the load balancer can take the node out (pitfall 28).
 2. Then `srv.Shutdown(ctx)` with the grace period.
 3. If that times out, `srv.Close()` and **exit 0** (pitfall 29).
+4. Once the server has stopped, the tracer provider exports the spans still queued, for at most 3 s.
+   With the default drain delay and grace the longest stop is 10 + 30 + 3 = 43 s, inside the 45 s `stop_grace_period`;
+   for `api`, `stop_grace_period` must exceed the drain delay, the grace and the 3 s together.
 
 ### Configuration (environment)
 
@@ -953,6 +972,15 @@ the one exception is `process-checks`, which runs `bash scripts/process-checks.s
 | `SLUMBER_MILL_TRUSTED_PROXIES` | empty (trust none) |
 | `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` | `false` (`true` in the local Compose stack) |
 | `SLUMBER_MILL_SECRET_KEYS` | none; required by `tenant create` and the webhook pool (§8) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty: tracing off. `api` only; the OTLP/HTTP base URL, spans go to its `/v1/traces` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | none; `key=value[,...]`, values percent-encoded, sent with every export |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf`, the only value accepted |
+| `OTEL_SERVICE_NAME` | `slumber-mill` (`slumber-mill-api` in the local Compose stack) |
+
+Without an endpoint the other `OTEL_` variables are ignored and the provider is a no-op that exports and dials
+nothing. With one, an endpoint that isn't an `http` or `https` URL (or has credentials, a query or a fragment),
+another protocol, or a header without a name or a value is a configuration error, and the process exits 1;
+the error never quotes a header's value or the endpoint.
 
 The temp refresh (every lease/3) and the startup temp sweep's age follow the encode lease,
 so `api` and both pools read `SLUMBER_MILL_ENCODE_LEASE`.
@@ -967,7 +995,8 @@ temp file; a shorter value is a configuration error, and the process exits 1.
 - **Unread request bodies:** A request whose body the handler doesn't read to its end loses its connection: the response says `Connection: close`, and the read deadline is expired once the handler is done, so a client that stalls its body can't hold the connection.
 - **DB pool:** `MaxOpenConns 25`, `MaxIdleConns 25`, `ConnMaxLifetime 5m`.
 - **Logging:** `slog` JSON to stderr. Request lines carry the route template (`c.FullPath()`), status,
-  duration and tenant slug. Middleware and the worker put a logger with their fields into the context,
+  duration and tenant slug, and for a request whose trace is exported, `trace_id` and `span_id`.
+  Middleware and the worker put a logger with their fields into the context,
   and services log through `logging.LoggerFromContext(ctx)`. Secrets from `tenant create` go to stdout only.
 
 ### CI
@@ -1013,6 +1042,37 @@ of the scheduled runs and send them to its own `api`, where they fail and alert.
   with `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` off as well as on.
 - The ping URL exists only after the first deploy, so the probe tenant is created after it,
   and `ingest-round-trip` fails until its key is stored.
+
+#### Traces
+
+Every HTTP request a check sends carries a W3C `traceparent` and `tracestate: checkly=true`.
+With Import Traces on in the Checkly account, `api` continues those traces and exports them to Checkly Traces
+(`https://otel.eu-west-1.checklyhq.com`, OTLP/HTTP with protobuf, the account's OTel API key as the `authorization`
+header), so a check result links to what the request did inside the API.
+
+- **Only Checkly's traces leave the process.** The sampler is parent-based: a span without a parent is never sampled,
+  and a remote parent is followed only when its sampled flag is set and its `tracestate` has `checkly=true`.
+  A request without those headers, or with a malformed `traceparent`, gets a non-recording span and costs no export.
+  Only the W3C TraceContext propagator is used; baggage isn't read.
+  A client that sends Checkly's headers itself gets its own requests exported; their spans hold nothing secret.
+- **Spans:**
+  - one server span per request, started by a `net/http` wrapper around the engine, so trailing-slash redirects and
+    panics get one too. It is named `METHOD route` (just the method when no route matched; `HTTP` and
+    `_OTHER` for a method HTTP doesn't define), with `http.request.method`, `http.route`,
+    `http.response.status_code` and, once authenticated, `slumber_mill.tenant` (the slug). A 5xx, or a response
+    aborted with `http.ErrAbortHandler`, sets status error.
+  - one client span per SQL statement, from a GORM callback registered in `db.Open`, named `OPERATION table`, with
+    `db.system=mysql`, `db.operation.name`, `db.collection.name` and `db.query.text`: the SQL with its `?`
+    placeholders, since `interpolateParams` is refused. A failed statement sets status error without the error's
+    text, which can quote a bound value. A statement whose context has no sampled span gets none.
+  - `asset.Stage`, around streaming the upload to its temp file, with `slumber_mill.upload.bytes`.
+- **No header, query string or body goes into a span**, so `Authorization`, the API key, cookies and the
+  `Idempotency-Key` never do.
+- **Logs:** request lines and the request's service logs carry `trace_id` and `span_id` when the trace is exported.
+- **Off by default:** without `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is exported or dialled. The Compose stack sets it
+  only when `.env` has `CHECKLY_OTEL_API_KEY`; a worktree or second checkout that shares the main `.env` through
+  `COMPOSE_ENV_FILES` sets `CHECKLY_OTEL_API_KEY=` in its shell.
+- The encode and webhook pools aren't traced yet.
 
 ## 13. Testing
 
@@ -1061,6 +1121,14 @@ What the tests must show:
   or rendition is a 404 and their list is empty; an upper-case ID finds the asset and a malformed one is a 404;
   idempotent replays, `422` on reuse, case-variant keys as different keys, and concurrent retries producing one asset;
   pagination that is complete, newest first, without overlap, and rejects a malformed cursor.
+- **Tracing** (`tracetest` recorders and an `httptest` OTLP receiver): the sampler follows a remote parent only when
+  it is sampled with `checkly=true`, and not without a parent, without `checkly`, unsampled or with a malformed
+  `traceparent`; a Checkly request's server span continues its trace, is named after the route and carries the
+  status and tenant, a 5xx is an error, and a request without Checkly's `tracestate` exports nothing;
+  no span holds the API key, a header, the query string or the body; statement spans carry the SQL without bound
+  values and appear only under a sampled span; against MySQL, the statement and staging spans nest under the request's
+  span; the exporter POSTs protobuf to `/v1/traces` with the configured `authorization`, and `api` exports a
+  Checkly request's span by the time it exits.
 - **End to end**, with the real API, MySQL, ffmpeg, both pools and an `httptest` receiver:
   an upload becomes `ready` with every rendition in spec, a ranged download returns 206,
   and exactly one signed `asset.ready` arrives; a text file named `.wav` fails with the tenant-safe message,
