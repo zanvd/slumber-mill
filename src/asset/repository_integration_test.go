@@ -1049,6 +1049,31 @@ func TestLeasedAsset(t *testing.T) {
 	}
 }
 
+func TestLeasedTrace(t *testing.T) {
+	const stored = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true"
+	s := newLeaseStack(t)
+	owner := s.tenant(t, "owner")
+	other := s.tenant(t, "other")
+	traced, tracedID := s.queue(t, owner)
+	untraced, _ := s.queue(t, owner)
+	s.exec(t, "UPDATE assets SET trace_context = ? WHERE id = ?", stored, tracedID)
+
+	for _, want := range []struct {
+		id     uuid.UUID
+		stored string
+	}{{traced, stored}, {untraced, ""}} {
+		l := s.claimNext(t)
+		gotID, got, err := s.repo.leasedTrace(t.Context(), l)
+		if err != nil || gotID != want.id || got != want.stored {
+			t.Errorf("leasedTrace() = %s, %q, %v; want %s, %q", gotID, got, err, want.id, want.stored)
+		}
+		wrongTenant := lease{ID: l.ID, TenantID: other, Attempt: l.Attempt}
+		if gotID, _, err := s.repo.leasedTrace(t.Context(), wrongTenant); err != ErrNotFound {
+			t.Errorf("leasedTrace() under another tenant = %s, %v; want %v", gotID, err, ErrNotFound)
+		}
+	}
+}
+
 func TestFinish(t *testing.T) {
 	s := newLeaseStack(t)
 	tenant := s.tenant(t, "owner")

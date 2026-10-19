@@ -224,6 +224,19 @@ func (r *Repository) leasedAsset(ctx context.Context, l lease) (id uuid.UUID, ta
 	return uuid.UUID(row.PublicID), row.TargetLUFS, nil
 }
 
+// leasedTrace returns the leased asset's public ID and the trace context its upload stored, empty if it has none.
+func (r *Repository) leasedTrace(ctx context.Context, l lease) (id uuid.UUID, traceContext string, err error) {
+	var row assetRow
+	err = r.db.WithContext(ctx).
+		Select("public_id", "trace_context").
+		Where("id = ? AND tenant_id = ?", l.ID, l.TenantID).
+		Take(&row).Error
+	if err != nil {
+		return uuid.UUID{}, "", translate("error reading the leased asset's trace context", err)
+	}
+	return uuid.UUID(row.PublicID), stringOrEmpty(row.TraceContext), nil
+}
+
 func renditionsOf(tenantID uint64) func(*gorm.DB) *gorm.DB {
 	return func(tx *gorm.DB) *gorm.DB {
 		return tx.Where("tenant_id = ?", tenantID).Order("profile")

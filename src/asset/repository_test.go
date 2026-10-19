@@ -259,6 +259,14 @@ func TestReadsFilterOnTenant(t *testing.T) {
 			},
 			want: [][]string{{"SELECT `public_id`,`target_lufs` FROM `assets` WHERE id = ? AND tenant_id = ?"}},
 		},
+		{
+			name: "leasedTrace",
+			read: func(ctx context.Context, r *Repository) error {
+				_, _, err := r.leasedTrace(ctx, lease{ID: 11, TenantID: tenant, Attempt: 1})
+				return err
+			},
+			want: [][]string{{"SELECT `public_id`,`trace_context` FROM `assets` WHERE id = ? AND tenant_id = ?"}},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -35,7 +35,7 @@ func checklyRequest(t *testing.T, tp trace.TracerProvider, tracestate string) (c
 }
 
 // TestCreateStoresTraceContext uploads under the server span of a request: only a request Checkly traced stores
-// its trace context with the asset, and the insert gets it even though it outlives the request.
+// its trace context with the asset.
 func TestCreateStoresTraceContext(t *testing.T) {
 	checkly := sdktrace.NewTracerProvider(sdktrace.WithSampler(tracing.Sampler()))
 	tests := []struct {

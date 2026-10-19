@@ -352,9 +352,10 @@ type fakeLeaseRepo struct {
 	errs  map[string]error
 	// due is the lease claim hands out; nil means nothing is due.
 	due *lease
-	// assetID and targetLUFS are what leasedAsset returns.
-	assetID    uuid.UUID
-	targetLUFS float64
+	// assetID and targetLUFS are what leasedAsset returns, and assetID and traceContext what leasedTrace returns.
+	assetID      uuid.UUID
+	targetLUFS   float64
+	traceContext string
 	// requeued and failed are what reap returns.
 	requeued, failed int
 
@@ -394,6 +395,14 @@ func (f *fakeLeaseRepo) extend(ctx context.Context, l lease, d time.Duration) er
 	f.leases = append(f.leases, l)
 	f.durations = append(f.durations, d)
 	return f.err(ctx, "extend")
+}
+
+func (f *fakeLeaseRepo) leasedTrace(ctx context.Context, l lease) (uuid.UUID, string, error) {
+	f.leases = append(f.leases, l)
+	if err := f.err(ctx, "leasedTrace"); err != nil {
+		return uuid.UUID{}, "", err
+	}
+	return f.assetID, f.traceContext, nil
 }
 
 func (f *fakeLeaseRepo) leasedAsset(ctx context.Context, l lease) (uuid.UUID, float64, error) {
