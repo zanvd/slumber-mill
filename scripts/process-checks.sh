@@ -37,8 +37,9 @@ results=()
 api_key=
 asset_a=
 
+# COMPOSE_PROFILES is emptied so that a checkout's .env opt-in to the Checkly agent doesn't start a second agent here.
 compose() {
-  docker compose --project-directory "$root" -p "$project" --progress quiet \
+  COMPOSE_PROFILES= docker compose --project-directory "$root" -p "$project" --progress quiet \
     -f "$root/compose.yaml" -f "$root/scripts/process-checks.compose.yaml" "$@"
 }
 

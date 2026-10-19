@@ -47,8 +47,9 @@ webhook_kills=0
 idle_kills=0
 uploads_end=0
 
+# COMPOSE_PROFILES is emptied so that a checkout's .env opt-in to the Checkly agent doesn't start a second agent here.
 compose() {
-  docker compose --project-directory "$root" -p "$project" --progress quiet \
+  COMPOSE_PROFILES= docker compose --project-directory "$root" -p "$project" --progress quiet \
     -f "$root/compose.yaml" -f "$root/scripts/soak.compose.yaml" "$@"
 }
 

@@ -303,8 +303,9 @@ of grace. Each run keeps its upload: about 2.2 MB of source and renditions in `v
 since assets are never deleted.
 
 The checks run from a Checkly private location named `slumber-mill-local`, served by an agent in the Compose stack,
-so they reach `api` on the Compose network and nothing is exposed to the internet. Both services are in the
-`checkly` profile, so `docker compose up` doesn't start them.
+so they reach `api` on the Compose network and nothing is exposed to the internet. The CLI service `checkly` is in
+the `checkly` profile and the agent `checkly-agent` in its own profile of that name, so a plain `docker compose up`
+starts neither; the agent is opt-in per checkout, as the setup below says.
 
 Setup, once:
 
@@ -318,9 +319,19 @@ Setup, once:
    CHECKLY_PL_API_KEY=pl_...
    ```
 
+3. In the one checkout that should serve the location, add `COMPOSE_PROFILES=checkly-agent` to that `.env` as well.
+   From then on `docker compose up -d`, and so `make up`, also starts the agent, and it runs again after
+   `make down` then `make up`. It has `restart: unless-stopped`, so a Docker restart brings it back too.
+
+Opt in from one checkout only: every agent connected to `slumber-mill-local` takes a share of its scheduled runs and
+sends them to its own stack's `api`, where they fail and alert. A second checkout or a worktree stays out by
+leaving that line, and `CHECKLY_PL_API_KEY`, out of its `.env`; without the line, `up` creates no agent.
+`make checkly-agent` still starts one on demand. `scripts/process-checks.sh` and `scripts/soak.sh` empty
+`COMPOSE_PROFILES` for their own projects, so they never start an agent, even in the opted-in checkout.
+
 ```sh
-make up                # the stack the agent will probe
-make checkly-agent     # start the private-location agent
+make up                # the stack the agent will probe, and the agent too if the checkout opted in
+make checkly-agent     # start the private-location agent without the opt-in
 make checkly-test      # run the checks there and record a test session
 make checkly-deploy    # create or update the live checks and the group in your Checkly account
 ```
@@ -329,7 +340,7 @@ make checkly-deploy    # create or update the live checks and the group in your 
 wait for pings, so it doesn't run `webhook-delivered`.
 `checkly-deploy` changes your live account: the checks start running on their schedule and alert the channel.
 The first run installs `node_modules` into the `checkly-node-modules` volume from the committed `package-lock.json`,
-which also pins the `checkly` package; `make down` stops the agent.
+which also pins the `checkly` package; `make down` stops the agent, opted in or not.
 
 The probe tenant's webhook URL is the heartbeat's ping URL, which exists only once the heartbeat is deployed, so
 the probe is set up after the first deploy. Until its key is stored, `ingest-round-trip` fails and alerts.
