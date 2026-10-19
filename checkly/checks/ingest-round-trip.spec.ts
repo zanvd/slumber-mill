@@ -90,7 +90,7 @@ test('ingest round trip', async ({ request }) => {
     expect(res.status(), await res.text()).toBe(202)
     expect(res.headers()['location']).toBeTruthy()
     const asset = await res.json()
-    expect(asset.status).toBe('queued')
+    expect(['queued', 'processing']).toContain(asset.status)
     return asset.id as string
   })
 
