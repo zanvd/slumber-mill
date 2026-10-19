@@ -287,6 +287,10 @@ the account's existing email channel, whose ID is in `checkly/checks/group.ts`) 
 | `ingest-round-trip` | Multistep, every 15 min | An upload as the probe tenant turns `ready`, a ranged rendition download returns 206, and an unknown asset 404 |
 | `webhook-delivered` | Heartbeat, 15 min period and 15 min grace | The webhook pool delivered the probe tenant's webhooks |
 
+Every check in the group alerts that channel, on the account's global alert settings (when to alert and how often to
+remind). The group sets `alertEscalationPolicy: 'global'` for that: a `CheckGroupV2` without a policy ignores its own
+alert channels and leaves each check on its own settings.
+
 `ingest-round-trip` builds 10 seconds of stereo pink noise from a fixed seed (48 kHz, 16-bit WAV), uploads it with a
 fresh `Idempotency-Key`, polls the asset every 2 seconds until it is `ready`, then fetches the first 1024 bytes of
 `aac_64k` and expects 206 with an `ETag`, and finally asks for a random UUIDv7 and expects 404. It fails at once if

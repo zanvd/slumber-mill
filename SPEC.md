@@ -972,7 +972,9 @@ since a hosted runner isn't guaranteed to be UID 1000, and caches image layers w
 ### Synthetic monitoring (Checkly)
 
 The checks are in the group `slumber-mill`, which runs them from the private location `slumber-mill-local`
-against `SLUMBER_MILL_BASE_URL` (`http://api:8080`) and alerts one email channel.
+against `SLUMBER_MILL_BASE_URL` (`http://api:8080`) and alerts one email channel for every check in it.
+The group sets `alertEscalationPolicy: 'global'`, so its checks use the account's global alert settings with the
+group's channel; a `CheckGroupV2` without a policy ignores its alert channels and leaves each check on its own.
 
 | Check | Type | Asserts |
 |---|---|---|
