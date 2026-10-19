@@ -162,6 +162,10 @@ Environment variables, with the defaults used when one is unset:
 | `SLUMBER_MILL_TRUSTED_PROXIES` | empty: trust none |
 | `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` | `false`; `true` in the local Compose stack |
 | `SLUMBER_MILL_SECRET_KEYS` | none; `<id>:<base64 key>[,...]`, required by `tenant create` and the webhook pool |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty: tracing off. The `api`'s OTLP/HTTP base URL; see [Traces](#traces) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | none; `key=value[,...]`, sent with every export |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf`, the only value accepted |
+| `OTEL_SERVICE_NAME` | `slumber-mill`; `slumber-mill-api` in the local Compose stack |
 
 - **Leases.** The encode lease is `SLUMBER_MILL_ENCODE_LEASE`, default 2 minutes, with a 1 minute minimum: a shorter
   value is a configuration error and the process exits 1. The `api` and both pools read it, because the startup
@@ -184,7 +188,8 @@ Environment variables, with the defaults used when one is unset:
 - `stop_grace_period` is 45 seconds in `compose.yaml`, and must stay above the grace: Docker's default of 10 seconds
   would kill every worker mid-encode.
 - The API fails `/readyz` on SIGTERM, keeps serving for `SLUMBER_MILL_DRAIN_DELAY`, then shuts down within the grace,
-  and exits 0 even when the grace runs out.
+  and exits 0 even when the grace runs out. With tracing on, it then spends at most 3 more seconds exporting the
+  last spans, so with the defaults it stops within 43 seconds.
 - A signal before the API listens ends it with exit 0 and the log line `stopped before serving HTTP`.
 - After a SIGKILL or a crash, the reaper requeues the asset once its lease has expired and counts the attempt.
   The dead attempt's temp files wait for the next startup sweep.
@@ -380,6 +385,58 @@ docker compose --profile checkly run --rm checkly npx checkly test --private-loc
 The heartbeat is pinged from the webhook pool's container, so the stack needs outbound HTTPS to
 `ping.checklyhq.com`. Its addresses are public, so the SSRF guard lets the delivery through whatever
 `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` says.
+
+#### Traces
+
+Checkly sends a W3C `traceparent` and `tracestate: checkly=true` with every request of a check. The `api` continues
+those traces with OpenTelemetry and exports them to [Checkly Traces](https://www.checklyhq.com/docs/resolve/traces/how-it-works/),
+so a check result links to a trace of what the request did inside the API:
+
+- a server span per request, named after its route (`POST /v1/assets`, `GET /readyz`), with the method, route,
+  status code and, once authenticated, the tenant's slug; a 5xx marks it as an error;
+- a span per SQL statement under it, such as `SELECT tenants` or `INSERT assets`, with the SQL and its `?`
+  placeholders but no values;
+- `asset.Stage` around streaming an upload to disk, with its size in bytes.
+
+**Only traces a Checkly check started leave the process.** A request is traced only when its `traceparent` is
+sampled and its `tracestate` has `checkly=true`; tenant traffic records no span, and nothing is exported for it.
+No header, query string or body goes into a span, so the API key never does. The request's log lines carry
+`trace_id` and `span_id`, to go from a trace to its logs. The encode and webhook pools aren't traced yet.
+
+Setup, once: in Checkly, turn on Import Traces on the Traces page, create an OTel API key there, and put it in the
+`.env` of the checkout that serves the checks:
+
+```
+CHECKLY_OTEL_API_KEY=...
+```
+
+`compose.yaml` then gives `api` the standard OpenTelemetry variables:
+`OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.eu-west-1.checklyhq.com` (the account's region),
+`OTEL_EXPORTER_OTLP_HEADERS=authorization=<the key>`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and
+`OTEL_SERVICE_NAME=slumber-mill-api`. `make down && make up` applies it, and the `api` logs
+`exporting traces started by Checkly` at startup.
+
+Those four are the only exporter settings `api` supports. It refuses to start, with tracing on or off, when
+`OTEL_GO_X_OBSERVABILITY` or any other `OTEL_EXPORTER_OTLP_` variable that the exporter reads by itself is
+set: the `TRACES_` per-signal forms, `TIMEOUT`, `COMPRESSION`, the certificates, the client key and `INSECURE`.
+The error names the variable, never its value. These variables are refused because:
+- the exporter would write any value it can't parse to stderr as plain text, outside the JSON log;
+- with tracing off, a setting such as `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` would silently do nothing.
+
+For the same reason, a header list with a stray comma or a name that isn't an HTTP token is a configuration error.
+
+The SDK's own variables are honoured: the `OTEL_BSP_*` batching settings, the `OTEL_*_LIMIT` span limits, and
+`OTEL_RESOURCE_ATTRIBUTES`, whose attributes go out with every exported span. `OTEL_TRACES_SAMPLER` and
+`OTEL_TRACES_SAMPLER_ARG` are read but always overridden by the Checkly-only sampler. A bad value in any of them
+never prints plain text: it is reported as a `tracing error` in the JSON log, or ignored in favour of the default.
+
+**Turning it off.** Without `CHECKLY_OTEL_API_KEY`, or with it empty, Compose sets the endpoint to an empty string,
+and an `api` without an endpoint exports nothing and dials nothing. A worktree or second checkout that points
+`COMPOSE_ENV_FILES` at the main `.env` sets `CHECKLY_OTEL_API_KEY=` in its shell, so only the main stack exports.
+Outside Compose, leave `OTEL_EXPORTER_OTLP_ENDPOINT` unset.
+
+After a check runs, find its trace in Checkly under Traces by the trace ID of the check's result: the API's spans
+(service `slumber-mill-api`) sit under the check's request.
 
 ### MySQL connection limit
 

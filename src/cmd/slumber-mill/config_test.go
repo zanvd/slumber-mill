@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zanvd/slumber-mill/src/secret"
+	"github.com/zanvd/slumber-mill/src/tracing"
 )
 
 func envFrom(m map[string]string) func(string) string {
@@ -61,6 +64,30 @@ func TestLoadAPIConfig(t *testing.T) {
 				DrainDelay:          0,
 				ShutdownGrace:       90 * time.Second,
 			},
+		},
+		{
+			name: "tracing on",
+			env: map[string]string{
+				tracing.EnvEndpoint: "https://otel.eu-west-1.checklyhq.com", tracing.EnvServiceName: "slumber-mill-api",
+			},
+			want: func() apiConfig {
+				c := defaults
+				c.Tracing = tracing.Config{
+					Endpoint: "https://otel.eu-west-1.checklyhq.com", Headers: map[string]secret.Value{},
+					ServiceName: "slumber-mill-api",
+				}
+				return c
+			}(),
+		},
+		{
+			name: "tracing off without an endpoint",
+			env:  map[string]string{tracing.EnvHeaders: "authorization=", tracing.EnvServiceName: "slumber-mill-api"},
+			want: defaults,
+		},
+		{
+			name:    "tracing with another protocol",
+			env:     map[string]string{tracing.EnvEndpoint: "https://otel.test", tracing.EnvProtocol: "grpc"},
+			wantErr: []string{`OTEL_EXPORTER_OTLP_PROTOCOL must be http/protobuf, got "grpc"`},
 		},
 		{
 			name:    "encode lease below the minimum",
