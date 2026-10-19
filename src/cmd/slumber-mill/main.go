@@ -226,19 +226,20 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 	return serve(ctx, log, srv, ln, handler, cfg.DrainDelay, cfg.ShutdownGrace)
 }
 
-// setupTracing builds the tracer provider. When it exports, the SDK's errors, such as a failed export,
-// go to log as warnings rather than as plain text through the log package.
+// setupTracing builds the tracer provider. When tracing is on, the SDK's errors, such as a failed export
+// or a bad OTEL_TRACES_SAMPLER read while the provider is built, go to log as warnings rather than as plain text
+// through the log package; the handler is set first for that.
 func setupTracing(ctx context.Context, log *slog.Logger, cfg tracing.Config) (*tracing.Provider, error) {
-	tp, err := tracing.Setup(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if !tp.Enabled() {
-		return tp, nil
+	if cfg.Endpoint == "" {
+		return tracing.Setup(ctx, cfg)
 	}
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		log.Warn("tracing error", "error", err)
 	}))
+	tp, err := tracing.Setup(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
 	log.InfoContext(ctx, "exporting traces started by Checkly", "endpoint", cfg.Endpoint, "service", cfg.ServiceName)
 	return tp, nil
 }
