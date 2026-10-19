@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -69,6 +70,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	return Config{Endpoint: endpoint, Headers: headers, ServiceName: name}, errors.Join(errs...)
 }
 
+// checkEndpoint refuses at least what the exporter's own parse of the variable would log: a value url.Parse rejects.
 func checkEndpoint(endpoint string) error {
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -82,15 +84,20 @@ func checkEndpoint(endpoint string) error {
 }
 
 // parseHeaders reads comma-separated key=value pairs whose values may be percent-encoded.
+//
+// otlptracehttp.New parses the same variable again with its own parser (internal/envconfig.stringToHeader),
+// which writes whatever it rejects to stderr as plain text, a header's value included. The two must agree:
+// this one rejects everything that one would, namely an empty member, a member without '=',
+// a name that isn't an HTTP token and a value that isn't validly percent-encoded.
 func parseHeaders(s string) (map[string]secret.Value, error) {
 	headers := map[string]secret.Value{}
+	// Like the exporter, which doesn't parse a blank variable.
+	if strings.TrimSpace(s) == "" {
+		return headers, nil
+	}
 	for i, member := range strings.Split(s, ",") {
-		member = strings.TrimSpace(member)
-		if member == "" {
-			continue
-		}
 		key, value, ok := strings.Cut(member, "=")
-		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		key = strings.TrimSpace(key)
 		if !ok || !validHeaderName(key) {
 			return nil, fmt.Errorf("pair %d must be a header name, '=' and a value", i+1)
 		}
@@ -98,6 +105,7 @@ func parseHeaders(s string) (map[string]secret.Value, error) {
 		if err != nil {
 			return nil, fmt.Errorf("the value of %s isn't validly percent-encoded", key)
 		}
+		decoded = strings.TrimSpace(decoded)
 		if decoded == "" {
 			return nil, fmt.Errorf("the value of %s is empty", key)
 		}
@@ -106,12 +114,13 @@ func parseHeaders(s string) (map[string]secret.Value, error) {
 	return headers, nil
 }
 
+// validHeaderName reports whether s is an HTTP token, as the exporter's parser requires.
 func validHeaderName(s string) bool {
 	if s == "" {
 		return false
 	}
 	for _, c := range s {
-		if c > 0x7e || c <= ' ' || strings.ContainsRune("\"(),/:;<=>?@[\\]{}", c) {
+		if c > unicode.MaxASCII || !(unicode.IsLetter(c) || unicode.IsDigit(c) || strings.ContainsRune("!#$%&'*+-.^_`|~", c)) {
 			return false
 		}
 	}

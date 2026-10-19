@@ -246,8 +246,39 @@ func TestLoadConfig(t *testing.T) {
 		{name: "defaults", env: map[string]string{EnvEndpoint: endpoint},
 			wantName: "slumber-mill", wantHeaders: map[string]string{}},
 		{name: "several percent-encoded headers", env: map[string]string{
-			EnvEndpoint: endpoint, EnvHeaders: " a = x%20y , b=z=1,",
-		}, wantName: "slumber-mill", wantHeaders: map[string]string{"a": "x y", "b": "z=1"}},
+			EnvEndpoint: endpoint, EnvHeaders: " a = x%20y , b=z=1, c=%20d%20",
+		}, wantName: "slumber-mill", wantHeaders: map[string]string{"a": "x y", "b": "z=1", "c": "d"}},
+		{name: "token characters in a name", env: map[string]string{
+			EnvEndpoint: endpoint, EnvHeaders: "X-Api_Key.1!#$%&'*+^`|~=v",
+		}, wantName: "slumber-mill", wantHeaders: map[string]string{"X-Api_Key.1!#$%&'*+^`|~": "v"}},
+		{name: "blank headers", env: map[string]string{EnvEndpoint: endpoint, EnvHeaders: "  "},
+			wantName: "slumber-mill", wantHeaders: map[string]string{}},
+		// The exporter parses the variable again and logs, as plain text, every member it rejects.
+		{name: "trailing comma", env: map[string]string{
+			EnvEndpoint: endpoint, EnvHeaders: "authorization=" + testKey + ",",
+		}, wantErr: []string{EnvHeaders, "pair 2"}},
+		{name: "leading comma", env: map[string]string{
+			EnvEndpoint: endpoint, EnvHeaders: ",authorization=" + testKey,
+		}, wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "empty member between pairs", env: map[string]string{
+			EnvEndpoint: endpoint, EnvHeaders: "a=1, ,authorization=" + testKey,
+		}, wantErr: []string{EnvHeaders, "pair 2"}},
+		{name: "only a comma", env: map[string]string{EnvEndpoint: endpoint, EnvHeaders: ","},
+			wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "name without a value's '='", env: map[string]string{
+			EnvEndpoint: endpoint, EnvHeaders: "authorization",
+		}, wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "empty name", env: map[string]string{EnvEndpoint: endpoint, EnvHeaders: " =" + testKey},
+			wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "separator in a name", env: map[string]string{EnvEndpoint: endpoint, EnvHeaders: "auth:x=" + testKey},
+			wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "space in a name", env: map[string]string{EnvEndpoint: endpoint, EnvHeaders: "auth x=" + testKey},
+			wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "non-ASCII name", env: map[string]string{EnvEndpoint: endpoint, EnvHeaders: "autorización=" + testKey},
+			wantErr: []string{EnvHeaders, "pair 1"}},
+		{name: "value only spaces once decoded", env: map[string]string{
+			EnvEndpoint: endpoint, EnvHeaders: "authorization=%20%20",
+		}, wantErr: []string{EnvHeaders, "authorization", "empty"}},
 		{name: "unsupported protocol", env: map[string]string{EnvEndpoint: endpoint, EnvProtocol: "grpc"},
 			wantErr: []string{EnvProtocol}},
 		{name: "endpoint without a scheme", env: map[string]string{EnvEndpoint: "otel.example.com"},
