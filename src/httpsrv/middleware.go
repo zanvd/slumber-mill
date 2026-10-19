@@ -129,7 +129,9 @@ func (s *Server) requestLogger(ctx context.Context, method, route, clientIP stri
 		slog.String("route", route),
 		slog.String("client_ip", clientIP),
 	}
-	if sc := trace.SpanContextFromContext(ctx); sc.IsSampled() {
+	// A span that doesn't record may still hold the caller's sampled IDs, as when tracing is off.
+	if span := trace.SpanFromContext(ctx); span.IsRecording() && span.SpanContext().IsSampled() {
+		sc := span.SpanContext()
 		attrs = append(attrs, slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String()))
 	}
 	return s.log.With(attrs...)

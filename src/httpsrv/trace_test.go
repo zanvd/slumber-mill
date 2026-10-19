@@ -208,6 +208,18 @@ func TestTraceIDsInLogs(t *testing.T) {
 	}
 }
 
+// With tracing off the request's context still holds Checkly's sampled IDs, which the logs mustn't pass off as a
+// trace the API exported.
+func TestNoTraceIDsInLogsWithoutTracer(t *testing.T) {
+	f := newFixture(t, Config{})
+	if w := f.serve(fromCheckly(authed("/v1/assets"))); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", w.Code, w.Body)
+	}
+	if line := f.logLine(t, "request"); line["trace_id"] != nil || line["span_id"] != nil {
+		t.Errorf("request line = %v, want no trace or span ID", line)
+	}
+}
+
 // TestTraceKeepsSecretsOut sends secrets in every part of a request a client controls, and checks that no span
 // carries any of them.
 func TestTraceKeepsSecretsOut(t *testing.T) {

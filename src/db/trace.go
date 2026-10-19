@@ -17,7 +17,7 @@ const (
 	spanKey    = "slumber_mill:span"
 )
 
-// traceStatements makes a client span for every statement whose context carries a sampled span,
+// traceStatements makes a client span for every statement whose context carries a sampled, recording span,
 // from that span's provider. The SQL keeps its placeholders, since interpolateParams is refused,
 // so no bound value reaches a span, and neither does an error's text, which can quote one.
 func traceStatements(g *gorm.DB) error {
@@ -46,7 +46,7 @@ func traceStatements(g *gorm.DB) error {
 func startSpan(g *gorm.DB) {
 	ctx := g.Statement.Context
 	parent := trace.SpanFromContext(ctx)
-	if !parent.SpanContext().IsSampled() {
+	if !parent.IsRecording() || !parent.SpanContext().IsSampled() {
 		return
 	}
 	_, span := parent.TracerProvider().Tracer(tracerName).Start(ctx, "db",
