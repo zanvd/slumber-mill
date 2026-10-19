@@ -54,6 +54,7 @@ type assetRow struct {
 	InputMaxMomentary *float64 `gorm:"column:input_max_momentary"`
 	Warnings          warningSet
 	Error             *string
+	TraceContext      *string        `gorm:"column:trace_context"`
 	CreatedAt         time.Time      `gorm:"->"`
 	UpdatedAt         time.Time      `gorm:"->"`
 	Renditions        []renditionRow `gorm:"foreignKey:AssetID"`
@@ -81,12 +82,13 @@ type renditionRow struct {
 func (renditionRow) TableName() string { return "renditions" }
 
 type eventRow struct {
-	ID        uint64 `gorm:"primaryKey"`
-	EventID   db.ID  `gorm:"column:event_id"`
-	TenantID  uint64 `gorm:"column:tenant_id"`
-	AssetID   uint64 `gorm:"column:asset_id"`
-	Type      EventType
-	CreatedAt time.Time `gorm:"->"`
+	ID           uint64 `gorm:"primaryKey"`
+	EventID      db.ID  `gorm:"column:event_id"`
+	TenantID     uint64 `gorm:"column:tenant_id"`
+	AssetID      uint64 `gorm:"column:asset_id"`
+	Type         EventType
+	TraceContext *string   `gorm:"column:trace_context"`
+	CreatedAt    time.Time `gorm:"->"`
 }
 
 func (eventRow) TableName() string { return "asset_events" }
@@ -122,12 +124,14 @@ func (w *warningSet) Scan(src any) error {
 	return nil
 }
 
-// insertAsset writes the columns an upload sets; MySQL fills in the rest, timestamps included.
-func (r *Repository) insertAsset(ctx context.Context, a Asset) error {
+// insertAsset writes the columns an upload sets, and its trace context, NULL when it's empty;
+// MySQL fills in the rest, timestamps included.
+func (r *Repository) insertAsset(ctx context.Context, a Asset, traceContext string) error {
 	row := toRepo(a)
+	row.TraceContext = nullString(traceContext)
 	err := r.db.WithContext(ctx).
 		Select("public_id", "tenant_id", "idempotency_key", "title", "status",
-			"source_sha256", "source_bytes", "target_lufs").
+			"source_sha256", "source_bytes", "target_lufs", "trace_context").
 		Create(&row).Error
 	switch {
 	case err == nil:
@@ -263,11 +267,12 @@ func (r *Repository) unrelayedEvents(ctx context.Context, limit int) ([]Event, e
 				e.EventID, e.AssetID, e.TenantID)
 		}
 		events[i] = Event{
-			ID:        uuid.UUID(e.EventID),
-			TenantID:  e.TenantID,
-			Type:      e.Type,
-			CreatedAt: e.CreatedAt,
-			Asset:     newAssetFromRepo(a),
+			ID:           uuid.UUID(e.EventID),
+			TenantID:     e.TenantID,
+			Type:         e.Type,
+			CreatedAt:    e.CreatedAt,
+			Asset:        newAssetFromRepo(a),
+			TraceContext: stringOrEmpty(e.TraceContext),
 		}
 	}
 	return events, nil
@@ -468,12 +473,20 @@ func updateAssets(tx *gorm.DB, leases []lease, set map[string]any) error {
 	return nil
 }
 
+// insertEvents records an event of type t for each leased asset, with a copy of the asset's trace context.
 func insertEvents(tx *gorm.DB, t EventType, leases []lease) error {
-	rows := make([]eventRow, len(leases))
+	rows := make([]map[string]any, len(leases))
 	for i, l := range leases {
-		rows[i] = eventRow{EventID: db.NewID(), TenantID: l.TenantID, AssetID: l.ID, Type: t}
+		rows[i] = map[string]any{
+			"event_id":  db.NewID(),
+			"tenant_id": l.TenantID,
+			"asset_id":  l.ID,
+			"type":      t,
+			"trace_context": gorm.Expr("(SELECT trace_context FROM assets WHERE id = ? AND tenant_id = ?)",
+				l.ID, l.TenantID),
+		}
 	}
-	return tx.Select("event_id", "tenant_id", "asset_id", "type").Create(&rows).Error
+	return tx.Table("asset_events").Create(&rows).Error
 }
 
 // translateLease turns db's lost lease into errLeaseLost, without wrapping it, and wraps any other error.

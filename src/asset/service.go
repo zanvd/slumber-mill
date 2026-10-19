@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zanvd/slumber-mill/src/logging"
+	"github.com/zanvd/slumber-mill/src/tracing"
 	"github.com/zanvd/slumber-mill/src/validation"
 )
 
@@ -46,7 +47,7 @@ const (
 )
 
 type repo interface {
-	insertAsset(ctx context.Context, a Asset) error
+	insertAsset(ctx context.Context, a Asset, traceContext string) error
 	assetByID(ctx context.Context, tenantID uint64, id uuid.UUID) (Asset, error)
 	assetByIdempotencyKey(ctx context.Context, tenantID uint64, key string) (Asset, error)
 	listAssets(ctx context.Context, tenantID, before uint64, limit int) ([]Asset, uint64, error)
@@ -133,6 +134,7 @@ type CreateParams struct {
 // Create registers a staged upload as a queued asset, or replays the asset an earlier upload
 // with the same idempotency key created; replayed reports which.
 // Create owns p.Upload: the file is removed unless it becomes the new asset's source.
+// The trace context of an upload a Checkly check traced is stored with the asset, for the worker pools to continue.
 func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed bool, err error) {
 	staged := p.Upload.path
 	defer func() { s.remove(ctx, staged) }()
@@ -168,7 +170,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (a Asset, replayed
 		SourceSHA256:   p.Upload.sha256,
 		SourceBytes:    p.Upload.size,
 		TargetLUFS:     p.TargetLUFS,
-	})
+	}, tracing.StoredContext(ctx))
 	cancel()
 	if errors.Is(err, errOutcomeUnknown) {
 		logging.LoggerFromContext(ctx).LogAttrs(ctx, slog.LevelWarn,

@@ -44,7 +44,9 @@ type fakeRepo struct {
 	// errAfterInsert is returned by an insert that stored its row, as when the commit's reply is lost.
 	errAfterInsert error
 	insertCtx      context.Context
-	listArgs       []listArgs
+	// traceContexts holds the trace context every insertAsset got.
+	traceContexts []string
+	listArgs      []listArgs
 	// events is the outbox, oldest first; relayed holds the IDs markRelayed has marked.
 	events      []Event
 	relayed     map[uuid.UUID]bool
@@ -124,9 +126,10 @@ type listArgs struct {
 	limit            int
 }
 
-func (f *fakeRepo) insertAsset(ctx context.Context, a Asset) error {
+func (f *fakeRepo) insertAsset(ctx context.Context, a Asset, traceContext string) error {
 	f.calls.add("insertAsset")
 	f.insertCtx = ctx
+	f.traceContexts = append(f.traceContexts, traceContext)
 	if f.beforeInsert != nil {
 		f.beforeInsert(f)
 	}

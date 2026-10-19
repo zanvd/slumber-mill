@@ -163,29 +163,42 @@ func dryRun(t *testing.T) (*Repository, *recorder) {
 // TestInsertAssetSQL inserts an asset whose fields are zero wherever the type allows,
 // so a dropped zero value would show as a missing column.
 func TestInsertAssetSQL(t *testing.T) {
-	r, rec := dryRun(t)
-	if err := r.insertAsset(t.Context(), Asset{Status: StatusQueued}); err != nil {
-		t.Fatalf("insertAsset() error = %v", err)
+	const traced = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true"
+	tests := []struct {
+		name         string
+		traceContext string
+		want         *string
+	}{
+		{"untraced", "", nil},
+		{"traced", traced, new(traced)},
 	}
-	if len(rec.statements) != 1 {
-		t.Fatalf("got %d statements, want 1: %v", len(rec.statements), rec.statements)
-	}
-	got := rec.statements[0]
-	const want = "INSERT INTO `assets` (`public_id`,`tenant_id`,`idempotency_key`,`title`,`status`," +
-		"`source_sha256`,`source_bytes`,`target_lufs`) VALUES (?,?,?,?,?,?,?,?)"
-	if got.sql != want {
-		t.Errorf("SQL = %s\nwant  %s", got.sql, want)
-	}
-	if len(got.vars) != 8 {
-		t.Fatalf("got %d values, want 8: %v", len(got.vars), got.vars)
-	}
-	if key, ok := got.vars[2].(*string); !ok || key != nil {
-		t.Errorf("idempotency_key = %#v, want NULL", got.vars[2])
-	}
-	for i, want := range map[int]any{3: "", 4: StatusQueued, 6: uint64(0), 7: float64(0)} {
-		if got.vars[i] != want {
-			t.Errorf("value %d = %#v, want %#v", i, got.vars[i], want)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, rec := dryRun(t)
+			if err := r.insertAsset(t.Context(), Asset{Status: StatusQueued}, tc.traceContext); err != nil {
+				t.Fatalf("insertAsset() error = %v", err)
+			}
+			if len(rec.statements) != 1 {
+				t.Fatalf("got %d statements, want 1: %v", len(rec.statements), rec.statements)
+			}
+			got := rec.statements[0]
+			const want = "INSERT INTO `assets` (`public_id`,`tenant_id`,`idempotency_key`,`title`,`status`," +
+				"`source_sha256`,`source_bytes`,`target_lufs`,`trace_context`) VALUES (?,?,?,?,?,?,?,?,?)"
+			if got.sql != want {
+				t.Errorf("SQL = %s\nwant  %s", got.sql, want)
+			}
+			if len(got.vars) != 9 {
+				t.Fatalf("got %d values, want 9: %v", len(got.vars), got.vars)
+			}
+			if key, ok := got.vars[2].(*string); !ok || key != nil {
+				t.Errorf("idempotency_key = %#v, want NULL", got.vars[2])
+			}
+			for i, want := range map[int]any{3: "", 4: StatusQueued, 6: uint64(0), 7: float64(0), 8: tc.want} {
+				if !reflect.DeepEqual(got.vars[i], want) {
+					t.Errorf("value %d = %#v, want %#v", i, got.vars[i], want)
+				}
+			}
+		})
 	}
 }
 
@@ -274,7 +287,8 @@ func TestReadsFilterOnTenant(t *testing.T) {
 func TestUnrelayedEventsSQL(t *testing.T) {
 	r, rec := dryRun(t)
 	rec.eventRows = []eventRow{
-		{ID: 1, EventID: db.NewID(), TenantID: 42, AssetID: 11, Type: EventReady},
+		{ID: 1, EventID: db.NewID(), TenantID: 42, AssetID: 11, Type: EventReady,
+			TraceContext: new("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true")},
 		{ID: 2, EventID: db.NewID(), TenantID: 43, AssetID: 12, Type: EventFailed},
 	}
 
@@ -289,7 +303,7 @@ func TestUnrelayedEventsSQL(t *testing.T) {
 	for i, e := range events {
 		row := rec.eventRows[i]
 		if e.ID != uuid.UUID(row.EventID) || e.TenantID != row.TenantID || e.Type != row.Type ||
-			e.Asset.TenantID != row.TenantID {
+			e.Asset.TenantID != row.TenantID || e.TraceContext != stringOrEmpty(row.TraceContext) {
 			t.Errorf("event %d = %+v, want it built from %+v", i, e, row)
 		}
 	}
@@ -361,9 +375,10 @@ func TestLeaseWritesSQL(t *testing.T) {
 	failing := sorted("status", "locked_by", "lease_expires_at", "last_error")
 	event := func(id, tenantID uint64, typ EventType) wantStatement {
 		return wantStatement{
-			contains: []string{"INSERT INTO `asset_events`"},
-			columns:  sorted("event_id", "tenant_id", "asset_id", "type"),
-			vars:     map[int]any{0: isUUIDv7, 1: tenantID, 2: id, 3: typ},
+			contains: []string{"INSERT INTO `asset_events`",
+				"(SELECT trace_context FROM assets WHERE id = ? AND tenant_id = ?)"},
+			columns: sorted("event_id", "tenant_id", "asset_id", "type", "trace_context"),
+			vars:    map[int]any{0: id, 1: isUUIDv7, 2: tenantID, 3: id, 4: tenantID, 5: typ},
 		}
 	}
 	failed := func(message string, id, tenantID uint64) []wantStatement {
