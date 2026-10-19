@@ -31,6 +31,9 @@ const (
 
 	attrAssetID = "slumber_mill.asset.id"
 	attrAttempt = "slumber_mill.attempt"
+	// traceReadTimeout bounds the read of a claimed asset's trace context, which runs on the work's context
+	// before the heartbeat and the shutdown grace start, so a stalled MySQL can't hold the pool's stop.
+	traceReadTimeout = 5 * time.Second
 )
 
 type leaseRepo interface {
@@ -99,12 +102,15 @@ func NewProcessor(r leaseRepo, files renditionStore, tc transcoder, cfg Processo
 }
 
 // Trace continues the trace of the asset's upload, if a Checkly check sent it, in an asset.encode span for this
-// attempt, which the pool ends with the attempt's outcome. Failing to read the trace context only loses the span.
+// attempt, which the pool ends with the attempt's outcome. Failing to read the trace context within
+// traceReadTimeout only loses the span.
 func (p *Processor) Trace(ctx context.Context, l worker.Lease) (context.Context, trace.Span) {
 	if p.tracer == nil {
 		return ctx, nil
 	}
-	assetID, stored, err := p.repo.leasedTrace(ctx, lease(l))
+	readCtx, cancel := context.WithTimeout(ctx, traceReadTimeout)
+	assetID, stored, err := p.repo.leasedTrace(readCtx, lease(l))
+	cancel()
 	if err != nil {
 		logging.LoggerFromContext(ctx).LogAttrs(ctx, slog.LevelWarn, "error reading the asset's trace context",
 			slog.String("error", err.Error()))

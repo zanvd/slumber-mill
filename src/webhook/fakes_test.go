@@ -185,6 +185,8 @@ type fakeDeliveryRepo struct {
 	due *lease
 	// pending is what leasedDelivery returns, and its trace context what leasedTraceContext returns.
 	pending delivery
+	// stallTraceRead makes leasedTraceContext answer only when its context ends, as on a stalled connection.
+	stallTraceRead bool
 	// requeued and failed are what reap returns.
 	requeued, failed int
 
@@ -268,8 +270,15 @@ func (f *fakeDeliveryRepo) extend(ctx context.Context, l lease, d time.Duration)
 
 func (f *fakeDeliveryRepo) leasedTraceContext(ctx context.Context, l lease) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.leases = append(f.leases, l)
+	stall := f.stallTraceRead
+	f.mu.Unlock()
+	if stall {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if err := f.err(ctx, "leasedTraceContext"); err != nil {
 		return "", err
 	}

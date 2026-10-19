@@ -27,6 +27,9 @@ const (
 	attrAttempt       = "slumber_mill.attempt"
 	attrServerAddress = "server.address"
 	attrStatusCode    = "http.response.status_code"
+	// traceReadTimeout bounds the read of a claimed delivery's trace context, which runs on the work's context
+	// before the heartbeat and the shutdown grace start, so a stalled MySQL can't hold the pool's stop.
+	traceReadTimeout = 5 * time.Second
 
 	relayInterval = time.Second
 	// releaseTimeout bounds giving up the relay lock once Run's context is done.
@@ -341,13 +344,15 @@ func NewDeliverer(r deliveryRepo, tenants webhookTargets, client poster, cfg Del
 }
 
 // Trace continues the trace of the delivery's event, if a Checkly check uploaded its asset, in a webhook.deliver
-// span for this attempt, which the pool ends with the attempt's outcome. Failing to read the trace context only
-// loses the span.
+// span for this attempt, which the pool ends with the attempt's outcome. Failing to read the trace context within
+// traceReadTimeout only loses the span.
 func (d *Deliverer) Trace(ctx context.Context, l worker.Lease) (context.Context, trace.Span) {
 	if d.tracer == nil {
 		return ctx, nil
 	}
-	stored, err := d.repo.leasedTraceContext(ctx, lease(l))
+	readCtx, cancel := context.WithTimeout(ctx, traceReadTimeout)
+	stored, err := d.repo.leasedTraceContext(readCtx, lease(l))
+	cancel()
 	if err != nil {
 		logging.LoggerFromContext(ctx).WarnContext(ctx, "error reading the delivery's trace context", "error", err)
 		return ctx, nil
