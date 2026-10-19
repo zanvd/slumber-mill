@@ -225,6 +225,79 @@ func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
+// TestLoadConfigRefusesUnsupported lists the variables otlptracehttp v1.47.0 reads itself, beyond the supported
+// ones, so a change to unsupportedEnv shows up here.
+func TestLoadConfigRefusesUnsupported(t *testing.T) {
+	const keyLike = "sm_test_only_key%zz"
+	names := []string{
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_TIMEOUT", "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+		"OTEL_EXPORTER_OTLP_COMPRESSION", "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+		"OTEL_EXPORTER_OTLP_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+		"OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+		"OTEL_EXPORTER_OTLP_INSECURE", "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+		"OTEL_GO_X_OBSERVABILITY",
+	}
+	if got := unsupportedEnv(); len(got) != len(names) {
+		t.Errorf("unsupportedEnv() has %d variables, want %d", len(got), len(names))
+	}
+	tracingOn := map[string]string{EnvEndpoint: "https://otel.eu-west-1.checklyhq.com",
+		EnvHeaders: "authorization=" + testKey}
+	for _, name := range names {
+		for mode, base := range map[string]map[string]string{"tracing on": tracingOn, "tracing off": {}} {
+			t.Run(name+", "+mode, func(t *testing.T) {
+				for _, tt := range []struct {
+					value   string
+					wantErr bool
+				}{
+					{value: keyLike, wantErr: true},
+					{value: "true", wantErr: true},
+					{value: " \t", wantErr: false},
+					{value: "", wantErr: false},
+				} {
+					e := map[string]string{name: tt.value}
+					for k, v := range base {
+						e[k] = v
+					}
+					_, err := LoadConfig(env(e))
+					if (err != nil) != tt.wantErr {
+						t.Errorf("value %q: LoadConfig() error = %v, want error %v", tt.value, err, tt.wantErr)
+						continue
+					}
+					if err == nil {
+						continue
+					}
+					if !strings.Contains(err.Error(), name) {
+						t.Errorf("error %q doesn't name %s", err, name)
+					}
+					for _, secret := range []string{keyLike, "zz", testKey} {
+						if strings.Contains(err.Error(), secret) {
+							t.Errorf("error %q quotes %q", err, secret)
+						}
+					}
+				}
+			})
+		}
+	}
+
+	t.Run("every one is reported", func(t *testing.T) {
+		e := map[string]string{}
+		for _, name := range names {
+			e[name] = keyLike
+		}
+		_, err := LoadConfig(env(e))
+		if err == nil {
+			t.Fatal("LoadConfig() error = nil")
+		}
+		for _, name := range names {
+			if !strings.Contains(err.Error(), name+" ") {
+				t.Errorf("error lacks %s", name)
+			}
+		}
+	})
+}
+
 func TestLoadConfig(t *testing.T) {
 	const endpoint = "https://otel.eu-west-1.checklyhq.com"
 	tests := []struct {

@@ -416,6 +416,15 @@ CHECKLY_OTEL_API_KEY=...
 `OTEL_SERVICE_NAME=slumber-mill-api`. `make down && make up` applies it, and the `api` logs
 `exporting traces started by Checkly` at startup.
 
+Those four are the only OpenTelemetry settings `api` supports. It refuses to start, with tracing on or off, when
+`OTEL_GO_X_OBSERVABILITY` or any other `OTEL_EXPORTER_OTLP_` variable that the exporter reads by itself is
+set: the `TRACES_` per-signal forms, `TIMEOUT`, `COMPRESSION`, the certificates, the client key and `INSECURE`.
+The error names the variable, never its value. These variables are refused because:
+- the exporter would write any value it can't parse to stderr as plain text, outside the JSON log;
+- with tracing off, a setting such as `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` would silently do nothing.
+
+For the same reason, a header list with a stray comma or a name that isn't an HTTP token is a configuration error.
+
 **Turning it off.** Without `CHECKLY_OTEL_API_KEY`, or with it empty, Compose sets the endpoint to an empty string,
 and an `api` without an endpoint exports nothing and dials nothing. A worktree or second checkout that points
 `COMPOSE_ENV_FILES` at the main `.env` sets `CHECKLY_OTEL_API_KEY=` in its shell, so only the main stack exports.

@@ -43,14 +43,45 @@ type Config struct {
 	ServiceName string
 }
 
+// unsupportedEnv lists the variables otlptracehttp v1.47.0 reads by itself, in internal/otlpconfig/envconfig.go
+// and internal/x, other than the ones LoadConfig supports. Check it again whenever the OpenTelemetry version changes.
+func unsupportedEnv() []string {
+	return []string{
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+		"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_TIMEOUT",
+		"OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+		"OTEL_EXPORTER_OTLP_COMPRESSION",
+		"OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+		"OTEL_EXPORTER_OTLP_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_CLIENT_KEY",
+		"OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+		"OTEL_EXPORTER_OTLP_INSECURE",
+		"OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+		"OTEL_GO_X_OBSERVABILITY",
+	}
+}
+
 // LoadConfig reads the standard OpenTelemetry variables. Only the http/protobuf protocol is supported.
-// Without an endpoint the other variables are ignored, so tracing is off. Errors never quote a header's value.
+// Without an endpoint the other supported variables are ignored, so tracing is off.
+// Any other variable the exporter would read is refused, with tracing on or off: the exporter logs the values it
+// can't parse as plain text, and with tracing off a setting such as a per-signal endpoint would silently do nothing.
+// Errors never quote a header's value or a refused variable's.
 func LoadConfig(getenv func(string) string) (Config, error) {
+	var errs []error
+	for _, name := range unsupportedEnv() {
+		if strings.TrimSpace(getenv(name)) != "" {
+			errs = append(errs, fmt.Errorf("%s isn't supported, so it must be unset", name))
+		}
+	}
 	endpoint := strings.TrimSpace(getenv(EnvEndpoint))
 	if endpoint == "" {
-		return Config{}, nil
+		return Config{}, errors.Join(errs...)
 	}
-	var errs []error
 	if err := checkEndpoint(endpoint); err != nil {
 		// Not quoted, since a malformed value may hold credentials.
 		errs = append(errs, fmt.Errorf("%s must be an http or https URL without credentials, a query or a fragment",

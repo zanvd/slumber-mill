@@ -977,10 +977,29 @@ the one exception is `process-checks`, which runs `bash scripts/process-checks.s
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf`, the only value accepted |
 | `OTEL_SERVICE_NAME` | `slumber-mill` (`slumber-mill-api` in the local Compose stack) |
 
-Without an endpoint the other `OTEL_` variables are ignored and the provider is a no-op that exports and dials
-nothing. With one, an endpoint that isn't an `http` or `https` URL (or has credentials, a query or a fragment),
-another protocol, or a header without a name or a value is a configuration error, and the process exits 1;
-the error never quotes a header's value or the endpoint.
+Without an endpoint the other three are ignored and the provider is a no-op that exports and dials
+nothing. With one, the following are configuration errors, and the process exits 1:
+- an endpoint that isn't an `http` or `https` URL, or that has credentials, a query or a fragment;
+- another protocol;
+- a header list with an empty member (a stray comma), a member without `=`, a name that isn't an HTTP token,
+  or a value that is empty or isn't validly percent-encoded.
+
+The error never quotes a header's value or the endpoint.
+The exporter parses the endpoint and the headers again by itself, and writes whatever it rejects to stderr
+as plain text, outside the JSON log and a header's value included. So `api` refuses at least what the exporter
+would reject.
+
+The exporter also reads other variables by itself, and `api` doesn't support them. If any of these is set to a
+non-blank value, `api` refuses to start, with tracing on or off; the error names the variable and never quotes
+its value. The variables are the `OTEL_EXPORTER_OTLP_` ones `TRACES_ENDPOINT`, `TRACES_HEADERS`,
+`TRACES_PROTOCOL`, `TIMEOUT`, `TRACES_TIMEOUT`, `COMPRESSION`, `TRACES_COMPRESSION`, `CERTIFICATE`,
+`TRACES_CERTIFICATE`, `CLIENT_CERTIFICATE`, `CLIENT_KEY`, `TRACES_CLIENT_CERTIFICATE`, `TRACES_CLIENT_KEY`,
+`INSECURE` and `TRACES_INSECURE`, plus `OTEL_GO_X_OBSERVABILITY`. They are refused for these reasons:
+- the exporter would log the values it can't parse as plain text, some of them file paths;
+- they would change behaviour this spec doesn't cover;
+- with tracing off, a setting such as a per-signal endpoint would silently do nothing.
+
+The list is the one `otlptracehttp` v1.47.0 reads, and is checked again whenever the OpenTelemetry version changes.
 
 The temp refresh (every lease/3) and the startup temp sweep's age follow the encode lease,
 so `api` and both pools read `SLUMBER_MILL_ENCODE_LEASE`.
@@ -1128,7 +1147,8 @@ What the tests must show:
   no span holds the API key, a header, the query string or the body; statement spans carry the SQL without bound
   values and appear only under a sampled span; against MySQL, the statement and staging spans nest under the request's
   span; the exporter POSTs protobuf to `/v1/traces` with the configured `authorization`, and `api` exports a
-  Checkly request's span by the time it exits.
+  Checkly request's span by the time it exits; every exporter variable the API doesn't support is refused when set,
+  with tracing on or off, without quoting its value, and a blank one is accepted.
 - **End to end**, with the real API, MySQL, ffmpeg, both pools and an `httptest` receiver:
   an upload becomes `ready` with every rendition in spec, a ranged download returns 206,
   and exactly one signed `asset.ready` arrives; a text file named `.wav` fails with the tenant-safe message,
