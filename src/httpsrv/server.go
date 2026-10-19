@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/zanvd/slumber-mill/src/asset"
 	"github.com/zanvd/slumber-mill/src/tenant"
@@ -45,6 +47,8 @@ type Config struct {
 	MaxUploadBytes int64
 	// MaxUploadsPerTenant caps each tenant's concurrent uploads. Zero means DefaultMaxUploadsPerTenant.
 	MaxUploadsPerTenant int
+	// Tracer starts each request's server span. Nil traces nothing.
+	Tracer trace.TracerProvider
 }
 
 type Server struct {
@@ -55,6 +59,7 @@ type Server struct {
 	maxUploadBytes int64
 	uploads        *uploadSlots
 	engine         *gin.Engine
+	tracer         trace.Tracer
 	draining       atomic.Bool
 }
 
@@ -70,6 +75,10 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 	if cfg.MaxUploadBytes < 0 || cfg.MaxUploadsPerTenant < 0 {
 		return nil, errors.New("error creating HTTP server: upload limits must not be negative")
 	}
+	tp := cfg.Tracer
+	if tp == nil {
+		tp = noop.NewTracerProvider()
+	}
 	s := &Server{
 		log:            log,
 		tenants:        tenants,
@@ -78,6 +87,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 		maxUploadBytes: cmp.Or(cfg.MaxUploadBytes, DefaultMaxUploadBytes),
 		uploads:        newUploadSlots(cmp.Or(cfg.MaxUploadsPerTenant, DefaultMaxUploadsPerTenant)),
 		engine:         gin.New(),
+		tracer:         tp.Tracer(tracerName),
 	}
 	// Gin trusts every proxy until this is called; nil trusts none.
 	if err := s.engine.SetTrustedProxies(cfg.TrustedProxies); err != nil {
@@ -98,7 +108,7 @@ func NewServer(log *slog.Logger, tenants tenantService, assets assetService, cfg
 }
 
 func (s *Server) Handler() http.Handler {
-	return releaseUnreadBody(s.logRequests(s.engine))
+	return releaseUnreadBody(s.traceRequests(s.logRequests(s.engine)))
 }
 
 // BeginShutdown makes /readyz fail while every other route keeps serving, so a load balancer

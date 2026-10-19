@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/tenant"
@@ -86,7 +88,7 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 			v := recover()
 			log := rl.log
 			if log == nil {
-				log = s.requestLogger(r.Method, "", s.clientIP(r))
+				log = s.requestLogger(r.Context(), r.Method, "", s.clientIP(r))
 			}
 			// net/http's sentinel for aborting a response must reach the server to cut the connection.
 			aborted := v == http.ErrAbortHandler
@@ -112,17 +114,25 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 	})
 }
 
-// describeRequest gives the request a logger with its method, route and client, for its handlers and its request line.
+// describeRequest names the request's span after its route, and gives the request a logger with its method, route
+// and client, for its handlers and its request line.
 func (s *Server) describeRequest(c *gin.Context) {
-	s.setLogger(c, s.requestLogger(c.Request.Method, c.FullPath(), c.ClientIP()))
+	ctx := c.Request.Context()
+	nameSpan(trace.SpanFromContext(ctx), c.Request.Method, c.FullPath())
+	s.setLogger(c, s.requestLogger(ctx, c.Request.Method, c.FullPath(), c.ClientIP()))
 }
 
-func (s *Server) requestLogger(method, route, clientIP string) *slog.Logger {
-	return s.log.With(
+// requestLogger adds the trace and span IDs when the request's trace is exported, so its lines can be found from it.
+func (s *Server) requestLogger(ctx context.Context, method, route, clientIP string) *slog.Logger {
+	attrs := []any{
 		slog.String("method", method),
 		slog.String("route", route),
 		slog.String("client_ip", clientIP),
-	)
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsSampled() {
+		attrs = append(attrs, slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String()))
+	}
+	return s.log.With(attrs...)
 }
 
 // clientIP resolves the client's address through the engine's trusted proxies for a request
@@ -202,6 +212,7 @@ func (s *Server) authenticate(c *gin.Context) {
 		s.writeError(c, err)
 		return
 	}
+	trace.SpanFromContext(c.Request.Context()).SetAttributes(attribute.String(attrTenant, t.Slug))
 	s.setLogger(c, s.logger(c).With(slog.String("tenant", t.Slug)))
 	c.Set(tenantKey, t)
 	c.Next()
