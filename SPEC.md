@@ -31,8 +31,9 @@ process lifecycle and shutdown, and loudness that is verified rather than assume
   outside the build order (§15):
   - Synthetic monitoring: a Checkly CLI project in `checkly/`, in Node and TypeScript, with its own Compose services,
     `checkly` and `checkly-agent`, in opt-in profiles (§12).
-  - Tracing of Checkly's checks: `api` exports the spans of traces a Checkly check started to Checkly Traces over
-    OTLP/HTTP, with the OpenTelemetry modules in §3. Tenant traffic is never exported (§12).
+  - Tracing of Checkly's checks: `api` and both worker pools export the spans of traces a Checkly check started to
+    Checkly Traces over OTLP/HTTP, with the OpenTelemetry modules in §3; an upload's trace follows its work through
+    the queue in `trace_context` columns (§5). Tenant traffic is never exported (§12).
 - No per-tenant fairness scheduling. Called out as a known limitation.
 
 ## 3. Stack
@@ -146,7 +147,7 @@ Each domain package owns its tables, and every transaction stays inside one repo
 src/                         the Go module: go.mod, go.sum and all Go code
   cmd/slumber-mill/main.go   composition root: env config, wiring, subcommands, signal handling
   db/                        Open (GORM config), lease SQL, Migrate (embedded SQL), ID, Clip, GORM logger
-  db/migrations/             0001_init.sql, 0002_tenant_target_default.sql
+  db/migrations/             0001_init.sql, 0002_tenant_target_default.sql, 0003_trace_context.sql (feat/checkly)
   worker/                    pool runtime: polling, heartbeats, grace, release, backoff, panics
   tenant/                    repository.go, service.go (create, authenticate, webhook target)
   asset/                     repository.go, service.go (upload, get, list, renditions, events), processor.go
@@ -158,7 +159,8 @@ src/                         the Go module: go.mod, go.sum and all Go code
   apiv1/                     public JSON types, shared by API responses and webhook payloads
   validation/                field errors that services return and the API renders as 400
   logging/                   a logger carried in the context (CtxWithLogger, LoggerFromContext)
-  tracing/                   OTLP/HTTP tracer provider from the OTEL_* variables, the Checkly-only sampler
+  tracing/                   OTLP/HTTP tracer provider from the OTEL_* variables, the Checkly-only sampler,
+                             the trace context stored with queued work
   httpsrv/                   Gin router, middleware, handlers, error mapping
   testutil/                  throwaway MySQL database per test, audio fixtures
 var/                         host-synced volumes; gitignored apart from the .gitkeep files
@@ -203,9 +205,11 @@ and nothing specific to one layer's technology crosses into another:
   so GORM tags and `db.ID` never appear in a domain type.
 - **A plain `context.Context` crosses layers, never `*gin.Context`** (pitfall 1).
   It carries cancellation and the request's or job's logger (`logging.LoggerFromContext`),
-  and, for a traced request, its span: `db` and `asset` start child spans from that span's provider,
-  so only `httpsrv` is given a tracer provider, by `main.go`. Of OpenTelemetry's globals, only the error handler
-  is set, by `main.go`, so the SDK's errors reach the JSON log; the provider and propagator are never global.
+  and, for a traced request or job, its span: `db`, `asset` and `audio` start child spans from that span's provider.
+  Only the code that starts a trace's first span in a process is given a tracer provider, by `main.go`: `httpsrv`,
+  for each request, and `asset.Processor` and `webhook.Deliverer`, for each lease, from the trace context stored with
+  its work (§6, §12). Of OpenTelemetry's globals, only the error handler is set, by `main.go`, so the SDK's errors
+  reach the JSON log; the provider and propagator are never global.
 - **Errors are translated at each boundary.**
   A repository maps `gorm.ErrRecordNotFound` to its package's `ErrNotFound` and `gorm.ErrDuplicatedKey`
   to an unexported `errDuplicate`, and wraps anything else as `fmt.Errorf("error ...: %w: %v", errDatabase, err)`,
@@ -263,6 +267,7 @@ CREATE TABLE assets (
     last_error           VARCHAR(2048)   NULL,           -- internal detail, never in the API
     created_at           DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at           DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    trace_context        VARCHAR(512) CHARACTER SET ascii NULL,  -- 0003, feat/checkly: a Checkly upload's trace
     PRIMARY KEY (id),
     UNIQUE KEY uq_assets_public_id (public_id),
     UNIQUE KEY uq_assets_tenant_idempotency (tenant_id, idempotency_key),  -- NULLs don't collide
@@ -305,6 +310,7 @@ CREATE TABLE asset_events (
     type        ENUM ('asset.ready','asset.failed') NOT NULL,
     created_at  DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     relayed_at  DATETIME(6)     NULL,
+    trace_context VARCHAR(512) CHARACTER SET ascii NULL,  -- 0003, feat/checkly: copied from the asset
     PRIMARY KEY (id),
     UNIQUE KEY uq_asset_events_event_id (event_id),
     KEY ix_asset_events_pending (relayed_at, id),
@@ -324,6 +330,7 @@ CREATE TABLE webhook_deliveries (
     last_error       VARCHAR(2048)     NULL,
     created_at       DATETIME(6)       NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at       DATETIME(6)       NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    trace_context    VARCHAR(512) CHARACTER SET ascii NULL,  -- 0003, feat/checkly: copied from the event
     PRIMARY KEY (id),
     UNIQUE KEY uq_webhook_deliveries_event_id (event_id),
     KEY ix_webhook_deliveries_claim (state, run_after),
@@ -353,6 +360,13 @@ CREATE TABLE webhook_deliveries (
   In strict mode, MySQL 8's default, a value outside the list fails the insert (error 1265),
   so a typo in code can't be stored. New members are only ever appended, which is instant;
   inserting one mid-list, or growing a `SET` past 8 members, rebuilds the table (§11).
+- **`trace_context`** (migration 0003, on `feat/checkly` only) carries a Checkly check's trace through the queue.
+  The upload's insert stores its request span's `traceparent`, then a space and its `tracestate`,
+  only when that span is recording and sampled, which the Checkly-only sampler allows only for a request Checkly
+  traced (§12); every other upload stores NULL. If the value would outgrow the column, `tracestate` members other
+  than Checkly's are dropped from the last, so the insert never fails for it. The event that finishes the asset
+  copies it in the same transaction, through a subquery in its insert, and the relay copies it into the delivery
+  (§8). The pools continue the trace from it (§6); it never reaches the API or a webhook.
 - **The DSN is normalised in code:** `ParseTime=true`, `Loc=UTC`,
   session `time_zone='+00:00'` and `clientFoundRows=true` are forced, and `interpolateParams=true` is refused,
   so parameters always travel separately from the SQL.
@@ -464,6 +478,13 @@ func Permanent(err error) error // wrap errors that retrying can't fix
 - **On startup, sweep `tmp/`** of files older than the lease (pitfall 25). The processor refreshes its temp files'
   modification time every `lease / 3` while it holds them, so only a dead attempt's files age past the lease.
 - The pool puts a logger carrying `worker`, `pool`, `id`, `tenant_id`, `attempt` and `took` into the work's context.
+- **Tracing** (`feat/checkly`): a source may also implement
+  `Trace(ctx context.Context, l Lease) (context.Context, trace.Span)`, which `asset.Processor` and `webhook.Deliverer`
+  do when given a tracer provider. The pool calls it right after the claim and runs the work, its heartbeats and the
+  outcome's write in the context it returns; once the outcome is written, it sets `slumber_mill.outcome` on the span
+  (`done`, `discarded`, `released` or `failed`, as logged; `failed` is an error) and ends it. When the span is
+  exported, the lease's logger also carries `trace_id` and `span_id`. A nil span means no span; neither changes
+  fencing or the outcome order.
 - `RunUntilIdle(ctx)` processes until nothing is due, for tests.
 
 ## 7. Audio processing (encode pool)
@@ -625,7 +646,8 @@ The webhook pool runs two loops: the relay, which turns asset events into delive
   than keeping a cursor means an event whose transaction committed late is still picked up.
 - For each event whose tenant has a `webhook_url`, insert a delivery keyed by the event ID; a repeat is a no-op.
   Events of a tenant without a URL are only marked relayed. The body is built at relay time from the asset,
-  which is final once `ready` or `failed`, so it matches the event.
+  which is final once `ready` or `failed`, so it matches the event. The delivery also copies the event's
+  `trace_context` (§5), beside the body and never in it.
 - Then mark the batch relayed. A crash in between repeats the inserts, which change nothing.
 - **Measured lag** from an event's creation to its relay:
   about 0.6 s on average and 1.2 s at p99 with 135–175 completions a second, and 1.8 s at worst across a failover.
@@ -638,6 +660,8 @@ The webhook pool runs two loops: the relay, which turns asset events into delive
 - **Request:** POST with `Content-Type: application/json`, `User-Agent: slumber-mill-webhooks/1`, `SlumberMill-Event-Id`
   and `SlumberMill-Signature`. The URL and secret come from `tenant.Service.WebhookTarget` **at delivery time**,
   so fixing an endpoint or rotating a secret applies to pending retries.
+  A delivery whose trace is exported (§12) sends the same request: no `traceparent`, `tracestate` or other trace
+  context goes out.
 - **Outcomes:** 2xx → delivered; **410 Gone → permanent**; anything else, including 3xx, → retry.
   Drain at most 64 KiB of the response for keep-alive.
   After the body is closed, Go's transport may itself read up to 256 KiB more, for at most 50 ms.
@@ -798,7 +822,9 @@ object storage, presigned uploads, signed CDN URLs, and the same write-then-comm
   Verified: five concurrent `migrate` runs → one applied, four found nothing to do.
 - `multiStatements=true` only on the migration pool, never the app's.
 - MySQL DDL commits implicitly, so a migration that fails halfway isn't rolled back:
-  one logical, re-runnable change per file.
+  one logical, re-runnable change per file. MySQL has no `ADD COLUMN IF NOT EXISTS`, so a migration that adds
+  columns, such as 0003, checks `information_schema.columns` and runs each `ALTER` as a prepared statement only
+  where its column is missing.
 - State `ALGORITHM` and `LOCK` explicitly, so MySQL refuses an unsafe change
   instead of silently falling back to a blocking copy.
 
@@ -806,7 +832,7 @@ object storage, presigned uploads, signed CDN URLs, and the same write-then-comm
 
 | Change | Result |
 |---|---|
-| Add a nullable column | `ALGORITHM=INSTANT` ✓ |
+| Add a nullable column | `ALGORITHM=INSTANT` ✓; MySQL 8.4.11 accepts it with `LOCK=DEFAULT` and refuses `LOCK=NONE` (error 1221) |
 | Append a value to the end of an ENUM | `ALGORITHM=INSTANT` ✓ |
 | Insert an ENUM value mid-list | ✗ table rebuild required |
 | Append a member to a SET (up to 8 members) | `ALGORITHM=INSTANT` ✓ |
@@ -882,14 +908,15 @@ so `docker compose run --rm api tenant create ...` runs the CLI in the lean imag
 - `migrate`: the `runtime` image, `command: migrate`, run once;
   the API and both pools depend on it with `condition: service_completed_successfully`.
 - `api`: `runtime`, `command: api`, port 8080, published on `127.0.0.1` only, so the local stack isn't open to the network.
-  It gets the OpenTelemetry variables for Checkly Traces (see "Synthetic monitoring" below):
-  `OTEL_EXPORTER_OTLP_ENDPOINT: ${CHECKLY_OTEL_API_KEY:+https://otel.eu-west-1.checklyhq.com}`,
-  `OTEL_EXPORTER_OTLP_HEADERS: authorization=${CHECKLY_OTEL_API_KEY:-}`, `OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf`
-  and `OTEL_SERVICE_NAME: slumber-mill-api`. Without `CHECKLY_OTEL_API_KEY` in `.env` the endpoint is empty,
-  which turns tracing off.
 - `worker-encode`: `runtime-media`, `command: worker -pool encode`, `cpus: 2`,
   so `GOMAXPROCS` and the pool size follow the limit.
 - `worker-webhook`: `runtime`, `command: worker -pool webhook`.
+- `api` and both pools get the OpenTelemetry variables for Checkly Traces (see "Synthetic monitoring" below) from one
+  `x-checkly-traces` block: `OTEL_EXPORTER_OTLP_ENDPOINT: ${CHECKLY_OTEL_API_KEY:+https://otel.eu-west-1.checklyhq.com}`,
+  `OTEL_EXPORTER_OTLP_HEADERS: authorization=${CHECKLY_OTEL_API_KEY:-}` and `OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf`,
+  and each its own `OTEL_SERVICE_NAME`: `slumber-mill-api`, `slumber-mill-worker-encode` and
+  `slumber-mill-worker-webhook`. Without `CHECKLY_OTEL_API_KEY` in `.env` the endpoint is empty,
+  which turns tracing off.
 - `api` and both pools mount `./var/data` at `/data`, run as the app user, and have **`stop_grace_period: 45s`**.
   `SLUMBER_MILL_SECRET_KEYS`, a fixed dev-only key, goes to `api` (for `tenant create`) and `worker-webhook` (§8).
 - `dev`: the `dev` stage, with `./src` at `/src` (its working directory) and `./var/out` at `/out`,
@@ -935,6 +962,10 @@ the one exception is `process-checks`, which runs `bash scripts/process-checks.s
 | Out of memory, or a crash | The main process dies | As above; temp files wait on the volume for the sweep |
 
 - **`stop_grace_period` must exceed `SLUMBER_MILL_SHUTDOWN_GRACE`** (pitfall 30).
+- **A pool's last spans:** with tracing on, once the pool has stopped and every lease's outcome is written, the
+  tracer provider exports the spans still queued, for at most 3 s. With the default grace that is 30 + 3 = 33 s
+  and the outcome writes, which take milliseconds unless MySQL stalls (each is bounded by 15 s), inside the 45 s
+  `stop_grace_period`.
 - **No init process is needed.** Go handles signals itself, so running as PID 1 is fine:
   verified as PID 1 of a PID namespace, the first SIGTERM started the drain and the second ended the process.
   `exec.Cmd.Wait` reaps ffmpeg, so no zombies.
@@ -972,10 +1003,10 @@ the one exception is `process-checks`, which runs `bash scripts/process-checks.s
 | `SLUMBER_MILL_TRUSTED_PROXIES` | empty (trust none) |
 | `SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE` | `false` (`true` in the local Compose stack) |
 | `SLUMBER_MILL_SECRET_KEYS` | none; required by `tenant create` and the webhook pool (§8) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty: tracing off. `api` only; the OTLP/HTTP base URL, spans go to its `/v1/traces` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty: tracing off. `api` and both pools; the OTLP/HTTP base URL, spans go to its `/v1/traces` |
 | `OTEL_EXPORTER_OTLP_HEADERS` | none; `key=value[,...]`, values percent-encoded, sent with every export |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf`, the only value accepted |
-| `OTEL_SERVICE_NAME` | `slumber-mill` (`slumber-mill-api` in the local Compose stack) |
+| `OTEL_SERVICE_NAME` | `slumber-mill` (`slumber-mill-api`, `slumber-mill-worker-encode` and `slumber-mill-worker-webhook` in the local Compose stack) |
 
 Without an endpoint the other three are ignored and the provider is a no-op that exports and dials
 nothing. With one, the following are configuration errors, and the process exits 1:
@@ -986,12 +1017,12 @@ nothing. With one, the following are configuration errors, and the process exits
 
 The error never quotes a header's value or the endpoint.
 The exporter parses the endpoint and the headers again by itself, and writes whatever it rejects to stderr
-as plain text, outside the JSON log and a header's value included. So `api` refuses at least what the exporter
-would reject.
+as plain text, outside the JSON log and a header's value included. So `api` and the pools refuse at least what the
+exporter would reject.
 
-The exporter also reads other variables by itself, and `api` doesn't support them. If any of these is set to a
-non-blank value, `api` refuses to start, with tracing on or off; the error names the variable and never quotes
-its value. The variables are the `OTEL_EXPORTER_OTLP_` ones `TRACES_ENDPOINT`, `TRACES_HEADERS`,
+The exporter also reads other variables by itself, and neither `api` nor the pools support them. If any of these is
+set to a non-blank value, `api` and the pools refuse to start, with tracing on or off; the error names the variable
+and never quotes its value. The variables are the `OTEL_EXPORTER_OTLP_` ones `TRACES_ENDPOINT`, `TRACES_HEADERS`,
 `TRACES_PROTOCOL`, `TIMEOUT`, `TRACES_TIMEOUT`, `COMPRESSION`, `TRACES_COMPRESSION`, `CERTIFICATE`,
 `TRACES_CERTIFICATE`, `CLIENT_CERTIFICATE`, `CLIENT_KEY`, `TRACES_CLIENT_CERTIFICATE`, `TRACES_CLIENT_KEY`,
 `INSECURE` and `TRACES_INSECURE`, plus `OTEL_GO_X_OBSERVABILITY`. They are refused for these reasons:
@@ -1002,7 +1033,7 @@ its value. The variables are the `OTEL_EXPORTER_OTLP_` ones `TRACES_ENDPOINT`, `
 
 The list is the one `otlptracehttp` v1.47.0 reads, and is checked again whenever the OpenTelemetry version changes.
 
-The SDK reads variables of its own, and with tracing on `api` honours them:
+The SDK reads variables of its own, and with tracing on `api` and the pools honour them:
 - the batching variables `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_EXPORT_TIMEOUT`, `OTEL_BSP_MAX_QUEUE_SIZE` and
   `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`;
 - the span limits `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_ATTRIBUTE_COUNT_LIMIT`,
@@ -1032,7 +1063,8 @@ temp file; a shorter value is a configuration error, and the process exits 1.
 - **Unread request bodies:** A request whose body the handler doesn't read to its end loses its connection: the response says `Connection: close`, and the read deadline is expired once the handler is done, so a client that stalls its body can't hold the connection.
 - **DB pool:** `MaxOpenConns 25`, `MaxIdleConns 25`, `ConnMaxLifetime 5m`.
 - **Logging:** `slog` JSON to stderr. Request lines carry the route template (`c.FullPath()`), status,
-  duration and tenant slug, and for a request whose trace is exported, `trace_id` and `span_id`.
+  duration and tenant slug, and for a request whose trace is exported, `trace_id` and `span_id`;
+  so do a lease's lines when its trace is exported (§6).
   Middleware and the worker put a logger with their fields into the context,
   and services log through `logging.LoggerFromContext(ctx)`. Secrets from `tenant create` go to stdout only.
 
@@ -1085,7 +1117,8 @@ of the scheduled runs and send them to its own `api`, where they fail and alert.
 Every HTTP request a check sends carries a W3C `traceparent` and `tracestate: checkly=true`.
 With Import Traces on in the Checkly account, `api` continues those traces and exports them to Checkly Traces
 (`https://otel.eu-west-1.checklyhq.com`, OTLP/HTTP with protobuf, the account's OTel API key as the `authorization`
-header), so a check result links to what the request did inside the API.
+header), so a check result links to what the request did inside the API; for an upload, the encode and webhook pools
+continue the trace too, so it also shows the encode and the webhook's delivery.
 
 - **Only Checkly's traces leave the process.** The sampler is parent-based: a span without a parent is never sampled,
   and a remote parent is followed only when its sampled flag is set and its `tracestate` has `checkly=true`.
@@ -1103,13 +1136,29 @@ header), so a check result links to what the request did inside the API.
     placeholders, since `interpolateParams` is refused. A failed statement sets status error without the error's
     text, which can quote a bound value. A statement whose context has no sampled span gets none.
   - `asset.Stage`, around streaming the upload to its temp file, with `slumber_mill.upload.bytes`.
+  - `asset.encode` (service `slumber-mill-worker-encode`, kind consumer), one per attempt at encoding an upload
+    Checkly traced, a child of the upload request's server span, with `slumber_mill.asset.id` (the public ID),
+    `slumber_mill.attempt` and `slumber_mill.outcome` (§6). Under it are the attempt's statement spans and the
+    steps of §7: `audio.probe`, `audio.measure`, `audio.render` with `slumber_mill.profiles` (and
+    `slumber_mill.gain_db` for a corrective re-encode), and one `audio.verify` per verification with
+    `slumber_mill.profile`, `slumber_mill.lufs`, `slumber_mill.true_peak_dbtp` and `slumber_mill.in_spec`.
+    A failed step is an error, whose description is a rejection's tenant-safe message and otherwise empty,
+    since ffmpeg's output names internal paths. `audio` starts its spans from the encode span's provider.
+  - `webhook.deliver` (service `slumber-mill-worker-webhook`, kind consumer), one per attempt at delivering such an
+    upload's webhook, also a child of the upload request's server span, with `slumber_mill.attempt`,
+    `slumber_mill.outcome`, `server.address` (the endpoint's host only: a webhook URL's path and query can hold a
+    token, as the heartbeat's ping URL does) and, once it answers, `http.response.status_code`.
+- **Across the queue:** the upload stores its request span's context in `assets.trace_context`, the event copies it
+  and the relay copies it into the delivery (§5, §8). Each pool reads it when it claims the work, only when tracing
+  is on, and starts the lease's span with it as the remote parent, so the Checkly-only sampler keeps exactly what
+  it kept in `api`: NULL gives a root span, which it drops. The outgoing webhook carries no trace context (§8).
 - **No header, query string or body goes into a span**, so `Authorization`, the API key, cookies and the
-  `Idempotency-Key` never do.
-- **Logs:** request lines and the request's service logs carry `trace_id` and `span_id` when the trace is exported.
-- **Off by default:** without `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is exported or dialled. The Compose stack sets it
-  only when `.env` has `CHECKLY_OTEL_API_KEY`; a worktree or second checkout that shares the main `.env` through
-  `COMPOSE_ENV_FILES` sets `CHECKLY_OTEL_API_KEY=` in its shell.
-- The encode and webhook pools aren't traced yet.
+  `Idempotency-Key` never do, and no webhook URL's path or query goes into a span or a log.
+- **Logs:** request lines and the request's service logs carry `trace_id` and `span_id` when the trace is exported,
+  and so do a lease's lines.
+- **Off by default:** without `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is exported or dialled, and a pool reads no trace
+  context. The Compose stack sets it only when `.env` has `CHECKLY_OTEL_API_KEY`; a worktree or second checkout
+  that shares the main `.env` through `COMPOSE_ENV_FILES` sets `CHECKLY_OTEL_API_KEY=` in its shell.
 
 ## 13. Testing
 
@@ -1167,6 +1216,17 @@ What the tests must show:
   span; the exporter POSTs protobuf to `/v1/traces` with the configured `authorization`, and `api` exports a
   Checkly request's span by the time it exits; every exporter variable the API doesn't support is refused when set,
   with tracing on or off, without quoting its value, and a blank one is accepted.
+  Across the queue: a stored context round-trips, keeps Checkly's `tracestate` member when it must be cut to fit,
+  and is empty for an unsampled request or with tracing off; `trace_context` round-trips through `assets`,
+  `asset_events` (written by finish, fail and the reaper) and `webhook_deliveries`, as NULL for a tenant's upload;
+  migration 0003 adds the columns as nullable ASCII and applies again after a run that stopped partway;
+  the processor and the deliverer continue a stored trace in `asset.encode` and `webhook.deliver`, a NULL one
+  records nothing and with tracing off nothing is read (fakes and `tracetest`); the pool ends a lease's span with
+  its outcome, runs the work, heartbeats and outcome under it and adds the trace IDs to the lease's logs; the steps of
+  §7 are children of the encode span; the delivery span holds the host and status but no path or query, and the
+  request on the wire is the same with or without a span, without `traceparent`; against MySQL and ffmpeg,
+  `asset.encode` and `webhook.deliver` nest under the upload's request span; and the three processes export
+  a Checkly upload's spans by the time they exit, and nothing of an upload Checkly didn't trace.
 - **End to end**, with the real API, MySQL, ffmpeg, both pools and an `httptest` receiver:
   an upload becomes `ready` with every rendition in spec, a ranged download returns 206,
   and exactly one signed `asset.ready` arrives; a text file named `.wav` fails with the tenant-safe message,
