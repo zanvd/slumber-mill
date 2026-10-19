@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+
 	"github.com/zanvd/slumber-mill/src/asset"
 	"github.com/zanvd/slumber-mill/src/audio"
 	"github.com/zanvd/slumber-mill/src/db"
@@ -24,6 +26,7 @@ import (
 	"github.com/zanvd/slumber-mill/src/secret"
 	"github.com/zanvd/slumber-mill/src/storage"
 	"github.com/zanvd/slumber-mill/src/tenant"
+	"github.com/zanvd/slumber-mill/src/tracing"
 	"github.com/zanvd/slumber-mill/src/webhook"
 	"github.com/zanvd/slumber-mill/src/worker"
 )
@@ -35,6 +38,9 @@ const (
 
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 2 * time.Minute
+	// traceFlushTimeout bounds the export of the last spans. With the default drain delay and grace
+	// it keeps the API's longest stop at 43 s, inside Compose's 45 s stop_grace_period.
+	traceFlushTimeout = 3 * time.Second
 
 	defaultTargetLUFS = -20
 
@@ -167,6 +173,13 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 	files := storage.NewLocal(cfg.DataDir)
 	sweepTemp(ctx, log, files, cfg.EncodeLease)
 
+	tp, err := setupTracing(ctx, log, cfg.Tracing)
+	if err != nil {
+		return err
+	}
+	// Deferred first, so it runs last: once the HTTP server has stopped and every span has ended.
+	defer flushTraces(ctx, log, tp)
+
 	gdb, err := db.Open(cfg.DSN, log)
 	if err != nil {
 		return err
@@ -184,6 +197,7 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 		Readiness:           pool,
 		MaxUploadBytes:      cfg.MaxUploadBytes,
 		MaxUploadsPerTenant: cfg.MaxUploadsPerTenant,
+		Tracer:              tp,
 	})
 	if err != nil {
 		return err
@@ -210,6 +224,32 @@ func runAPI(ctx context.Context, log *slog.Logger, getenv func(string) string) e
 	}
 	log.InfoContext(ctx, "serving HTTP", "addr", ln.Addr().String())
 	return serve(ctx, log, srv, ln, handler, cfg.DrainDelay, cfg.ShutdownGrace)
+}
+
+// setupTracing builds the tracer provider. When it exports, the SDK's errors, such as a failed export,
+// go to log as warnings rather than as plain text through the log package.
+func setupTracing(ctx context.Context, log *slog.Logger, cfg tracing.Config) (*tracing.Provider, error) {
+	tp, err := tracing.Setup(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if !tp.Enabled() {
+		return tp, nil
+	}
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		log.Warn("tracing error", "error", err)
+	}))
+	log.InfoContext(ctx, "exporting traces started by Checkly", "endpoint", cfg.Endpoint, "service", cfg.ServiceName)
+	return tp, nil
+}
+
+// flushTraces exports the spans still queued, within traceFlushTimeout, after the HTTP server has stopped.
+func flushTraces(ctx context.Context, log *slog.Logger, tp *tracing.Provider) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), traceFlushTimeout)
+	defer cancel()
+	if err := tp.Shutdown(ctx); err != nil {
+		log.WarnContext(ctx, "error flushing traces", "error", err)
+	}
 }
 
 func runWorker(ctx context.Context, log *slog.Logger, args []string, getenv func(string) string) error {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/zanvd/slumber-mill/src/httpsrv"
 	"github.com/zanvd/slumber-mill/src/secret"
+	"github.com/zanvd/slumber-mill/src/tracing"
 )
 
 const (
@@ -57,6 +58,8 @@ type apiConfig struct {
 	EncodeLease   time.Duration
 	DrainDelay    time.Duration
 	ShutdownGrace time.Duration
+	// Tracing has no endpoint when tracing is off.
+	Tracing tracing.Config
 }
 
 type encodeConfig struct {
@@ -103,6 +106,11 @@ func loadAPIConfig(getenv func(string) string) (apiConfig, error) {
 		DrainDelay:          p.duration(envDrainDelay, defaultDrainDelay),
 		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
 	}
+	tc, err := tracing.LoadConfig(getenv)
+	if err != nil {
+		p.errs = append(p.errs, err)
+	}
+	cfg.Tracing = tc
 	return cfg, p.err()
 }
 
