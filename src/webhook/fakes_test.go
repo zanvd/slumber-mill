@@ -183,7 +183,7 @@ type fakeDeliveryRepo struct {
 	errs map[string]error
 	// due is the lease the next claim hands out, once; nil means nothing is due.
 	due *lease
-	// pending is what leasedDelivery returns.
+	// pending is what leasedDelivery returns, and its trace context what leasedTraceContext returns.
 	pending delivery
 	// requeued and failed are what reap returns.
 	requeued, failed int
@@ -264,6 +264,16 @@ func (f *fakeDeliveryRepo) extend(ctx context.Context, l lease, d time.Duration)
 	f.leases = append(f.leases, l)
 	f.durations = append(f.durations, d)
 	return f.err(ctx, "extend")
+}
+
+func (f *fakeDeliveryRepo) leasedTraceContext(ctx context.Context, l lease) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases = append(f.leases, l)
+	if err := f.err(ctx, "leasedTraceContext"); err != nil {
+		return "", err
+	}
+	return f.pending.TraceContext, nil
 }
 
 func (f *fakeDeliveryRepo) leasedDelivery(ctx context.Context, l lease) (delivery, error) {

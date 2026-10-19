@@ -6,18 +6,28 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 	"uuid"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zanvd/slumber-mill/src/apiv1"
 	"github.com/zanvd/slumber-mill/src/asset"
 	"github.com/zanvd/slumber-mill/src/egress"
 	"github.com/zanvd/slumber-mill/src/logging"
 	"github.com/zanvd/slumber-mill/src/tenant"
+	"github.com/zanvd/slumber-mill/src/tracing"
 	"github.com/zanvd/slumber-mill/src/worker"
 )
 
 const (
+	tracerName        = "github.com/zanvd/slumber-mill/src/webhook"
+	attrAttempt       = "slumber_mill.attempt"
+	attrServerAddress = "server.address"
+	attrStatusCode    = "http.response.status_code"
+
 	relayInterval = time.Second
 	// releaseTimeout bounds giving up the relay lock once Run's context is done.
 	releaseTimeout = 15 * time.Second
@@ -47,6 +57,8 @@ type delivery struct {
 	EventID  uuid.UUID
 	TenantID uint64
 	Body     []byte
+	// TraceContext is the event's trace context, carried for the delivery's span and never sent.
+	TraceContext string
 }
 
 // lease is a claimed delivery. Its fields are those of worker.Lease and db.Lease, so it converts to and from either.
@@ -265,7 +277,7 @@ func (r *Relay) deliveries(ctx context.Context, events []asset.Event) ([]deliver
 		if err != nil {
 			return nil, fmt.Errorf("error encoding event %s: %w", e.ID, err)
 		}
-		out = append(out, delivery{EventID: e.ID, TenantID: e.TenantID, Body: body})
+		out = append(out, delivery{EventID: e.ID, TenantID: e.TenantID, Body: body, TraceContext: e.TraceContext})
 	}
 	return out, nil
 }
@@ -273,6 +285,7 @@ func (r *Relay) deliveries(ctx context.Context, events []asset.Event) ([]deliver
 type deliveryRepo interface {
 	claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error)
 	extend(ctx context.Context, l lease, d time.Duration) error
+	leasedTraceContext(ctx context.Context, l lease) (string, error)
 	leasedDelivery(ctx context.Context, l lease) (delivery, error)
 	complete(ctx context.Context, l lease) error
 	fail(ctx context.Context, l lease, f failure) (bool, error)
@@ -290,6 +303,8 @@ type DelivererConfig struct {
 	WorkerID string
 	// Lease is how long a claim or a heartbeat holds a delivery: the webhook pool's Lease.
 	Lease time.Duration
+	// Tracer continues the traces stored with deliveries. Nil traces nothing, and reads no trace context.
+	Tracer trace.TracerProvider
 }
 
 // Deliverer is the webhook pool's source of work. It signs a claimed delivery, posts it to the tenant's webhook,
@@ -299,6 +314,8 @@ type Deliverer struct {
 	tenants webhookTargets
 	client  poster
 	cfg     DelivererConfig
+	// tracer is nil when tracing is off.
+	tracer trace.Tracer
 	// retentionBatch is defaultRetentionBatch outside tests.
 	retentionBatch int
 }
@@ -316,7 +333,28 @@ func NewDeliverer(r deliveryRepo, tenants webhookTargets, client poster, cfg Del
 	case cfg.Lease <= 0:
 		return nil, fmt.Errorf("lease %v is not positive", cfg.Lease)
 	}
-	return &Deliverer{repo: r, tenants: tenants, client: client, cfg: cfg, retentionBatch: defaultRetentionBatch}, nil
+	d := &Deliverer{repo: r, tenants: tenants, client: client, cfg: cfg, retentionBatch: defaultRetentionBatch}
+	if cfg.Tracer != nil {
+		d.tracer = cfg.Tracer.Tracer(tracerName)
+	}
+	return d, nil
+}
+
+// Trace continues the trace of the delivery's event, if a Checkly check uploaded its asset, in a webhook.deliver
+// span for this attempt, which the pool ends with the attempt's outcome. Failing to read the trace context only
+// loses the span.
+func (d *Deliverer) Trace(ctx context.Context, l worker.Lease) (context.Context, trace.Span) {
+	if d.tracer == nil {
+		return ctx, nil
+	}
+	stored, err := d.repo.leasedTraceContext(ctx, lease(l))
+	if err != nil {
+		logging.LoggerFromContext(ctx).WarnContext(ctx, "error reading the delivery's trace context", "error", err)
+		return ctx, nil
+	}
+	return d.tracer.Start(tracing.ContinueStored(ctx, stored), "webhook.deliver",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(attribute.Int(attrAttempt, l.Attempt)))
 }
 
 func (d *Deliverer) Claim(ctx context.Context) (worker.Lease, bool, error) {
@@ -355,7 +393,17 @@ func (d *Deliverer) Process(ctx context.Context, l worker.Lease) error {
 		return fmt.Errorf("error signing the delivery: %w", err)
 	}
 
+	span := trace.SpanFromContext(ctx)
+	if span.IsRecording() {
+		// Only the host: a webhook URL's path and query can hold a token.
+		if u, err := url.Parse(target.URL); err == nil && u.Hostname() != "" {
+			span.SetAttributes(attribute.String(attrServerAddress, u.Hostname()))
+		}
+	}
 	status, err := d.client.Post(ctx, target.URL, p.EventID.String(), signature, p.Body)
+	if err == nil {
+		span.SetAttributes(attribute.Int(attrStatusCode, status))
+	}
 	switch {
 	case errors.Is(err, egress.ErrBlockedAddress):
 		return worker.Permanent(err)

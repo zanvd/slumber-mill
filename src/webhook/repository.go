@@ -38,16 +38,17 @@ func NewRepository(gdb *gorm.DB) *Repository {
 }
 
 type deliveryRow struct {
-	ID       uint64 `gorm:"primaryKey"`
-	EventID  db.ID  `gorm:"column:event_id"`
-	TenantID uint64 `gorm:"column:tenant_id"`
-	Body     []byte `gorm:"column:body"`
+	ID           uint64  `gorm:"primaryKey"`
+	EventID      db.ID   `gorm:"column:event_id"`
+	TenantID     uint64  `gorm:"column:tenant_id"`
+	Body         []byte  `gorm:"column:body"`
+	TraceContext *string `gorm:"column:trace_context"`
 }
 
 func (deliveryRow) TableName() string { return "webhook_deliveries" }
 
-// insertDeliveries queues a delivery for each event that has none yet. An event that already has one
-// keeps it as it is, body included.
+// insertDeliveries queues a delivery for each event that has none yet, with the event's trace context,
+// NULL when it's empty. An event that already has one keeps it as it is, body included.
 func (r *Repository) insertDeliveries(ctx context.Context, ds []delivery) error {
 	if len(ds) == 0 {
 		return nil
@@ -55,9 +56,12 @@ func (r *Repository) insertDeliveries(ctx context.Context, ds []delivery) error 
 	rows := make([]deliveryRow, len(ds))
 	for i, d := range ds {
 		rows[i] = deliveryRow{EventID: db.ID(d.EventID), TenantID: d.TenantID, Body: d.Body}
+		if d.TraceContext != "" {
+			rows[i].TraceContext = &d.TraceContext
+		}
 	}
 	err := r.db.WithContext(ctx).
-		Select("event_id", "tenant_id", "body").
+		Select("event_id", "tenant_id", "body", "trace_context").
 		Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&rows).Error
 	if err != nil {
@@ -81,6 +85,22 @@ func (r *Repository) extend(ctx context.Context, l lease, d time.Duration) error
 		return translateLease("error extending delivery lease", err)
 	}
 	return nil
+}
+
+// leasedTraceContext returns the trace context the leased delivery's event carried, empty if it had none.
+func (r *Repository) leasedTraceContext(ctx context.Context, l lease) (string, error) {
+	var row deliveryRow
+	err := r.db.WithContext(ctx).
+		Select("trace_context").
+		Where("id = ? AND tenant_id = ?", l.ID, l.TenantID).
+		Take(&row).Error
+	if err != nil {
+		return "", translate("error reading the leased delivery's trace context", err)
+	}
+	if row.TraceContext == nil {
+		return "", nil
+	}
+	return *row.TraceContext, nil
 }
 
 // leasedDelivery returns the leased delivery's event ID and body.

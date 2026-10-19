@@ -123,9 +123,10 @@ func dryRun(t *testing.T) (*Repository, *recorder) {
 // so a dropped zero value would show as a missing value.
 func TestInsertDeliveriesSQL(t *testing.T) {
 	r, rec := dryRun(t)
+	const traced = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true"
 	ds := []delivery{
 		{EventID: uuid.NewV7(), Body: []byte{}},
-		{EventID: uuid.NewV7(), TenantID: 42, Body: []byte(`{"id":"x"}`)},
+		{EventID: uuid.NewV7(), TenantID: 42, Body: []byte(`{"id":"x"}`), TraceContext: traced},
 	}
 
 	if err := r.insertDeliveries(t.Context(), ds); err != nil {
@@ -136,12 +137,13 @@ func TestInsertDeliveriesSQL(t *testing.T) {
 		t.Fatalf("ran %d statements, want 1: %v", len(rec.statements), rec.statements)
 	}
 	got := rec.statements[0]
-	const want = "INSERT INTO `webhook_deliveries` (`event_id`,`tenant_id`,`body`) VALUES (?,?,?),(?,?,?) " +
-		"ON DUPLICATE KEY UPDATE `id`=`id`"
+	const want = "INSERT INTO `webhook_deliveries` (`event_id`,`tenant_id`,`body`,`trace_context`) " +
+		"VALUES (?,?,?,?),(?,?,?,?) ON DUPLICATE KEY UPDATE `id`=`id`"
 	if got.sql != want {
 		t.Errorf("SQL = %s\nwant  %s", got.sql, want)
 	}
-	wantVars := []any{db.ID(ds[0].EventID), uint64(0), []byte{}, db.ID(ds[1].EventID), uint64(42), []byte(`{"id":"x"}`)}
+	wantVars := []any{db.ID(ds[0].EventID), uint64(0), []byte{}, (*string)(nil),
+		db.ID(ds[1].EventID), uint64(42), []byte(`{"id":"x"}`), new(traced)}
 	if !reflect.DeepEqual(got.vars, wantVars) {
 		t.Errorf("values = %#v\nwant     %#v", got.vars, wantVars)
 	}
@@ -178,6 +180,30 @@ func TestLeasedDeliverySQL(t *testing.T) {
 	const want = "SELECT `event_id`,`tenant_id`,`body` FROM `webhook_deliveries` WHERE id = ? AND tenant_id = ? LIMIT ?"
 	if s.sql != want || !reflect.DeepEqual(s.vars, []any{uint64(11), uint64(42), 1}) {
 		t.Errorf("statement = %s %v\nwant        %s [11 42 1]", s.sql, s.vars, want)
+	}
+}
+
+func TestLeasedTraceContextSQL(t *testing.T) {
+	const traced = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true"
+	for _, want := range []string{traced, ""} {
+		r, rec := dryRun(t)
+		if want != "" {
+			rec.row = deliveryRow{TraceContext: new(want)}
+		}
+
+		got, err := r.leasedTraceContext(t.Context(), lease{ID: 11, TenantID: 42, Attempt: 3})
+
+		if err != nil || got != want {
+			t.Errorf("leasedTraceContext() = %q, %v; want %q", got, err, want)
+		}
+		if len(rec.statements) != 1 {
+			t.Fatalf("ran %d statements, want 1: %v", len(rec.statements), rec.statements)
+		}
+		s := rec.statements[0]
+		const query = "SELECT `trace_context` FROM `webhook_deliveries` WHERE id = ? AND tenant_id = ? LIMIT ?"
+		if s.sql != query || !reflect.DeepEqual(s.vars, []any{uint64(11), uint64(42), 1}) {
+			t.Errorf("statement = %s %v\nwant        %s [11 42 1]", s.sql, s.vars, query)
+		}
 	}
 }
 
