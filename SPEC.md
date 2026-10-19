@@ -991,6 +991,8 @@ against `SLUMBER_MILL_BASE_URL` (`http://api:8080`) and alerts one email channel
   GETs `/renditions/aac_64k` with `Range: bytes=0-1023` and expects 206, an `ETag` and 1024 bytes,
   and GETs a random UUIDv7 and expects 404.
   Checkly stops a multistep run after 240 s, so the test's own timeout is 210 s.
+  The upload waits in the same encode queue as tenant uploads, so a backlog that keeps every encode slot busy
+  for over 180 s fails the check too, without an outage.
   Each run keeps its asset, about 2.2 MB on disk, since assets are never deleted.
 - **`webhook-delivered`:** the probe tenant's webhook URL is this heartbeat's ping URL, so every `asset.ready`
   and `asset.failed` webhook of the probe (§8) pings it. It shows that the relay and the delivery slots work and

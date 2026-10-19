@@ -291,6 +291,8 @@ the account's existing email channel, whose ID is in `checkly/checks/group.ts`) 
 fresh `Idempotency-Key`, polls the asset every 2 seconds until it is `ready`, then fetches the first 1024 bytes of
 `aac_64k` and expects 206 with an `ETag`, and finally asks for a random UUIDv7 and expects 404. It fails at once if
 the asset turns `failed`, and after 3 minutes of waiting, since Checkly stops a multistep run after 240 seconds.
+The probe's upload waits in the same encode queue as tenant uploads, so it also fails when every encode slot stays
+busy for over 3 minutes, as one long source can make it: that is a backlog, not an outage.
 The probe tenant `checkly-probe` has the heartbeat's ping URL as its webhook URL, so each of its `asset.ready` and
 `asset.failed` webhooks pings `webhook-delivered`, which alerts when none arrives for 15 minutes plus 15 minutes
 of grace. Each run keeps its upload: about 2.2 MB of source and renditions in `var/data`, or roughly 210 MB a day,
@@ -349,8 +351,11 @@ the probe is set up after the first deploy. Until its key is stored, `ingest-rou
    docker compose --profile checkly run --rm checkly npx checkly env add SLUMBER_MILL_PROBE_API_KEY --secret
    ```
 
-Test sessions see the account's variables too, so from then on `make checkly-test` needs nothing else. To test against a
-tenant that isn't stored in Checkly, such as one in a fresh local stack, pass its key for that run only:
+Test sessions see the account's variables too, so from then on `make checkly-test` needs nothing else.
+To test against a tenant that isn't stored in Checkly, such as one in a fresh local stack, pass its key for that run
+only, and use only a throwaway key there. Checkly scrubs only secret variables from results, and a value passed with `-e` or
+`--env-file` isn't one, while Playwright prints the request headers, `Authorization` included, when a request can't
+reach `api`; a recorded session then keeps the key.
 
 ```sh
 docker compose --profile checkly run --rm checkly npx checkly test --private-location slumber-mill-local --record \
