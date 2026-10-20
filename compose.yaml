@@ -14,6 +14,13 @@ x-data-volume: &data-volume
 # DEV ONLY: a fixed key for the local stack. Production reads its key ring from a secret manager.
 x-dev-only-secret-keys: &dev-only-secret-keys "1:2msFlHD07Wase5XLGZqo/KQADXNakuUYbBeutcmLD0Q="
 
+# Checkly Traces, for api and both pools, each of which adds its OTEL_SERVICE_NAME.
+# Without CHECKLY_OTEL_API_KEY in .env the endpoint is empty, which turns tracing off.
+x-checkly-traces: &checkly-traces
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${CHECKLY_OTEL_API_KEY:+https://otel.eu-west-1.checklyhq.com}
+  OTEL_EXPORTER_OTLP_HEADERS: authorization=${CHECKLY_OTEL_API_KEY:-}
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+
 services:
   mysql:
     image: mysql:8.4
@@ -50,12 +57,9 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
+      <<: *checkly-traces
       SLUMBER_MILL_SECRET_KEYS: *dev-only-secret-keys
       SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE: "true"
-      # Checkly Traces. Without CHECKLY_OTEL_API_KEY in .env the endpoint is empty, which turns tracing off.
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${CHECKLY_OTEL_API_KEY:+https://otel.eu-west-1.checklyhq.com}
-      OTEL_EXPORTER_OTLP_HEADERS: authorization=${CHECKLY_OTEL_API_KEY:-}
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
       OTEL_SERVICE_NAME: slumber-mill-api
     volumes:
       - *data-volume
@@ -72,6 +76,9 @@ services:
         APP_UID: ${APP_UID:-1000}
     command: ["worker", "-pool", "encode"]
     cpus: 2
+    environment:
+      <<: *checkly-traces
+      OTEL_SERVICE_NAME: slumber-mill-worker-encode
     volumes:
       - *data-volume
     depends_on:
@@ -83,8 +90,10 @@ services:
     build: *runtime-build
     command: ["worker", "-pool", "webhook"]
     environment:
+      <<: *checkly-traces
       SLUMBER_MILL_SECRET_KEYS: *dev-only-secret-keys
       SLUMBER_MILL_WEBHOOK_ALLOW_PRIVATE: "true"
+      OTEL_SERVICE_NAME: slumber-mill-worker-webhook
     volumes:
       - *data-volume
     depends_on:

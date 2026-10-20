@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -145,6 +146,50 @@ func TestRelayingTwiceYieldsOneDelivery(t *testing.T) {
 	}
 	if n := s.unrelayed(t); n != 0 {
 		t.Errorf("%d events unrelayed, want 0", n)
+	}
+}
+
+// TestRelayCarriesTraceContext relays an event whose asset's upload Checkly traced and one whose upload it didn't:
+// each delivery stores its event's trace context, or NULL, its claim reads it back, and neither body holds it.
+func TestRelayCarriesTraceContext(t *testing.T) {
+	s := newRelayStack(t, testutil.NewDatabase(t))
+	hooked, _ := s.createTenant(t, "hooked", "https://hooks.example.com/slumber")
+	other, _ := s.createTenant(t, "other", "")
+	traced, _ := s.addEvent(t, hooked.ID, "Rain")
+	untraced, _ := s.addEvent(t, hooked.ID, "Thunder")
+	s.exec(t, "UPDATE asset_events SET trace_context = ? WHERE event_id = ?", checklyTraceContext, db.ID(traced))
+
+	s.once(t, true, 2)
+
+	for _, want := range []struct {
+		eventID uuid.UUID
+		stored  string
+	}{{traced, checklyTraceContext}, {untraced, ""}} {
+		var got sql.NullString
+		var body []byte
+		if err := s.pool.QueryRowContext(t.Context(),
+			"SELECT trace_context, body FROM webhook_deliveries WHERE event_id = ?", db.ID(want.eventID)).
+			Scan(&got, &body); err != nil {
+			t.Fatalf("error reading the delivery of event %s: %v", want.eventID, err)
+		}
+		if got.String != want.stored || got.Valid != (want.stored != "") {
+			t.Errorf("delivery of event %s stores %+v, want %q, or NULL for empty", want.eventID, got, want.stored)
+		}
+		if bytes.Contains(body, []byte("checkly")) || bytes.Contains(body, []byte("4bf92f3577b34da6")) {
+			t.Errorf("delivery body %s holds the trace context", body)
+		}
+
+		l, ok, err := s.repo.claim(t.Context(), "webhook-1", time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim() = %+v, %t, %v; want a lease", l, ok, err)
+		}
+		if stored, err := s.repo.leasedTraceContext(t.Context(), l); err != nil || stored != want.stored {
+			t.Errorf("leasedTraceContext() = %q, %v; want %q", stored, err, want.stored)
+		}
+		wrongTenant := lease{ID: l.ID, TenantID: other.ID, Attempt: l.Attempt}
+		if _, err := s.repo.leasedTraceContext(t.Context(), wrongTenant); !errors.Is(err, errNotFound) {
+			t.Errorf("leasedTraceContext() under another tenant: error = %v, want %v", err, errNotFound)
+		}
 	}
 }
 

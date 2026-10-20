@@ -118,6 +118,8 @@ type Event struct {
 	CreatedAt time.Time
 	// Asset is the event's asset as it is now, which is final once it has an event.
 	Asset Asset
+	// TraceContext is the trace context of the asset's upload when a Checkly check traced it, and empty otherwise.
+	TraceContext string
 }
 
 // lease is a claimed asset. Its fields are those of worker.Lease and db.Lease, so it converts to and from either.

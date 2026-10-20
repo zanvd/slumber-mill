@@ -68,6 +68,8 @@ type encodeConfig struct {
 	Concurrency   int
 	Lease         time.Duration
 	ShutdownGrace time.Duration
+	// Tracing has no endpoint when tracing is off.
+	Tracing tracing.Config
 }
 
 type webhookConfig struct {
@@ -79,6 +81,8 @@ type webhookConfig struct {
 	ShutdownGrace       time.Duration
 	WebhookAllowPrivate bool
 	SecretKeys          secret.Value
+	// Tracing has no endpoint when tracing is off.
+	Tracing tracing.Config
 }
 
 type tenantCreateConfig struct {
@@ -106,11 +110,7 @@ func loadAPIConfig(getenv func(string) string) (apiConfig, error) {
 		DrainDelay:          p.duration(envDrainDelay, defaultDrainDelay),
 		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
 	}
-	tc, err := tracing.LoadConfig(getenv)
-	if err != nil {
-		p.errs = append(p.errs, err)
-	}
-	cfg.Tracing = tc
+	cfg.Tracing = p.tracing()
 	return cfg, p.err()
 }
 
@@ -122,6 +122,7 @@ func loadEncodeConfig(getenv func(string) string) (encodeConfig, error) {
 		Concurrency:   p.positiveInt(envEncodeConcurrency, runtime.GOMAXPROCS(0)),
 		Lease:         p.durationAtLeast(envEncodeLease, defaultEncodeLease, minEncodeLease),
 		ShutdownGrace: p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
+		Tracing:       p.tracing(),
 	}
 	return cfg, p.err()
 }
@@ -136,6 +137,7 @@ func loadWebhookConfig(getenv func(string) string) (webhookConfig, error) {
 		ShutdownGrace:       p.positiveDuration(envShutdownGrace, defaultShutdownGrace),
 		WebhookAllowPrivate: p.bool(envWebhookAllowPrivate, false),
 		SecretKeys:          p.secret(envSecretKeys),
+		Tracing:             p.tracing(),
 	}
 	return cfg, p.err()
 }
@@ -173,6 +175,15 @@ func (p *envParser) string(name, def string) string {
 		return v
 	}
 	return def
+}
+
+// tracing reads the OpenTelemetry variables, whose errors never quote a header's value.
+func (p *envParser) tracing() tracing.Config {
+	cfg, err := tracing.LoadConfig(p.getenv)
+	if err != nil {
+		p.errs = append(p.errs, err)
+	}
+	return cfg
 }
 
 // secret's errors never quote the value.

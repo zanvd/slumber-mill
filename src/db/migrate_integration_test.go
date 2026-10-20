@@ -149,6 +149,84 @@ func TestMigrateTargetDefault(t *testing.T) {
 	}
 }
 
+// TestMigrateTraceContext applies 0003 to tables with rows but no trace_context, again as if the first run had
+// stopped after its first table, and once more with every column in place. Each run leaves every table with
+// a nullable ASCII column of 512 characters, and the rows that were there with NULL in it.
+func TestMigrateTraceContext(t *testing.T) {
+	tables := []string{"assets", "asset_events", "webhook_deliveries"}
+	dsn := testutil.NewDatabase(t)
+	gdb := open(t, dsn).WithContext(t.Context())
+	for _, table := range tables {
+		if err := gdb.Exec("ALTER TABLE " + table + " DROP COLUMN trace_context").Error; err != nil {
+			t.Fatalf("error restoring %s as 0002 left it: %v", table, err)
+		}
+	}
+	tenantID := createTenant(t, gdb, "before-0003")
+	asset := newAsset(tenantID, db.NewID(), nil)
+	if err := gdb.Create(asset).Error; err != nil {
+		t.Fatalf("error creating an asset: %v", err)
+	}
+	for query, args := range map[string][]any{
+		"INSERT INTO asset_events (event_id, tenant_id, asset_id, type) VALUES (?, ?, ?, 'asset.ready')": {
+			db.NewID(), tenantID, asset.ID},
+		"INSERT INTO webhook_deliveries (event_id, tenant_id, body) VALUES (?, ?, '{}')": {db.NewID(), tenantID},
+	} {
+		if err := gdb.Exec(query, args...).Error; err != nil {
+			t.Fatalf("error running %q: %v", query, err)
+		}
+	}
+
+	runs := []struct {
+		name   string
+		before func(t *testing.T)
+	}{
+		{"first run", func(*testing.T) {}},
+		{"after a run that stopped partway", func(t *testing.T) {
+			for _, table := range tables[1:] {
+				if err := gdb.Exec("ALTER TABLE " + table + " DROP COLUMN trace_context").Error; err != nil {
+					t.Fatalf("error dropping %s.trace_context: %v", table, err)
+				}
+			}
+		}},
+		{"with every column in place", func(*testing.T) {}},
+	}
+	for _, run := range runs {
+		run.before(t)
+		if err := gdb.Exec("DELETE FROM schema_migrations WHERE version = 3").Error; err != nil {
+			t.Fatalf("%s: error forgetting migration 3: %v", run.name, err)
+		}
+		applied, err := db.Migrate(t.Context(), dsn, testutil.Logger(t))
+		if err != nil {
+			t.Fatalf("%s: Migrate() error = %v", run.name, err)
+		}
+		if want := []string{"0003_trace_context.sql"}; !slices.Equal(applied, want) {
+			t.Errorf("%s: Migrate() applied %v, want %v", run.name, applied, want)
+		}
+		for _, table := range tables {
+			var columnType, charset, nullable string
+			err := gdb.Raw("SELECT column_type, character_set_name, is_nullable FROM information_schema.columns "+
+				"WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'trace_context'", table).
+				Row().Scan(&columnType, &charset, &nullable)
+			if err != nil {
+				t.Fatalf("%s: error reading %s.trace_context: %v", run.name, table, err)
+			}
+			if columnType != "varchar(512)" || charset != "ascii" || nullable != "YES" {
+				t.Errorf("%s: %s.trace_context is %s, %s, nullable %s; want a nullable ASCII varchar(512)",
+					run.name, table, columnType, charset, nullable)
+			}
+			var rows, null int
+			err = gdb.Raw("SELECT COUNT(*), COUNT(*) - COUNT(trace_context) FROM "+table).Row().Scan(&rows, &null)
+			if err != nil {
+				t.Fatalf("%s: error counting %s: %v", run.name, table, err)
+			}
+			if rows != 1 || null != 1 {
+				t.Errorf("%s: %s has %d rows, %d of them with a NULL trace_context; want the one row, NULL",
+					run.name, table, rows, null)
+			}
+		}
+	}
+}
+
 func targetDefault(t *testing.T, gdb *gorm.DB) string {
 	t.Helper()
 	var def string

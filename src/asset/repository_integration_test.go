@@ -22,11 +22,13 @@ import (
 	"uuid"
 
 	"github.com/go-sql-driver/mysql"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"gorm.io/gorm"
 
 	"github.com/zanvd/slumber-mill/src/db"
 	"github.com/zanvd/slumber-mill/src/storage"
 	"github.com/zanvd/slumber-mill/src/testutil"
+	"github.com/zanvd/slumber-mill/src/tracing"
 )
 
 // stack is the real service, repository and storage on a throwaway database and directory.
@@ -666,7 +668,7 @@ func TestRepositoryErrors(t *testing.T) {
 	}
 	for _, tc := range inserts {
 		t.Run("insert/"+tc.name, func(t *testing.T) {
-			err := s.repo.insertAsset(tc.ctx, tc.asset)
+			err := s.repo.insertAsset(tc.ctx, tc.asset, "")
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("insertAsset() error = %v, want %v", err, tc.want)
 			}
@@ -1044,6 +1046,31 @@ func TestLeasedAsset(t *testing.T) {
 	wrongTenant := lease{ID: l.ID, TenantID: other, Attempt: l.Attempt}
 	if gotID, _, err := s.repo.leasedAsset(t.Context(), wrongTenant); err != ErrNotFound {
 		t.Errorf("leasedAsset() under another tenant = %s, %v; want %v", gotID, err, ErrNotFound)
+	}
+}
+
+func TestLeasedTrace(t *testing.T) {
+	const stored = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true"
+	s := newLeaseStack(t)
+	owner := s.tenant(t, "owner")
+	other := s.tenant(t, "other")
+	traced, tracedID := s.queue(t, owner)
+	untraced, _ := s.queue(t, owner)
+	s.exec(t, "UPDATE assets SET trace_context = ? WHERE id = ?", stored, tracedID)
+
+	for _, want := range []struct {
+		id     uuid.UUID
+		stored string
+	}{{traced, stored}, {untraced, ""}} {
+		l := s.claimNext(t)
+		gotID, got, err := s.repo.leasedTrace(t.Context(), l)
+		if err != nil || gotID != want.id || got != want.stored {
+			t.Errorf("leasedTrace() = %s, %q, %v; want %s, %q", gotID, got, err, want.id, want.stored)
+		}
+		wrongTenant := lease{ID: l.ID, TenantID: other, Attempt: l.Attempt}
+		if gotID, _, err := s.repo.leasedTrace(t.Context(), wrongTenant); err != ErrNotFound {
+			t.Errorf("leasedTrace() under another tenant = %s, %v; want %v", gotID, err, ErrNotFound)
+		}
 	}
 }
 
@@ -1514,4 +1541,87 @@ func TestEventsReadTheirTenantsAssets(t *testing.T) {
 			t.Errorf("UnrelayedEvents() = %+v, %v; want an error", events, err)
 		}
 	})
+}
+
+// TestTraceContextRoundTrip uploads assets under requests Checkly traced and under one it didn't: each asset stores
+// its upload's trace context, or NULL, and the event that ends it, written by finish, by fail or by the reaper,
+// copies it and comes back with it from the outbox.
+func TestTraceContextRoundTrip(t *testing.T) {
+	s := newLeaseStack(t)
+	tenant := s.tenant(t, "owner")
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(tracing.Sampler()))
+	type upload struct {
+		publicID uuid.UUID
+		id       uint64
+		stored   string
+	}
+	create := func(title, tracestate string) upload {
+		t.Helper()
+		ctx, span := checklyRequest(t, tp, tracestate)
+		defer span.End()
+		u, err := s.svc.Stage(ctx, strings.NewReader(title))
+		if err != nil {
+			t.Fatalf("Stage() error = %v", err)
+		}
+		a, _, err := s.svc.Create(ctx, CreateParams{TenantID: tenant, TargetLUFS: -16, Title: title, Upload: u})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		up := upload{publicID: a.ID, stored: tracing.StoredContext(ctx)}
+		if err := s.pool.QueryRowContext(t.Context(), "SELECT id FROM assets WHERE public_id = ?",
+			db.ID(a.ID)).Scan(&up.id); err != nil {
+			t.Fatalf("error reading the asset's ID: %v", err)
+		}
+		return up
+	}
+	ready := create("ready", "checkly=true")
+	failed := create("failed", "vendor=abc,checkly=true")
+	reaped := create("reaped", "checkly=true")
+	untraced := create("untraced", "")
+	uploads := []upload{ready, failed, reaped, untraced}
+	if ready.stored == "" || failed.stored == "" || reaped.stored == "" || untraced.stored != "" {
+		t.Fatalf("stored contexts %q, %q, %q and %q; want only the last empty", ready.stored, failed.stored,
+			reaped.stored, untraced.stored)
+	}
+
+	for _, up := range uploads {
+		var got sql.NullString
+		err := s.pool.QueryRowContext(t.Context(), "SELECT trace_context FROM assets WHERE id = ?", up.id).Scan(&got)
+		if err != nil {
+			t.Fatalf("error reading asset %d: %v", up.id, err)
+		}
+		if got.String != up.stored || got.Valid != (up.stored != "") {
+			t.Errorf("asset %d stores %+v, want %q, or NULL for empty", up.id, got, up.stored)
+		}
+	}
+
+	if err := s.repo.finish(t.Context(), s.claimNext(t), testProcessed()); err != nil {
+		t.Fatalf("finish() error = %v", err)
+	}
+	if _, err := s.repo.fail(t.Context(), s.claimNext(t), failure{Permanent: true, Reason: "not audio"}); err != nil {
+		t.Fatalf("fail() error = %v", err)
+	}
+	s.claimNext(t)
+	s.exec(t, "UPDATE assets SET attempts = ? WHERE id = ?", maxAttempts, reaped.id)
+	s.expire(t, reaped.id)
+	if _, n, err := s.repo.reap(t.Context()); err != nil || n != 1 {
+		t.Fatalf("reap() = %d failed, %v; want 1", n, err)
+	}
+	if err := s.repo.finish(t.Context(), s.claimNext(t), testProcessed()); err != nil {
+		t.Fatalf("finish() error = %v", err)
+	}
+
+	events, err := s.svc.UnrelayedEvents(t.Context(), MaxEventBatch)
+	if err != nil {
+		t.Fatalf("UnrelayedEvents() error = %v", err)
+	}
+	if len(events) != len(uploads) {
+		t.Fatalf("UnrelayedEvents() = %d events, want %d", len(events), len(uploads))
+	}
+	for i, e := range events {
+		if e.Asset.ID != uploads[i].publicID || e.TraceContext != uploads[i].stored {
+			t.Errorf("event %d is asset %s's with trace context %q, want asset %s's with %q", i, e.Asset.ID,
+				e.TraceContext, uploads[i].publicID, uploads[i].stored)
+		}
+	}
 }

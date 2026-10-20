@@ -14,8 +14,12 @@ import (
 	"time"
 	"uuid"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/zanvd/slumber-mill/src/audio"
 	"github.com/zanvd/slumber-mill/src/logging"
+	"github.com/zanvd/slumber-mill/src/tracing"
 	"github.com/zanvd/slumber-mill/src/worker"
 )
 
@@ -24,11 +28,18 @@ const (
 	finishTimeout  = 15 * time.Second
 	retryBase      = 30 * time.Second
 	retryMax       = 10 * time.Minute
+
+	attrAssetID = "slumber_mill.asset.id"
+	attrAttempt = "slumber_mill.attempt"
+	// traceReadTimeout bounds the read of a claimed asset's trace context, which runs on the work's context
+	// before the heartbeat and the shutdown grace start, so a stalled MySQL can't hold the pool's stop.
+	traceReadTimeout = 5 * time.Second
 )
 
 type leaseRepo interface {
 	claim(ctx context.Context, workerID string, d time.Duration) (lease, bool, error)
 	extend(ctx context.Context, l lease, d time.Duration) error
+	leasedTrace(ctx context.Context, l lease) (uuid.UUID, string, error)
 	leasedAsset(ctx context.Context, l lease) (uuid.UUID, float64, error)
 	finish(ctx context.Context, l lease, p processed) error
 	fail(ctx context.Context, l lease, f failure) (bool, error)
@@ -54,6 +65,8 @@ type ProcessorConfig struct {
 	WorkerID string
 	// Lease is how long a claim or a heartbeat holds an asset: the encode pool's Lease.
 	Lease time.Duration
+	// Tracer continues the traces stored with assets. Nil traces nothing, and reads no trace context.
+	Tracer trace.TracerProvider
 }
 
 // Processor is the encode pool's source of work. It renders a claimed asset's renditions,
@@ -64,6 +77,8 @@ type Processor struct {
 	tc       transcoder
 	cfg      ProcessorConfig
 	profiles []audio.Profile
+	// tracer is nil when tracing is off.
+	tracer trace.Tracer
 }
 
 func NewProcessor(r leaseRepo, files renditionStore, tc transcoder, cfg ProcessorConfig) (*Processor, error) {
@@ -79,7 +94,31 @@ func NewProcessor(r leaseRepo, files renditionStore, tc transcoder, cfg Processo
 	case cfg.Lease/3 <= 0:
 		return nil, fmt.Errorf("lease %v is too short", cfg.Lease)
 	}
-	return &Processor{repo: r, files: files, tc: tc, cfg: cfg, profiles: audio.Profiles()}, nil
+	p := &Processor{repo: r, files: files, tc: tc, cfg: cfg, profiles: audio.Profiles()}
+	if cfg.Tracer != nil {
+		p.tracer = cfg.Tracer.Tracer(tracerName)
+	}
+	return p, nil
+}
+
+// Trace continues the trace of the asset's upload, if a Checkly check sent it, in an asset.encode span for this
+// attempt, which the pool ends with the attempt's outcome. Failing to read the trace context within
+// traceReadTimeout only loses the span.
+func (p *Processor) Trace(ctx context.Context, l worker.Lease) (context.Context, trace.Span) {
+	if p.tracer == nil {
+		return ctx, nil
+	}
+	readCtx, cancel := context.WithTimeout(ctx, traceReadTimeout)
+	assetID, stored, err := p.repo.leasedTrace(readCtx, lease(l))
+	cancel()
+	if err != nil {
+		logging.LoggerFromContext(ctx).LogAttrs(ctx, slog.LevelWarn, "error reading the asset's trace context",
+			slog.String("error", err.Error()))
+		return ctx, nil
+	}
+	return p.tracer.Start(tracing.ContinueStored(ctx, stored), "asset.encode",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(attribute.String(attrAssetID, assetID.String()), attribute.Int(attrAttempt, l.Attempt)))
 }
 
 func (p *Processor) Claim(ctx context.Context) (worker.Lease, bool, error) {

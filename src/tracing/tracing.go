@@ -1,4 +1,5 @@
-// Package tracing exports the spans of traces that a Checkly check started, over OTLP/HTTP.
+// Package tracing exports the spans of traces that a Checkly check started, over OTLP/HTTP,
+// and carries their context with the work queued for the worker pools.
 package tracing
 
 import (
@@ -11,6 +12,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
@@ -32,6 +34,11 @@ const (
 	// checklyKey and checklyValue are the tracestate member a Checkly check sends with its traceparent.
 	checklyKey   = "checkly"
 	checklyValue = "true"
+
+	traceparentKey = "traceparent"
+	tracestateKey  = "tracestate"
+	// maxStoredContext is the size of the trace_context columns, which hold what StoredContext returns.
+	maxStoredContext = 512
 )
 
 // Config is the exporter's configuration. An empty Endpoint turns tracing off.
@@ -235,4 +242,55 @@ func (checklySampler) ShouldSample(p sdktrace.SamplingParameters) sdktrace.Sampl
 
 func (checklySampler) Description() string {
 	return "ChecklyStarted"
+}
+
+// StoredContext returns the trace context of ctx's span for work that continues the trace later, in another
+// process: its traceparent, then a space and its tracestate if it has one. It is empty unless the span records and
+// is sampled, so only a trace that is exported is carried. If the whole would be longer than the 512 bytes the
+// columns hold, tracestate members are dropped from the last, except Checkly's, which the sampler needs.
+func StoredContext(ctx context.Context) string {
+	span := trace.SpanFromContext(ctx)
+	sc := span.SpanContext()
+	if !span.IsRecording() || !sc.IsSampled() {
+		return ""
+	}
+	ts := sc.TraceState()
+	for {
+		stored := storedContext(sc.WithTraceState(ts))
+		if len(stored) <= maxStoredContext {
+			return stored
+		}
+		last := ""
+		ts.Walk(func(key, _ string) bool {
+			if key != checklyKey {
+				last = key
+			}
+			return true
+		})
+		if last == "" {
+			return ""
+		}
+		ts = ts.Delete(last)
+	}
+}
+
+func storedContext(sc trace.SpanContext) string {
+	c := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(trace.ContextWithSpanContext(context.Background(), sc), c)
+	stored := c.Get(traceparentKey)
+	if state := c.Get(tracestateKey); state != "" {
+		stored += " " + state
+	}
+	return stored
+}
+
+// ContinueStored returns ctx with a trace context StoredContext returned as its remote parent, so spans started
+// from it continue that trace, as far as the sampler allows. An empty or malformed one leaves ctx as it is.
+func ContinueStored(ctx context.Context, stored string) context.Context {
+	parent, state, _ := strings.Cut(stored, " ")
+	c := propagation.MapCarrier{traceparentKey: parent}
+	if state != "" {
+		c[tracestateKey] = state
+	}
+	return propagation.TraceContext{}.Extract(ctx, c)
 }

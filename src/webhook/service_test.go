@@ -34,6 +34,9 @@ const (
 	goneTenant  = 9
 
 	hookURL = "https://hooks.example.com/slumber?tenant=7"
+
+	// checklyTraceContext is what the upload of an asset Checkly traced stores.
+	checklyTraceContext = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 checkly=true"
 )
 
 var (
@@ -135,7 +138,8 @@ func (f *relayFixture) once(t *testing.T, wantHeld bool) (int, error) {
 	return relayed, err
 }
 
-// checkDeliveries checks that every delivery inserted carries its event's envelope as the relay found the event.
+// checkDeliveries checks that every delivery inserted carries its event's envelope as the relay found the event,
+// and its trace context outside the body.
 func (f *relayFixture) checkDeliveries(t *testing.T) {
 	t.Helper()
 	byID := make(map[uuid.UUID]asset.Event)
@@ -149,9 +153,9 @@ func (f *relayFixture) checkDeliveries(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if d.TenantID != e.TenantID || !bytes.Equal(d.Body, want) {
-				t.Errorf("delivery %s = tenant %d, body %s\nwant tenant %d, body %s",
-					d.EventID, d.TenantID, d.Body, e.TenantID, want)
+			if d.TenantID != e.TenantID || !bytes.Equal(d.Body, want) || d.TraceContext != e.TraceContext {
+				t.Errorf("delivery %s = tenant %d, trace context %q, body %s\nwant tenant %d, trace context %q, body %s",
+					d.EventID, d.TenantID, d.TraceContext, d.Body, e.TenantID, e.TraceContext, want)
 			}
 		}
 	}
@@ -181,6 +185,7 @@ func TestNewRelay(t *testing.T) {
 func TestRelayOnce(t *testing.T) {
 	hook1, plain, hook2, gone := testEvent(hookTenant, 1), testEvent(plainTenant, 2), testEvent(hookTenant, 3),
 		testEvent(goneTenant, 4)
+	hook1.TraceContext = checklyTraceContext
 	all := []asset.Event{hook1, plain, hook2, gone}
 	everyTenant := [][]uint64{{hookTenant, plainTenant, goneTenant}}
 	tests := []struct {

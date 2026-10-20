@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/zanvd/slumber-mill/src/logging"
 )
 
@@ -89,7 +91,7 @@ func (f *FFmpeg) Process(ctx context.Context, src string, targetLUFS float64, ou
 	}
 	for i := range renditions {
 		r := &renditions[i]
-		if r.Loudness, err = f.verify(ctx, r.Path, targetLUFS); err != nil {
+		if r.Loudness, err = f.verify(ctx, r.Profile.Name, r.Path, targetLUFS); err != nil {
 			return Result{}, fmt.Errorf("error verifying %s: %w", r.Profile.Name, err)
 		}
 	}
@@ -154,7 +156,9 @@ type probeOutput struct {
 	} `json:"format"`
 }
 
-func (f *FFmpeg) probe(ctx context.Context, src string) (Source, error) {
+func (f *FFmpeg) probe(ctx context.Context, src string) (_ Source, err error) {
+	ctx, span := startSpan(ctx, "audio.probe")
+	defer func() { endSpan(span, err) }()
 	var stdout bytes.Buffer
 	if err := f.run.Run(ctx, "ffprobe", probeArgs(src), &stdout, nil); err != nil {
 		if exitErr, ok := errors.AsType[*exitError](err); !ok || exitErr.code != ffprobeInvalid {
@@ -199,10 +203,12 @@ func (f *FFmpeg) probe(ctx context.Context, src string) (Source, error) {
 // and loudnorm on each layout's downmix and on the source as it is, unless one of the layouts already is.
 // It returns each layout's measurement and the target offset its loudnorm reported, for pass 2.
 func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetLUFS float64, layouts []layout,
-) (Input, []Loudness, []float64, error) {
+) (_ Input, _ []Loudness, _ []float64, err error) {
+	ctx, span := startSpan(ctx, "audio.measure")
+	defer func() { endSpan(span, err) }()
 	native := slices.IndexFunc(layouts, func(l layout) bool { return l.channels == source.Channels })
 	log := newFFmpegLog()
-	err := f.run.Run(ctx, "ffmpeg", measureArgs(src, targetLUFS, layouts, native < 0), nil, log)
+	err = f.run.Run(ctx, "ffmpeg", measureArgs(src, targetLUFS, layouts, native < 0), nil, log)
 	log.flush()
 	if err != nil {
 		return Input{}, nil, nil, fmt.Errorf("error measuring the source: %w", err)
@@ -245,9 +251,19 @@ func (f *FFmpeg) measure(ctx context.Context, src string, source Source, targetL
 // render runs pass 2 and returns the mode each layout's loudnorm reported.
 func (f *FFmpeg) render(ctx context.Context, src string, targetLUFS float64, layouts []layout,
 	measured []Loudness, offsets []float64, gainDB float64, outputs []Output,
-) ([]Normalization, error) {
+) (_ []Normalization, err error) {
+	profiles := make([]string, len(outputs))
+	for i, o := range outputs {
+		profiles[i] = o.Profile.Name
+	}
+	attrs := []attribute.KeyValue{attribute.StringSlice(attrProfiles, profiles)}
+	if gainDB != 0 {
+		attrs = append(attrs, attribute.Float64(attrGain, gainDB))
+	}
+	ctx, span := startSpan(ctx, "audio.render", attrs...)
+	defer func() { endSpan(span, err) }()
 	log := newFFmpegLog()
-	err := f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, offsets, gainDB, outputs), nil, log)
+	err = f.run.Run(ctx, "ffmpeg", renderArgs(src, targetLUFS, layouts, measured, offsets, gainDB, outputs), nil, log)
 	log.flush()
 	if err != nil {
 		return nil, fmt.Errorf("error rendering: %w", err)
@@ -282,7 +298,7 @@ func (f *FFmpeg) correct(ctx context.Context, src string, targetLUFS float64, l 
 		return fmt.Errorf("error re-encoding %s: %w", r.Profile.Name, err)
 	}
 	first := r.Loudness
-	if r.Loudness, err = f.verify(ctx, r.Path, targetLUFS); err != nil {
+	if r.Loudness, err = f.verify(ctx, r.Profile.Name, r.Path, targetLUFS); err != nil {
 		return fmt.Errorf("error verifying %s after re-encoding it: %w", r.Profile.Name, err)
 	}
 	r.Normalization = modes[0]
@@ -293,10 +309,12 @@ func (f *FFmpeg) correct(ctx context.Context, src string, targetLUFS float64, l 
 	return nil
 }
 
-// verify measures an encoded rendition as it is.
-func (f *FFmpeg) verify(ctx context.Context, path string, targetLUFS float64) (Loudness, error) {
+// verify measures an encoded rendition of profile as it is.
+func (f *FFmpeg) verify(ctx context.Context, profile, path string, targetLUFS float64) (_ Loudness, err error) {
+	ctx, span := startSpan(ctx, "audio.verify", attribute.String(attrProfile, profile))
+	defer func() { endSpan(span, err) }()
 	log := newFFmpegLog()
-	err := f.run.Run(ctx, "ffmpeg", verifyArgs(path, targetLUFS), nil, log)
+	err = f.run.Run(ctx, "ffmpeg", verifyArgs(path, targetLUFS), nil, log)
 	log.flush()
 	if err != nil {
 		return Loudness{}, err
@@ -308,6 +326,8 @@ func (f *FFmpeg) verify(ctx context.Context, path string, targetLUFS float64) (L
 	if m.MaxMomentaryLUFS, err = log.maxMomentary(verifyMomentaryInstance); err != nil {
 		return Loudness{}, err
 	}
+	span.SetAttributes(attribute.Float64(attrLUFS, m.LUFS), attribute.Float64(attrTruePeak, m.TruePeakDBTP),
+		attribute.Bool(attrInSpec, check(profile, m, targetLUFS) == ""))
 	return m, nil
 }
 
